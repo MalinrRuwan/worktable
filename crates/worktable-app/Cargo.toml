@@ -1,0 +1,10 @@
+[package]
+name = "worktable-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+gpui = "0.2.2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+worktable-ai = { path = "../worktable-ai" }

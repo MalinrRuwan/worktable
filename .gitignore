@@ -1,0 +1,4 @@
+/target
+/agent/node_modules
+/agent/dist
+**/.DS_Store

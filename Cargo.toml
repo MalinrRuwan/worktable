@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/worktable-ai",
+    "crates/worktable-app",
+    "crates/worktable-db",
+    "crates/worktable-events",
+]
+resolver = "3"
