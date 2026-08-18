@@ -6,3 +6,15 @@ members = [
     "crates/worktable-events",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# GPUI (Zed) and the GPUI Component library — pinned to the same commits that
+# `longbridge/gpui-component` uses so the two stay API-compatible.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = ["profiler"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = ["font-kit"] }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }

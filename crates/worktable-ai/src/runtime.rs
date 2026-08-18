@@ -59,6 +59,14 @@ impl WorktableRuntime {
         self.store.list_entries(limit).await
     }
 
+    pub async fn insert_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
+        self.store.insert_entry(entry).await
+    }
+
+    pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
+        self.store.delete_entry(id).await
+    }
+
     pub async fn start_ai_worker(
         &self,
         worker_command: &str,

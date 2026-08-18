@@ -216,6 +216,15 @@ impl TursoStore {
         Ok(())
     }
 
+    pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
+        self.connection
+            .execute("DELETE FROM wt_entries WHERE id = ?", [id])
+            .await
+            .context("failed to delete Worktable entry")?;
+
+        Ok(())
+    }
+
     pub async fn ensure_session(
         &self,
         session_id: &str,
