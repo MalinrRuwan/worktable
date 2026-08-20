@@ -203,7 +203,10 @@ fn capture_foreground_selection(sender: CommandSender) {
         if let Some((path, mime)) = try_capture_image_from_pasteboard(&pasteboard) {
             // For image capture we don't restore previous string — the image
             // replaces the pasteboard contents and we preserve the file on disk.
-            sender.send(AppCommand::CaptureImage { path, mime_type: mime });
+            sender.send(AppCommand::CaptureImage {
+                path,
+                mime_type: mime,
+            });
             return;
         }
 
@@ -297,10 +300,7 @@ fn write_image_data(data: &NSData, ext: &str, mime_type: &str) -> Option<(String
     let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
     let path = dir.join(&filename);
     if std::fs::write(&path, &bytes).is_ok() {
-        Some((
-            path.to_string_lossy().into_owned(),
-            mime_type.to_owned(),
-        ))
+        Some((path.to_string_lossy().into_owned(), mime_type.to_owned()))
     } else {
         None
     }

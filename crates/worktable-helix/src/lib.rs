@@ -41,7 +41,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use self::native::{
-    HelixClient, HELIX_DEFAULT_URL, add_entry_request, get_entry_request, list_entries_request,
+    HELIX_DEFAULT_URL, HelixClient, add_entry_request, get_entry_request, list_entries_request,
     search_entries_request,
 };
 #[cfg(target_arch = "wasm32")]
@@ -82,19 +82,18 @@ mod native {
         write_batch()
             .var_as(
                 "entry",
-                g()
-                    .add_n(
-                        "Entry",
-                        vec![
-                            ("id", id),
-                            ("kind", kind),
-                            ("content", content),
-                            ("title", title),
-                            ("source", source),
-                            ("created_at", created_at),
-                        ],
-                    )
-                    .value_map(None::<Vec<String>>),
+                g().add_n(
+                    "Entry",
+                    vec![
+                        ("id", id),
+                        ("kind", kind),
+                        ("content", content),
+                        ("title", title),
+                        ("source", source),
+                        ("created_at", created_at),
+                    ],
+                )
+                .value_map(None::<Vec<String>>),
             )
             .returning(["entry"])
     }
@@ -113,8 +112,7 @@ mod native {
         read_batch()
             .var_as(
                 "entries",
-                g()
-                    .n_with_label("Entry")
+                g().n_with_label("Entry")
                     .order_by("created_at", Order::Desc)
                     .limit(limit),
             )
@@ -136,8 +134,7 @@ mod native {
         read_batch()
             .var_as(
                 "entries",
-                g()
-                    .n_with_label("Entry")
+                g().n_with_label("Entry")
                     .where_(Predicate::or(vec![
                         Predicate::contains_param("content", "query"),
                         Predicate::contains_param("title", "query"),
@@ -154,8 +151,7 @@ mod native {
         write_batch()
             .var_as(
                 "user",
-                g()
-                    .add_n("User", vec![("name", name)])
+                g().add_n("User", vec![("name", name)])
                     .value_map(None::<Vec<String>>),
             )
             .returning(["user"])
@@ -203,7 +199,11 @@ mod native {
     }
 
     fn resolve_api_key() -> Option<String> {
-        for key in ["WORKTABLE_HELIX_API_KEY", "HELIX_API_KEY", "HELIXDB_API_KEY"] {
+        for key in [
+            "WORKTABLE_HELIX_API_KEY",
+            "HELIX_API_KEY",
+            "HELIXDB_API_KEY",
+        ] {
             if let Ok(val) = std::env::var(key) {
                 if !val.trim().is_empty() {
                     return Some(val);
@@ -327,7 +327,10 @@ mod native {
         /// still proceeds.
         pub async fn sync_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
             let Some(client) = self.client.clone() else {
-                eprintln!("[worktable-helix] sync_entry skipped — no client (url {:?})", self.url);
+                eprintln!(
+                    "[worktable-helix] sync_entry skipped — no client (url {:?})",
+                    self.url
+                );
                 return Ok(());
             };
             // Delete any existing node with same id (best-effort).
@@ -358,7 +361,9 @@ mod native {
                         || msg.contains("Connection refused")
                         || msg.contains("timed out")
                     {
-                        eprintln!("[worktable-helix] sync_entry: Helix not available ({msg}) — SQLite remains source of truth");
+                        eprintln!(
+                            "[worktable-helix] sync_entry: Helix not available ({msg}) — SQLite remains source of truth"
+                        );
                         return Ok(());
                     }
                     eprintln!("[worktable-helix] sync_entry: Helix error: {err}");
@@ -427,12 +432,43 @@ mod native {
                 Err(err) => {
                     let msg = err.to_string();
                     if msg.contains("Error communicating with server") {
-                        eprintln!("[worktable-helix] delete_entry: Helix not available — SQLite remains source of truth");
+                        eprintln!(
+                            "[worktable-helix] delete_entry: Helix not available — SQLite remains source of truth"
+                        );
                         return Ok(());
                     }
                     eprintln!("[worktable-helix] delete_entry Helix error: {err}");
                     Ok(())
                 }
+            }
+        }
+
+        /// Blocking delete (mirrors `sync_entry_blocking`).
+        pub fn delete_entry_blocking(&self, id: &str) -> anyhow::Result<()> {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let client = self.clone();
+                let id = id.to_owned();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    let res = match rt {
+                        Ok(rt) => rt.block_on(client.delete_entry(&id)),
+                        Err(e) => Err(anyhow::anyhow!("failed to build runtime: {e}")),
+                    };
+                    let _ = tx.send(res);
+                });
+                match rx.recv() {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow::anyhow!("delete_entry blocking channel failed: {e}")),
+                }
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build tokio runtime for Helix delete")?;
+                rt.block_on(self.delete_entry(id))
             }
         }
 
@@ -445,8 +481,8 @@ mod native {
                 anyhow::bail!("Helix client not configured (url {:?})", self.url);
             };
             let limit = limit.clamp(1, 100) as i64;
-            let req =
-                search_entries_query(query.to_owned(), limit).context("failed to build search query")?;
+            let req = search_entries_query(query.to_owned(), limit)
+                .context("failed to build search query")?;
             let raw: JsonValue = client
                 .query(req)
                 .send()
@@ -501,11 +537,7 @@ mod native {
         }
 
         /// Blocking best-effort search (never errors, returns empty Vec on failure).
-        pub fn search_best_effort_blocking(
-            &self,
-            query: &str,
-            limit: usize,
-        ) -> Vec<JsonValue> {
+        pub fn search_best_effort_blocking(&self, query: &str, limit: usize) -> Vec<JsonValue> {
             self.search_blocking(query, limit).unwrap_or_else(|err| {
                 eprintln!("[worktable-helix] search_best_effort_blocking fallback: {err}");
                 Vec::new()
@@ -626,7 +658,11 @@ mod wasm_stub {
         pub async fn search(&self, _q: &str, _limit: usize) -> anyhow::Result<Vec<JsonValue>> {
             Ok(Vec::new())
         }
-        pub async fn search_best_effort(&self, _q: &str, _l: usize) -> anyhow::Result<Vec<JsonValue>> {
+        pub async fn search_best_effort(
+            &self,
+            _q: &str,
+            _l: usize,
+        ) -> anyhow::Result<Vec<JsonValue>> {
             Ok(Vec::new())
         }
         pub fn search_blocking(&self, _q: &str, _l: usize) -> anyhow::Result<Vec<JsonValue>> {

@@ -249,6 +249,7 @@ fn open_main_window(
                 size(px(1080.), px(720.)),
                 cx,
             ))),
+            window_min_size: Some(size(px(900.), px(600.))),
             ..WindowOptions::default()
         },
         move |window, cx| {

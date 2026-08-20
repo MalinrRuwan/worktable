@@ -61,6 +61,35 @@ pub struct WorktableService {
 }
 
 impl WorktableService {
+    #[cfg(test)]
+    pub fn new_for_test(db_path: &str) -> anyhow::Result<Self> {
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow!("failed to create Worktable Tokio runtime: {error}"))?,
+        );
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        // Direct connect for hermetic tests (no env var, no bootstrap side-effects).
+        let runtime = tokio.block_on(WorktableRuntime::connect(db_path))?;
+        let entries = tokio
+            .block_on(runtime.list_entries(500))
+            .unwrap_or_default();
+        // Start AI worker so `has_ai_worker` is true in tests (best-effort).
+        let _ = tokio.block_on(runtime.start_ai_worker());
+        let runtime = Some(Arc::new(runtime));
+        let service = Self {
+            tokio: tokio.clone(),
+            runtime,
+            memory: Arc::new(tokio::sync::Mutex::new(entries)),
+            memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            persistent: true,
+            command_tx,
+            command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
+        };
+        Ok(service)
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let tokio = Arc::new(
             tokio::runtime::Builder::new_multi_thread()

@@ -73,13 +73,14 @@ impl WorktableRuntime {
 
         // Best-effort Helix mirror. SQLite remains source-of-truth; if Helix is
         // not running we log and continue. Never fail the SQLite insert.
+        // Use a plain thread (not tokio::spawn) because this is called from GPUI's
+        // scheduler which has no Tokio reactor.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let entry_owned = entry.clone();
-            // Fire-and-forget so the UI stays snappy. Errors are logged to stderr.
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let helix = worktable_helix::HelixClient::from_env();
-                if let Err(err) = helix.sync_entry(&entry_owned).await {
+                if let Err(err) = helix.sync_entry_blocking(&entry_owned) {
                     eprintln!("[worktable] Helix sync_entry failed (fallback to SQLite): {err}");
                 }
             });
@@ -94,9 +95,9 @@ impl WorktableRuntime {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let id_owned = id.to_owned();
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let helix = worktable_helix::HelixClient::from_env();
-                if let Err(err) = helix.delete_entry(&id_owned).await {
+                if let Err(err) = helix.delete_entry_blocking(&id_owned) {
                     eprintln!("[worktable] Helix delete_entry failed (fallback to SQLite): {err}");
                 }
             });

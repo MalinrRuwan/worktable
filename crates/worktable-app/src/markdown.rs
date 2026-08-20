@@ -13,6 +13,37 @@ use gpui_component::{Theme, h_flex, v_flex};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 // ---------------------------------------------------------------------------
+// Emoji shortcodes — map :tada: etc. to unicode so they render via font fallback.
+// ---------------------------------------------------------------------------
+
+fn emojify(text: &str) -> String {
+    // Common subset; extend as needed. Keep it small to avoid a crate.
+    let mut s = text.to_owned();
+    for (code, emoji) in [
+        (":tada:", "🎉"),
+        (":smile:", "😄"),
+        (":rocket:", "🚀"),
+        (":heart:", "❤️"),
+        (":fire:", "🔥"),
+        (":thumbsup:", "👍"),
+        (":thumbsdown:", "👎"),
+        (":eyes:", "👀"),
+        (":sparkles:", "✨"),
+        (":warning:", "⚠️"),
+        (":check:", "✅"),
+        (":x:", "❌"),
+        (":bulb:", "💡"),
+        (":memo:", "📝"),
+        (":link:", "🔗"),
+        (":star:", "⭐"),
+        (":zap:", "⚡"),
+    ] {
+        s = s.replace(code, emoji);
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -22,7 +53,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 /// `text_color` for normal spans and applies distinct styling for code,
 /// links, etc.
 pub fn render_markdown(text: &str, theme: &Theme) -> AnyElement {
-    render_markdown_inner(text, theme, false)
+    let text = emojify(text);
+    render_markdown_inner(&text, theme, false)
 }
 
 /// Render markdown that is expected to be a single inline line (e.g. an entry
@@ -35,7 +67,8 @@ pub fn render_markdown_inline(text: &str, theme: &Theme) -> AnyElement {
     // markdown yields exactly one paragraph we unwrap its inline children.
     // Otherwise we fall back to the block renderer — a heading containing a
     // hard break is still valid markdown.
-    let blocks = parse_blocks(text, theme);
+    let text = emojify(text);
+    let blocks = parse_blocks(&text, theme);
     if blocks.len() == 1 {
         // `parse_blocks` wraps paragraphs in a flex-wrap div. That div is
         // already an inline container — return it directly.
@@ -124,7 +157,14 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
         let is_italic = emphasis > 0;
         let is_strike = strikethrough > 0;
         let link_dest = link_stack.last().cloned();
-        let span = styled_inline(text.to_owned(), theme, is_bold, is_italic, is_strike, link_dest);
+        let span = styled_inline(
+            text.to_owned(),
+            theme,
+            is_bold,
+            is_italic,
+            is_strike,
+            link_dest,
+        );
         inline.push(span);
     };
 
@@ -144,7 +184,11 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
                 }
                 Tag::BlockQuote(_kind) => {
                     // Flush any pending inline from an outer paragraph before entering quote.
-                    if !inline.is_empty() && !in_item && !heading_level.is_some() && in_code_block.is_none() {
+                    if !inline.is_empty()
+                        && !in_item
+                        && !heading_level.is_some()
+                        && in_code_block.is_none()
+                    {
                         // Don't flush prematurely; blockquote contains its own blocks.
                     }
                     blockquote_depth += 1;
@@ -272,7 +316,8 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
                     let info = in_code_block.take();
                     let code = std::mem::take(&mut code_block_buf);
                     if !code.trim().is_empty() || info.is_some() {
-                        let block = render_code_block(&code, info.as_ref(), theme, blockquote_depth);
+                        let block =
+                            render_code_block(&code, info.as_ref(), theme, blockquote_depth);
                         blocks.push(block);
                     }
                     inline.clear();
@@ -296,12 +341,8 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
                     // Here we wrap the remaining inline as a list item row.
                     if !inline.is_empty() {
                         let item_inline = std::mem::take(&mut inline);
-                        let item_block = flush_list_item(
-                            item_inline,
-                            theme,
-                            &mut list_stack,
-                            blockquote_depth,
-                        );
+                        let item_block =
+                            flush_list_item(item_inline, theme, &mut list_stack, blockquote_depth);
                         blocks.push(item_block);
                     } else {
                         // Empty item — still advance counter so numbering stays correct.
@@ -552,15 +593,16 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
         if in_code_block.is_some() {
             let info = in_code_block.take();
             let code = std::mem::take(&mut code_block_buf);
-            blocks.push(render_code_block(&code, info.as_ref(), theme, blockquote_depth));
-        } else if heading_level.is_some() {
-            let level = heading_level.take().unwrap();
-            let heading = flush_heading(
-                std::mem::take(&mut inline),
-                level,
+            blocks.push(render_code_block(
+                &code,
+                info.as_ref(),
                 theme,
                 blockquote_depth,
-            );
+            ));
+        } else if heading_level.is_some() {
+            let level = heading_level.take().unwrap();
+            let heading =
+                flush_heading(std::mem::take(&mut inline), level, theme, blockquote_depth);
             blocks.push(heading);
         } else if in_item {
             let item_block = flush_list_item(
@@ -585,7 +627,12 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
     if in_code_block.is_some() {
         let info = in_code_block.take();
         let code = std::mem::take(&mut code_block_buf);
-        blocks.push(render_code_block(&code, info.as_ref(), theme, blockquote_depth));
+        blocks.push(render_code_block(
+            &code,
+            info.as_ref(),
+            theme,
+            blockquote_depth,
+        ));
     }
 
     // Also handle trailing table.
@@ -886,7 +933,9 @@ fn render_table(rows: &[Vec<String>], theme: &Theme, blockquote_depth: usize) ->
         let is_header = idx == 0;
         let mut row_el = h_flex().gap_2().px_2().py_1();
         if is_header {
-            row_el = row_el.bg(theme.muted).font_weight(gpui::FontWeight::SEMIBOLD);
+            row_el = row_el
+                .bg(theme.muted)
+                .font_weight(gpui::FontWeight::SEMIBOLD);
         } else if idx % 2 == 1 {
             row_el = row_el.bg(theme.muted.opacity(0.3));
         }

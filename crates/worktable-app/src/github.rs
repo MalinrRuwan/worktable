@@ -77,7 +77,10 @@ pub async fn fetch_github_stars(
         }
         if status.as_u16() == 401 {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub authentication failed (401). Check GITHUB_TOKEN. {}", body);
+            anyhow::bail!(
+                "GitHub authentication failed (401). Check GITHUB_TOKEN. {}",
+                body
+            );
         }
         if status.as_u16() == 403 {
             let body = resp.text().await.unwrap_or_default();
@@ -183,7 +186,8 @@ mod tests {
 
     #[test]
     fn repo_response_deser() {
-        let json = r#"[{"name":"foo","stargazers_count":42,"html_url":"https://github.com/u/foo"}]"#;
+        let json =
+            r#"[{"name":"foo","stargazers_count":42,"html_url":"https://github.com/u/foo"}]"#;
         let repos: Vec<RepoResponse> = serde_json::from_str(json).unwrap();
         assert_eq!(repos[0].name, "foo");
         assert_eq!(repos[0].stargazers_count, 42);

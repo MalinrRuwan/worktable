@@ -6,7 +6,6 @@ members = [
   "crates/worktable-events",
   "crates/worktable-helix",
   "crates/worktable-ui",
-  "crates/worktable-web",
 ]
 resolver = "3"
 

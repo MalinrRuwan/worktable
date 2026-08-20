@@ -16,7 +16,7 @@ mod native_impl {
     use async_trait::async_trait;
     use pi::config::Config;
     use pi::model::{ContentBlock, TextContent};
-    use pi::sdk::{default_tool_registry, ToolFactory};
+    use pi::sdk::{ToolFactory, default_tool_registry};
     use pi::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
     use serde::Deserialize;
     use worktable_helix::HelixClient;
@@ -101,8 +101,9 @@ mod native_impl {
             input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<ToolOutput, pi::error::Error> {
-            let input: SearchKnowledgeInput = serde_json::from_value(input)
-                .map_err(|e| pi::error::Error::validation(format!("invalid search_knowledge args: {e}")))?;
+            let input: SearchKnowledgeInput = serde_json::from_value(input).map_err(|e| {
+                pi::error::Error::validation(format!("invalid search_knowledge args: {e}"))
+            })?;
 
             let query = input.query.trim();
             if query.is_empty() {
@@ -140,7 +141,8 @@ mod native_impl {
                     )
                 }
             } else {
-                let payload = serde_json::to_string_pretty(&helix_hits).unwrap_or_else(|_| format!("{helix_hits:?}"));
+                let payload = serde_json::to_string_pretty(&helix_hits)
+                    .unwrap_or_else(|_| format!("{helix_hits:?}"));
                 format!(
                     "search_knowledge: {n} Helix hit(s) for {query:?} (limit {limit}) — gateway {}:\n{payload}",
                     self.helix.url(),
