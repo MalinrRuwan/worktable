@@ -8,8 +8,12 @@
 #![cfg(target_os = "macos")]
 
 use std::{
+    path::PathBuf,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -21,10 +25,21 @@ use objc2::runtime::NSObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSImage, NSImageScaling, NSMenu,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar,
+    NSMenuItem, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+    NSStatusBar,
 };
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
-use objc2_foundation::{NSSize, NSString};
+use objc2_foundation::{NSData, NSSize, NSString};
+
+/// Global shift-held state updated by the FlagsChanged monitor.
+/// Used by `worktable_view` to detect Shift+right-click.
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if the Shift key is currently held down (as last observed by
+/// the global FlagsChanged monitor).
+pub fn is_shift_held() -> bool {
+    SHIFT_HELD.load(Ordering::SeqCst)
+}
 
 /// A small Objective-C object that forwards menu clicks to the command sender.
 struct MenuTargetIvars {
@@ -141,6 +156,8 @@ fn install_shift_capture_monitor(sender: CommandSender) {
         }
 
         let shift_active = event.modifierFlags().contains(NSEventModifierFlags::Shift);
+        // Publish global shift state for worktable_view's Shift+right-click handling.
+        SHIFT_HELD.store(shift_active, Ordering::SeqCst);
         let should_capture = tracker
             .lock()
             .map(|mut tracker| {
@@ -178,26 +195,125 @@ fn capture_foreground_selection(sender: CommandSender) {
         thread::sleep(Duration::from_millis(80));
 
         let after_count = pasteboard.changeCount();
-        let captured = if after_count != before_count {
-            pasteboard
-                .stringForType(string_type)
-                .map(|value| value.to_string())
-                .filter(|value| !value.trim().is_empty())
-        } else {
-            None
-        };
+        if after_count == before_count {
+            return;
+        }
 
-        if after_count != before_count {
-            if let Some(previous_text) = previous_text {
-                let previous_text = NSString::from_str(&previous_text);
-                let _ = pasteboard.setString_forType(&previous_text, string_type);
-            }
+        // Try image first: check pasteboard for TIFF/PNG/JPEG data.
+        if let Some((path, mime)) = try_capture_image_from_pasteboard(&pasteboard) {
+            // For image capture we don't restore previous string — the image
+            // replaces the pasteboard contents and we preserve the file on disk.
+            sender.send(AppCommand::CaptureImage { path, mime_type: mime });
+            return;
+        }
+
+        let captured = pasteboard
+            .stringForType(string_type)
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+
+        // Restore previous string content if we changed the pasteboard.
+        if let Some(previous_text) = previous_text {
+            let previous_text = NSString::from_str(&previous_text);
+            let _ = pasteboard.setString_forType(&previous_text, string_type);
         }
 
         if let Some(text) = captured {
             sender.send(AppCommand::CaptureText(text));
         }
     });
+}
+
+/// Try to extract image data from the pasteboard, writing it to
+/// `~/.worktable/images/<uuid>.<ext>` and returning (path, mime_type).
+fn try_capture_image_from_pasteboard(pasteboard: &NSPasteboard) -> Option<(String, String)> {
+    // Order matters: prefer TIFF first (most general), then PNG, then JPEG variants.
+    let tiff_type = unsafe { NSPasteboardTypeTIFF };
+    if let Some(data) = pasteboard.dataForType(tiff_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "tiff", "image/tiff") {
+                return Some(result);
+            }
+        }
+    }
+
+    let png_type = unsafe { NSPasteboardTypePNG };
+    if let Some(data) = pasteboard.dataForType(png_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "png", "image/png") {
+                return Some(result);
+            }
+        }
+    }
+
+    // JPEG via UTI string "public.jpeg" (no dedicated constant in objc2-app-kit).
+    let jpeg_type = NSString::from_str("public.jpeg");
+    if let Some(data) = pasteboard.dataForType(&jpeg_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
+                return Some(result);
+            }
+        }
+    }
+    // Alternate UTI "public.jpg" on some systems.
+    let jpg_type = NSString::from_str("public.jpg");
+    if let Some(data) = pasteboard.dataForType(&jpg_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
+                return Some(result);
+            }
+        }
+    }
+    // HEIC / HEIF fallback
+    let heic_type = NSString::from_str("public.heic");
+    if let Some(data) = pasteboard.dataForType(&heic_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "heic", "image/heic") {
+                return Some(result);
+            }
+        }
+    }
+    let heif_type = NSString::from_str("public.heif");
+    if let Some(data) = pasteboard.dataForType(&heif_type) {
+        if data.length() > 0 {
+            if let Some(result) = write_image_data(&data, "heif", "image/heif") {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+fn write_image_data(data: &NSData, ext: &str, mime_type: &str) -> Option<(String, String)> {
+    let bytes = data.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+    let dir = resolve_images_dir()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+    let path = dir.join(&filename);
+    if std::fs::write(&path, &bytes).is_ok() {
+        Some((
+            path.to_string_lossy().into_owned(),
+            mime_type.to_owned(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn resolve_images_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("WORKTABLE_IMAGES_DIR") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".worktable").join("images"))
 }
 
 fn post_copy_shortcut() {

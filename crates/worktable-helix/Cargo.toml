@@ -1,0 +1,20 @@
+[package]
+name = "worktable-helix"
+version = "0.1.0"
+edition = "2024"
+description = "HelixDB parallel knowledge base for Worktable — graph store mirroring SQLite entries for AI semantic search"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+helix-db = "3.0.0"
+sonic-rs = "0.5.8"
+worktable-db = { path = "../worktable-db" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worktable-db = { path = "../worktable-db" }

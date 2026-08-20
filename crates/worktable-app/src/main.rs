@@ -4,12 +4,14 @@
 //! window, installs the macOS status item, and wires keybindings + status-item
 //! commands to the main view.
 
-mod actions;
-mod assistant;
-mod format;
-mod service;
-mod status_item;
-mod worktable_view;
+pub(crate) mod actions;
+pub(crate) mod assistant;
+pub(crate) mod format;
+pub(crate) mod github;
+pub(crate) mod markdown;
+pub(crate) mod service;
+pub(crate) mod status_item;
+pub(crate) mod worktable_view;
 
 use std::{
     path::{Path, PathBuf},
@@ -196,6 +198,11 @@ fn handle_command(
         AppCommand::CaptureText(text) => {
             if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
                 let _ = view.update(cx, |this, cx| this.add_captured_text(text, cx));
+            }
+        }
+        AppCommand::CaptureImage { path, mime_type } => {
+            if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
+                let _ = view.update(cx, |this, cx| this.add_captured_image(path, mime_type, cx));
             }
         }
         AppCommand::Quit => cx.quit(),

@@ -525,6 +525,15 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Delete a `wt_ai_config` value.
+    pub fn delete_config(&self, key: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
+            .execute("DELETE FROM wt_ai_config WHERE key = ?", [key])
+            .context("failed to delete AI config")?;
+        Ok(())
+    }
+
     fn set_session_state(
         &self,
         session_id: &str,
@@ -792,6 +801,14 @@ impl SqliteStore {
     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().expect("wasm lock poisoned");
         inner.config.insert(key.to_owned(), value.to_owned());
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn delete_config(&self, key: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.config.remove(key);
         drop(inner);
         self.save_to_storage();
         Ok(())

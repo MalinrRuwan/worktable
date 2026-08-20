@@ -24,6 +24,9 @@ use worktable_events::{ModelInfo, ProviderInfo, ProvidersSnapshot};
 
 use crate::worker_protocol::{WorkerEvent, WorkerRequest};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::helix_tool::HelixToolFactory;
+
 const AUTH_FALLBACK_FILE: &str = ".worktable-pi-auth.json";
 
 /// In-process Pi Agent runtime.
@@ -218,12 +221,30 @@ fn run_prompt(
         .map(|credential| credential.key);
 
     let working_directory = std::env::current_dir().ok();
+
+    // --- Helix tooling -------------------------------------------------------
+    // On native, expose `search_knowledge` so the LLM can retrieve Worktable
+    // entries mirrored into HelixDB's graph. The tool is best-effort: when
+    // Helix is not running it returns a fallback message and the agent can
+    // still answer from its prompt context. On WASM we stay chat-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (enabled_tools, tool_factory) = {
+        let factory: std::sync::Arc<dyn pi::sdk::ToolFactory> =
+            std::sync::Arc::new(HelixToolFactory);
+        (Some(vec!["search_knowledge".to_string()]), Some(factory))
+    };
+    #[cfg(target_arch = "wasm32")]
+    let (enabled_tools, tool_factory): (
+        Option<Vec<String>>,
+        Option<std::sync::Arc<dyn pi::sdk::ToolFactory>>,
+    ) = (Some(Vec::new()), None);
+
     let options = SessionOptions {
         provider: Some(provider_id),
         model: Some(model_id),
         api_key,
-        // Chat-only for now: no filesystem/tool execution from the app.
-        enabled_tools: Some(Vec::new()),
+        enabled_tools,
+        tool_factory,
         working_directory: working_directory.clone(),
         include_cwd_in_prompt: false,
         ..Default::default()

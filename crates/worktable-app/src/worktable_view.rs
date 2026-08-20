@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px, relative, size,
+    App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
+    SharedString, Size, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
+    relative, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu, PopupMenuItem};
+use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
     SidebarMenuItem, SidebarToggleButton,
@@ -107,8 +108,23 @@ pub struct WorktableView {
     auth_notice: Option<AuthNotice>,
     settings_status: Option<String>,
 
+    // GitHub Stars
+    github_input: Entity<InputState>,
+    github_username: Option<String>,
+    github_total_stars: Option<u64>,
+    github_repos: Vec<crate::github::GithubRepo>,
+    github_loading: bool,
+    github_error: Option<String>,
+
     // UI state
     pub(crate) sidebar_collapsed: bool,
+    // Dwell-open state: hover for 300ms opens, leave for 400ms re-collapses.
+    // `sidebar_dwell_opened` tracks whether the current expansion was caused
+    // by dwell so a leave only collapses dwell-opened sidebars, not a manual
+    // `cmd-shift-s` expansion.
+    sidebar_dwell_hovered: bool,
+    sidebar_dwell_seq: u64,
+    sidebar_dwell_opened: bool,
     pub(crate) dark_mode: bool,
     settings_scroll: VirtualListScrollHandle,
     provider_row_sizes: Rc<Vec<Size<Pixels>>>,
@@ -145,6 +161,11 @@ impl WorktableView {
                 .placeholder("Paste the code / value…")
                 .submit_on_enter(false)
         });
+        let github_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("GitHub username…")
+                .submit_on_enter(false)
+        });
 
         let mut view = Self {
             service,
@@ -171,7 +192,16 @@ impl WorktableView {
             prompt_input,
             auth_notice: None,
             settings_status: None,
+            github_input,
+            github_username: None,
+            github_total_stars: None,
+            github_repos: Vec::new(),
+            github_loading: false,
+            github_error: None,
             sidebar_collapsed: false,
+            sidebar_dwell_hovered: false,
+            sidebar_dwell_seq: 0,
+            sidebar_dwell_opened: false,
             dark_mode: false,
             settings_scroll: VirtualListScrollHandle::new(),
             provider_row_sizes: Rc::new(Vec::new()),
@@ -183,6 +213,7 @@ impl WorktableView {
         view.subscribe(window, cx);
         view.load_entries(cx);
         view.refresh_providers(cx);
+        view.load_github_username(cx);
         view
     }
 
@@ -267,6 +298,21 @@ impl WorktableView {
         });
         self._subscriptions.push(subscription);
 
+        // Pressing Enter in the GitHub username field saves it and fetches stars.
+        let github_input = self.github_input.clone();
+        let subscription = cx.subscribe(&github_input, move |this, _emitter, event, cx| {
+            if matches!(
+                event,
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false
+                }
+            ) {
+                this.save_github_username(cx);
+            }
+        });
+        self._subscriptions.push(subscription);
+
         // Stream runtime events (AI deltas, provider snapshots, login prompts)
         // into this view.
         if let Some(mut events) = self.service.subscribe() {
@@ -320,6 +366,117 @@ impl WorktableView {
                     cx.notify();
                 });
             }
+        })
+        .detach();
+    }
+
+    fn load_github_username(&mut self, cx: &mut Context<Self>) {
+        let service = Arc::clone(&self.service);
+        let input = self.github_input.clone();
+        cx.spawn(async move |view, cx| {
+            let result = service.get_github_username().await;
+            let _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(username)) if !username.trim().is_empty() => {
+                        let username = username.trim().to_owned();
+                        this.github_username = Some(username.clone());
+                        this.set_input(&input, &username, cx);
+                        // Auto-fetch stars for the stored username (non-blocking, updates UI when done).
+                        this.fetch_github_stars(cx);
+                    }
+                    Ok(Some(username)) => {
+                        let username = username.trim().to_owned();
+                        if !username.is_empty() {
+                            this.github_username = Some(username.clone());
+                            this.set_input(&input, &username, cx);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("Worktable: failed to load github_username: {error}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn save_github_username(&mut self, cx: &mut Context<Self>) {
+        let username = self.github_input.read(cx).value().to_string();
+        let username = username.trim().to_owned();
+        if username.is_empty() {
+            self.github_error = Some("Enter a GitHub username.".to_owned());
+            cx.notify();
+            return;
+        }
+        // Basic validation mirrored from github::fetch_github_stars
+        if username.contains('/') || username.contains(' ') || username.len() > 39 {
+            self.github_error = Some(format!("Invalid GitHub username: '{username}'"));
+            cx.notify();
+            return;
+        }
+        let service = Arc::clone(&self.service);
+        let username_clone = username.clone();
+        cx.spawn(async move |view, cx| {
+            let result = service.set_github_username(&username_clone).await;
+            let _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.github_username = Some(username_clone.clone());
+                        this.github_error = None;
+                        this.fetch_github_stars(cx);
+                    }
+                    Err(error) => {
+                        this.github_error = Some(format!("Failed to save username: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn fetch_github_stars(&mut self, cx: &mut Context<Self>) {
+        // Prefer the text currently in the input; fall back to the stored username.
+        let username = {
+            let input_val = self.github_input.read(cx).value().to_string();
+            let trimmed = input_val.trim().to_owned();
+            if !trimmed.is_empty() {
+                trimmed
+            } else if let Some(stored) = &self.github_username {
+                stored.clone()
+            } else {
+                self.github_error = Some("Enter a GitHub username first.".to_owned());
+                cx.notify();
+                return;
+            }
+        };
+        if self.github_loading {
+            return;
+        }
+        self.github_loading = true;
+        self.github_error = None;
+        cx.notify();
+
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.fetch_github_stars(&username).await;
+            let _ = view.update(cx, |this, cx| {
+                this.github_loading = false;
+                match result {
+                    Ok((total, repos)) => {
+                        this.github_total_stars = Some(total);
+                        this.github_repos = repos;
+                        this.github_username = Some(username.clone());
+                        this.github_error = None;
+                    }
+                    Err(error) => {
+                        this.github_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -430,7 +587,67 @@ impl WorktableView {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        // Manual toggle cancels any pending dwell timer and clears the
+        // dwell-opened flag so a subsequent hover-leave does not collapse a
+        // user-intended expansion.
+        self.sidebar_dwell_opened = false;
+        self.sidebar_dwell_seq = self.sidebar_dwell_seq.wrapping_add(1);
         cx.notify();
+    }
+
+    /// Handle hover changes for the sidebar dwell-open behavior.
+    ///
+    /// When the sidebar is collapsed and the mouse dwells over its 52px icon
+    /// strip for 300ms, the sidebar expands. When the mouse leaves the expanded
+    /// sidebar for 400ms, it re-collapses — but only if the expansion was
+    /// caused by dwell, so a `cmd-shift-s` expansion is sticky until the user
+    /// toggles again.
+    fn handle_sidebar_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.sidebar_dwell_hovered = hovered;
+        self.sidebar_dwell_seq = self.sidebar_dwell_seq.wrapping_add(1);
+        let seq = self.sidebar_dwell_seq;
+
+        if hovered {
+            if self.sidebar_collapsed {
+                let delay = Duration::from_millis(300);
+                cx.spawn(async move |view, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = view.update(cx, |this, cx| {
+                        if this.sidebar_dwell_seq != seq {
+                            return;
+                        }
+                        if !this.sidebar_dwell_hovered {
+                            return;
+                        }
+                        if this.sidebar_collapsed {
+                            this.sidebar_collapsed = false;
+                            this.sidebar_dwell_opened = true;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        } else if !self.sidebar_collapsed && self.sidebar_dwell_opened {
+            let delay = Duration::from_millis(400);
+            cx.spawn(async move |view, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = view.update(cx, |this, cx| {
+                    if this.sidebar_dwell_seq != seq {
+                        return;
+                    }
+                    if this.sidebar_dwell_hovered {
+                        return;
+                    }
+                    if !this.sidebar_collapsed && this.sidebar_dwell_opened {
+                        this.sidebar_collapsed = true;
+                        this.sidebar_dwell_opened = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     pub fn cancel_composer(&mut self, cx: &mut Context<Self>) {
@@ -529,12 +746,25 @@ impl WorktableView {
                 self.assistant_busy = true;
                 cx.notify();
             }
+            WorktableEvent::AiThoughtDelta { delta, .. } => {
+                match self.messages.last_mut().filter(|m| m.streaming) {
+                    Some(message) => message.thinking.push_str(delta),
+                    None => self.messages.push(ChatMessage {
+                        role: Role::Assistant,
+                        text: String::new(),
+                        thinking: delta.clone(),
+                        streaming: true,
+                    }),
+                }
+                cx.notify();
+            }
             WorktableEvent::AiMessageDelta { delta, .. } => {
                 match self.messages.last_mut().filter(|m| m.streaming) {
                     Some(message) => message.text.push_str(delta),
                     None => self.messages.push(ChatMessage {
                         role: Role::Assistant,
                         text: delta.clone(),
+                        thinking: String::new(),
                         streaming: true,
                     }),
                 }
@@ -549,6 +779,7 @@ impl WorktableView {
                     self.messages.push(ChatMessage {
                         role: Role::Assistant,
                         text: format!("> using **{name}**…"),
+                        thinking: String::new(),
                         streaming: true,
                     });
                 }
@@ -970,6 +1201,57 @@ impl WorktableView {
         .detach();
     }
 
+    /// Insert an image captured from another application.
+    pub fn add_captured_image(&mut self, path: String, mime_type: String, cx: &mut Context<Self>) {
+        let path = path.trim().to_owned();
+        if path.is_empty() {
+            return;
+        }
+        // `mime_type` is kept for display purposes but the DB stores the file path as content.
+        let _ = mime_type;
+        let entry = WorktableEntry {
+            id: crate::service::new_entry_id(),
+            kind: "image".to_owned(),
+            content: path,
+            title: None,
+            source: "Selection".to_owned(),
+            created_at: crate::service::unix_time_ms(),
+        };
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.insert_entry(entry.clone()).await;
+            let _ = view.update(cx, |this, cx| {
+                if result.is_ok() {
+                    this.entries.insert(0, entry);
+                    this.selected = this.entries.first().map(|entry| entry.id.clone());
+                    this.mode = AppMode::Entries;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Copy all visible entries as a joined list to the clipboard.
+    pub fn copy_entries_as_list(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_entries();
+        if visible.is_empty() {
+            return;
+        }
+        let text = visible
+            .iter()
+            .map(|entry| {
+                if let Some(title) = &entry.title {
+                    format!("{title}\n{}", entry.content)
+                } else {
+                    entry.content.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// Clear/set an input's value via the window handle (inputs need a window).
     fn set_input(&mut self, input: &Entity<InputState>, value: &str, cx: &mut Context<Self>) {
         let input = input.clone();
@@ -1079,10 +1361,17 @@ impl Render for WorktableView {
                     this.cancel_composer(cx)
                 }),
             )
-            .child(fade_in(
-                "worktable-sidebar-anim",
-                div().child(render_sidebar(self, cx)),
-            ))
+            .child(
+                div()
+                    .id("worktable-sidebar-dwell")
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        this.handle_sidebar_hover(*hovered, cx);
+                    }))
+                    .child(fade_in(
+                        "worktable-sidebar-anim",
+                        div().child(render_sidebar(self, cx)),
+                    )),
+            )
             .child(fade_in(
                 "worktable-main-anim",
                 div().child(render_main(self, window, cx)),
@@ -1421,26 +1710,43 @@ fn render_settings(
         .primary()
         .on_click(cx.listener(|this, _, _, cx| this.show_provider_config(cx)));
 
+    let github = render_github_section(this, _window, cx);
+
     v_flex()
         .flex_1()
+        .overflow_y_scrollbar()
+        .p_4()
+        .gap_6()
         .items_center()
-        .justify_center()
-        .gap_3()
         .child(
-            div()
-                .text_2xl()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child("AI providers"),
+            v_flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("AI providers"),
+                )
+                .child(
+                    div()
+                        .max_w(px(480.))
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            "Choose a provider, model, and authentication method for the assistant.",
+                        ),
+                )
+                .child(div().text_sm().text_color(theme.primary).child(active))
+                .child(configure),
         )
         .child(
             div()
-                .max_w(px(480.))
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child("Choose a provider, model, and authentication method for the assistant."),
+                .h(px(1.))
+                .w(px(480.))
+                .bg(theme.border.opacity(0.6)),
         )
-        .child(div().text_sm().text_color(theme.primary).child(active))
-        .child(configure)
+        .child(github)
         .into_any_element()
 }
 
@@ -1554,6 +1860,8 @@ fn render_provider_config(
 
     let scrollbar = Scrollbar::vertical(&this.settings_scroll).axis(ScrollbarAxis::Vertical);
 
+    let github = render_github_section(this, _window, cx);
+
     let mut root = v_flex()
         .flex_1()
         .min_h_0()
@@ -1567,6 +1875,15 @@ fn render_provider_config(
                 .relative()
                 .child(list)
                 .child(scrollbar),
+        )
+        .child(
+            div()
+                .px_4()
+                .pt_3()
+                .pb_3()
+                .border_t_1()
+                .border_color(theme.border.opacity(0.5))
+                .child(github),
         );
     if let Some(panel) = login_panel {
         root = root.child(div().px_4().pt_3().child(panel));
@@ -1976,6 +2293,216 @@ fn render_active_login(
     )
 }
 
+fn render_github_section(
+    this: &WorktableView,
+    _window: &mut Window,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+    let view = cx.entity();
+
+    let total_text = if this.github_loading {
+        match this.github_total_stars {
+            Some(total) => format!("★ {} total stars — updating…", total),
+            None => "Fetching stars…".to_owned(),
+        }
+    } else if let Some(total) = this.github_total_stars {
+        format!("★ {} total stars", total)
+    } else if this.github_error.is_some() {
+        String::new()
+    } else {
+        "No data yet — enter a username and fetch.".to_owned()
+    };
+
+    let mut column = v_flex()
+        .gap_2()
+        .p_3()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover);
+
+    column = column
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("GitHub Stars"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Total stars + per-repo breakdown"),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Stored in wt_ai_config (github_username). Uses GITHUB_TOKEN if set for 5000 req/h."),
+        );
+
+    // Input + Save + Fetch row
+    let save_view = view.clone();
+    let fetch_view = view.clone();
+    let input_row = h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .max_w(px(220.))
+                .child(Input::new(&this.github_input).h(px(32.))),
+        )
+        .child(
+            Button::new("github-save")
+                .label("Save")
+                .icon(app_icon(IconName::Check))
+                .h(px(28.))
+                .on_click(move |_, _, cx| {
+                    let _ = save_view.update(cx, |this, cx| this.save_github_username(cx));
+                }),
+        )
+        .child(
+            Button::new("github-fetch")
+                .label(if this.github_loading { "Fetching…" } else { "Fetch Stars" })
+                .icon(app_icon(IconName::ExternalLink))
+                .primary()
+                .h(px(28.))
+                .disabled(this.github_loading)
+                .on_click(move |_, _, cx| {
+                    let _ = fetch_view.update(cx, |this, cx| this.fetch_github_stars(cx));
+                }),
+        );
+
+    column = column.child(input_row);
+
+    if !total_text.is_empty() {
+        let color = if this.github_loading {
+            theme.muted_foreground
+        } else {
+            theme.primary
+        };
+        column = column.child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(total_text),
+        );
+    }
+
+    if let Some(error) = &this.github_error {
+        column = column.child(
+            div()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(error.clone()),
+        );
+    }
+
+    if this.github_loading {
+        let phase = pulse_delta(&ZERON_PULSE, cx.entity_id(), cx);
+        let opacity = worktable_ui::pulse_opacity(phase);
+        column = column.child(
+            div()
+                .h(px(2.))
+                .w_full()
+                .rounded(px(2.))
+                .bg(theme.border.opacity(0.5))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(opacity.clamp(0.2, 1.0)))
+                        .bg(theme.primary)
+                        .rounded(px(2.)),
+                ),
+        );
+    }
+
+    if !this.github_repos.is_empty() {
+        let mut repos_list = v_flex()
+            .gap_1()
+            .max_h(px(260.))
+            .overflow_y_scrollbar()
+            .pr_2();
+        // Show at most 50 repos to keep UI snappy; user likely cares about top starred.
+        for repo in this.github_repos.iter().take(50) {
+            let name = repo.name.clone();
+            let url = repo.html_url.clone();
+            let stars = repo.stars;
+            // Clicking the row opens the repo URL.
+            let view_for_click = view.clone();
+            let url_for_click = url.clone();
+            let row_id = format!("github-repo:{}", name);
+            repos_list = repos_list.child(
+                h_flex()
+                    .id(row_id)
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme.radius)
+                    .hover(|s| s.bg(theme.tokens.list_hover))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        if !url_for_click.is_empty() {
+                            let _ = view_for_click.update(cx, |this, cx| {
+                                cx.open_url(&url_for_click);
+                                let _ = this;
+                            });
+                        }
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(name)
+                            .text_color(theme.foreground),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("★ {}", stars)),
+                    ),
+            );
+        }
+        if this.github_repos.len() > 50 {
+            repos_list = repos_list.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "… and {} more repositories",
+                        this.github_repos.len() - 50
+                    )),
+            );
+        }
+        column = column
+            .child(div().h(px(1.)).bg(theme.border.opacity(0.5)))
+            .child(repos_list);
+    } else if this.github_total_stars == Some(0) && !this.github_loading && this.github_error.is_none() {
+        // User exists but has no public repos.
+        column = column.child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("No public repositories found."),
+        );
+    }
+
+    // Outer wrapper ensures a sensible max width in Settings (centered).
+    div()
+        .w_full()
+        .max_w(px(520.))
+        .child(column)
+        .into_any_element()
+}
+
 fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let Some(kind) = this.composer else {
@@ -2046,12 +2573,25 @@ fn render_entries(
             .into_any_element();
     }
 
+    // Text used for Shift+right-click "Copy as list"
+    let clipboard_text = visible
+        .iter()
+        .map(|entry| {
+            if let Some(title) = &entry.title {
+                format!("{title}\n{}", entry.content)
+            } else {
+                entry.content.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
     let cloned_selected = this.selected.clone();
     let items = visible
         .into_iter()
         .map(|entry| {
             let entry_selected = cloned_selected.clone();
-            render_entry_card(
+            let entry_card = render_entry_card(
                 entry,
                 &this.selected,
                 &theme,
@@ -2060,7 +2600,33 @@ fn render_entries(
                     let _ = window;
                     cx.notify();
                 }),
-            )
+            );
+            // Shift+right-click context menu: copy visible entries as list.
+            // We wrap the card with a context menu that only materializes when Shift is held.
+            let text_for_menu = clipboard_text.clone();
+            // Also support direct Shift+right-click via mouse_down that copies without opening menu.
+            let text_for_direct = clipboard_text.clone();
+            let card_with_menu = div()
+                .child(entry_card)
+                .on_mouse_down(MouseButton::Right, move |_event, window, cx| {
+                    if is_shift_held() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text_for_direct.clone()));
+                        // Prevent propagation so the plain right-click doesn't also trigger other handlers.
+                        window.refresh();
+                    }
+                })
+                .context_menu(move |menu, _window, _cx| {
+                    if !is_shift_held() {
+                        return menu;
+                    }
+                    let text = text_for_menu.clone();
+                    menu.item(
+                        PopupMenuItem::new("Copy as list").on_click(move |_event, _window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }),
+                    )
+                });
+            card_with_menu.into_any_element()
         })
         .collect::<Vec<_>>();
 
@@ -2079,7 +2645,6 @@ fn render_entry_card(
     theme: &gpui_component::Theme,
     listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let heading = entry.title.as_deref().unwrap_or(&entry.content);
     let kind = entry_kind(&entry.kind);
     let is_selected = selected.as_deref() == Some(&entry.id);
 
@@ -2114,21 +2679,55 @@ fn render_entry_card(
                         })
                         .child(relative_time(entry.created_at)),
                 ),
-        )
-        .child(
+        );
+
+    // Markdown rendering: `text` entries are stored as raw markdown in the DB
+    // (the composer Input accepts markdown). `link`/`image` entries keep their
+    // previous plain rendering so URLs and file paths are not mis-parsed.
+    if entry.kind == "text" {
+        if let Some(title) = &entry.title {
+            // Title is a single-line heading — render inline markdown (bold,
+            // italic, inline code, emojis) at `text_lg`. Body is full markdown.
+            row = row
+                .child(
+                    div()
+                        .text_lg()
+                        .text_color(theme.foreground)
+                        .child(crate::markdown::render_markdown_inline(title, theme)),
+                )
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(crate::markdown::render_markdown(&entry.content, theme)),
+                );
+        } else {
+            // No separate title — the content itself is the heading/body.
+            // Render the whole markdown block so headings, lists, code fences
+            // and emojis appear correctly.
+            row = row.child(
+                div()
+                    .text_color(theme.foreground)
+                    .child(crate::markdown::render_markdown(&entry.content, theme)),
+            );
+        }
+    } else {
+        // Non-text entries (link / image) — preserve the previous plain layout
+        // but still support markdown for titles if present.
+        let heading = entry.title.as_deref().unwrap_or(&entry.content);
+        row = row.child(
             div()
                 .text_lg()
                 .text_color(theme.foreground)
                 .child(heading.to_owned()),
         );
-
-    if entry.title.is_some() {
-        row = row.child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(entry.content.clone()),
-        );
+        if entry.title.is_some() {
+            row = row.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(entry.content.clone()),
+            );
+        }
     }
 
     if is_selected {
@@ -2178,6 +2777,16 @@ fn trim_opt(value: &str) -> Option<String> {
     } else {
         Some(value.to_owned())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_shift_held() -> bool {
+    crate::status_item::is_shift_held()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_shift_held() -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 //! falls back to an in-memory store so the app stays fully usable.
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -29,6 +30,7 @@ pub enum AppCommand {
     NewNote,
     NewLink,
     CaptureText(String),
+    CaptureImage { path: String, mime_type: String },
     Quit,
 }
 
@@ -51,6 +53,8 @@ pub struct WorktableService {
     runtime: Option<Arc<WorktableRuntime>>,
     /// In-memory fallback used when the local database is unavailable.
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
+    /// In-memory config fallback when the database is unavailable.
+    memory_config: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     persistent: bool,
     command_tx: mpsc::UnboundedSender<AppCommand>,
     command_rx: Option<std::sync::Mutex<Option<mpsc::UnboundedReceiver<AppCommand>>>>,
@@ -73,6 +77,7 @@ impl WorktableService {
             tokio,
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             persistent,
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
@@ -128,12 +133,29 @@ impl WorktableService {
     }
 
     /// Insert an entry, persisting to the local database when available.
+    ///
+    /// When HelixDB is reachable the entry is also mirrored into the graph
+    /// (label `Entry`, props `id/kind/content/title/source/created_at`) via
+    /// `worktable-helix` best-effort — failures are logged but do not fail the
+    /// insert, so SQLite remains the source-of-truth.
     pub async fn insert_entry(&self, entry: WorktableEntry) -> EmptyResult {
         if let Some(runtime) = &self.runtime {
             runtime
                 .insert_entry(&entry)
                 .await
                 .map_err(|error| error.to_string())?;
+        } else {
+            // In-memory fallback (no SQLite) — still best-effort mirror to Helix.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let entry_clone = entry.clone();
+                self.tokio.spawn(async move {
+                    let helix = worktable_helix::HelixClient::from_env();
+                    if let Err(err) = helix.sync_entry(&entry_clone).await {
+                        eprintln!("[worktable] Helix sync (memory mode) failed: {err}");
+                    }
+                });
+            }
         }
         self.memory.lock().await.push(entry);
         Ok(())
@@ -225,6 +247,115 @@ impl WorktableService {
             runtime.answer_auth_prompt(&prompt_id, &answer).await
         })
         .await
+    }
+
+    // ---- Generic wt_ai_config access (github_username, github_token, etc.) ----
+
+    pub async fn get_config(&self, key: &str) -> Result<Option<String>, String> {
+        if let Some(runtime) = self.runtime.clone() {
+            let key = key.to_owned();
+            let tokio = self.tokio.clone();
+            tokio
+                .spawn(async move { runtime.get_config(&key) })
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(self.memory_config.lock().await.get(key).cloned())
+        }
+    }
+
+    pub async fn set_config(&self, key: &str, value: &str) -> Result<(), String> {
+        if let Some(runtime) = self.runtime.clone() {
+            let key = key.to_owned();
+            let value = value.to_owned();
+            let tokio = self.tokio.clone();
+            tokio
+                .spawn(async move { runtime.set_config(&key, &value) })
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())
+        } else {
+            self.memory_config
+                .lock()
+                .await
+                .insert(key.to_owned(), value.to_owned());
+            Ok(())
+        }
+    }
+
+    pub async fn delete_config(&self, key: &str) -> Result<(), String> {
+        if let Some(runtime) = self.runtime.clone() {
+            let key = key.to_owned();
+            let tokio = self.tokio.clone();
+            tokio
+                .spawn(async move { runtime.delete_config(&key) })
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())
+        } else {
+            self.memory_config.lock().await.remove(key);
+            Ok(())
+        }
+    }
+
+    pub async fn get_github_username(&self) -> Result<Option<String>, String> {
+        self.get_config("github_username").await
+    }
+
+    pub async fn set_github_username(&self, username: &str) -> Result<(), String> {
+        let username = username.trim();
+        if username.is_empty() {
+            return self.delete_config("github_username").await;
+        }
+        self.set_config("github_username", username).await
+    }
+
+    /// Resolve optional GitHub token from (in priority order):
+    /// 1) `GITHUB_TOKEN` env var
+    /// 2) `wt_ai_config.github_token`
+    /// 3) provider credential `github` (key field)
+    pub async fn get_github_token(&self) -> Option<String> {
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            let t = token.trim().to_owned();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+        if let Ok(Some(token)) = self.get_config("github_token").await {
+            let t = token.trim().to_owned();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+        if let Some(runtime) = self.runtime.clone() {
+            let tokio = self.tokio.clone();
+            if let Ok(Ok(Some(cred))) = tokio
+                .spawn(async move { runtime.read_provider_credential("github") })
+                .await
+            {
+                let t = cred.key.trim().to_owned();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
+    /// Fetch GitHub stars for `username`, using an optional token from credentials/env.
+    pub async fn fetch_github_stars(
+        &self,
+        username: &str,
+    ) -> Result<(u64, Vec<crate::github::GithubRepo>), String> {
+        let token = self.get_github_token().await;
+        let username = username.to_owned();
+        let tokio = self.tokio.clone();
+        tokio
+            .spawn(async move { crate::github::fetch_github_stars(&username, token).await })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
     }
 
     pub async fn shutdown(&self) {

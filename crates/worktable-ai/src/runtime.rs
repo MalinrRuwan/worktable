@@ -69,11 +69,59 @@ impl WorktableRuntime {
     }
 
     pub async fn insert_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
-        self.store.insert_entry(entry)
+        self.store.insert_entry(entry)?;
+
+        // Best-effort Helix mirror. SQLite remains source-of-truth; if Helix is
+        // not running we log and continue. Never fail the SQLite insert.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let entry_owned = entry.clone();
+            // Fire-and-forget so the UI stays snappy. Errors are logged to stderr.
+            tokio::spawn(async move {
+                let helix = worktable_helix::HelixClient::from_env();
+                if let Err(err) = helix.sync_entry(&entry_owned).await {
+                    eprintln!("[worktable] Helix sync_entry failed (fallback to SQLite): {err}");
+                }
+            });
+        }
+
+        Ok(())
     }
 
     pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
-        self.store.delete_entry(id)
+        self.store.delete_entry(id)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let id_owned = id.to_owned();
+            tokio::spawn(async move {
+                let helix = worktable_helix::HelixClient::from_env();
+                if let Err(err) = helix.delete_entry(&id_owned).await {
+                    eprintln!("[worktable] Helix delete_entry failed (fallback to SQLite): {err}");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Helix best-effort search (for UI or direct API callers). On WASM or
+    /// when Helix is down returns `Ok(empty)`.
+    pub async fn search_helix(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let helix = worktable_helix::HelixClient::from_env();
+            helix.search_best_effort(query, limit).await
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (query, limit);
+            Ok(Vec::new())
+        }
     }
 
     pub async fn start_ai_worker(&self) -> anyhow::Result<()> {
@@ -314,6 +362,26 @@ impl WorktableRuntime {
             answer: answer.to_owned(),
         })
         .await
+    }
+
+    /// Generic config access via `wt_ai_config` table (e.g. `github_username`).
+    pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.store.get_config(key)
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.store.set_config(key, value)
+    }
+
+    pub fn delete_config(&self, key: &str) -> anyhow::Result<()> {
+        self.store.delete_config(key)
+    }
+
+    pub fn read_provider_credential(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Option<worktable_db::ProviderCredential>> {
+        self.store.read_provider_credential(provider_id)
     }
 
     async fn send_to_worker(&self, request: WorkerRequest) -> anyhow::Result<()> {
