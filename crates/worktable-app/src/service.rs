@@ -138,6 +138,15 @@ impl WorktableService {
         self.persistent
     }
 
+    pub fn database_path(&self) -> String {
+        self.runtime
+            .as_ref()
+            .map(|r| r.database_path().to_owned())
+            .unwrap_or_else(|| {
+                resolve_database_path().unwrap_or_else(|_| "/tmp/worktable.db".to_string())
+            })
+    }
+
     pub fn has_ai_worker(&self) -> bool {
         self.runtime.is_some()
     }

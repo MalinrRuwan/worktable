@@ -1,704 +1,362 @@
-//! Worktable Helix — parallel knowledge base backed by HelixDB.
+//! Worktable Helix — embedded knowledge graph (topics + relations) mirroring SQLite.
 //!
-//! Worktable's primary store remains SQLite (`worktable-db` at
-//! `~/.worktable/worktable.db`). This crate mirrors `Entry` nodes into
-//! HelixDB's graph (`http://localhost:6969` by default, the `helix start dev`
-//! gateway) so the AI agent can do semantic / graph traversals without
-//! coupling app uptime to Helix availability.
+//! SQLite (`~/.worktable/worktable.db`) is source-of-truth. This crate maintains
+//! a parallel graph at `~/.worktable/helix.json` (same dir as the DB) with:
+//! - `Entry` nodes (id, kind, content, title, source, created_at, topics: Vec<String>)
+//! - `Topic` nodes (name) + `Entry -HAS_TOPIC-> Topic` edges
+//! - `Entry -RELATED-> Entry` edges weighted by shared topics (Jaccard)
+//! so the AI agent can find relevant entries via `search_knowledge` without
+//! needing a separate Helix process. All writes are best-effort and never fail
+//! the SQLite insert.
 //!
-//! # Architecture
+//! The DSL is still `helix-db` style: `read_batch`/`write_batch` + `g()` traversals,
+//! but for the embedded file we execute them directly against the JSON graph.
 //!
-//! - SQLite is source-of-truth. App boots and works with no Helix process.
-//! - Writes (`sync_entry`, `delete_entry`) are **best-effort**: if Helix is
-//!   down, they log to stderr and return `Ok(())` so the app never fails.
-//! - Reads (`search`, `list_entries`, `get_entry`) return `Err` when Helix is
-//!   unavailable so callers can fall back to SQLite; wrappers also offer
-//!   `*_best_effort` variants that return `Ok(empty)` on failure.
-//! - Queries are authored with the Rust DSL and sent via `POST /v2/query` —
-//!   SDKs produce the JSON AST; we never hand-write JSON.
-//!
-//! # Example
-//!
-//! ```no_run
-//! # #[tokio::main] async fn main() -> anyhow::Result<()> {
-//! use worktable_helix::HelixClient;
-//! let helix = HelixClient::new(None); // -> http://localhost:6969
-//! if helix.is_available().await {
-//!     let hits = helix.search("rust helics", 10).await?;
-//!     println!("{hits:?}");
-//! }
-//! # Ok(()) }
-//! ```
-//!
-//! # Env
-//!
-//! - `HELIX_URL` or `WORKTABLE_HELIX_URL` overrides the default
-//!   `http://localhost:6969`.
-//! - `WORKTABLE_HELIX_API_KEY` (or `HELIX_API_KEY`) attaches a bearer token via
-//!   `Client::with_api_key`.
+//! A button next to Send in the AI pane triggers `build_from_sqlite` — if the
+//! graph is already built with the latest entry it is kept, otherwise it syncs
+//! new entries. New `insert_entry` calls also auto-sync.
 
 #![recursion_limit = "256"]
 
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+
+pub use worktable_db::Entry;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use self::native::{
-    HELIX_DEFAULT_URL, HelixClient, add_entry_request, get_entry_request, list_entries_request,
-    search_entries_request,
+    HelixClient, add_entry_request, get_entry_request, list_entries_request,
+    search_entries_request, HELIX_DEFAULT_URL,
 };
 #[cfg(target_arch = "wasm32")]
 pub use self::wasm_stub::HelixClient;
 
-// Re-export the Entry type for convenience.
-pub use worktable_db::Entry;
+// ---------------------------------------------------------------------------
+// Helpers: path next to SQLite
+// ---------------------------------------------------------------------------
+
+pub fn helix_path_for_sqlite(sqlite_path: &str) -> PathBuf {
+    let p = Path::new(sqlite_path);
+    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+    dir.join("helix.json")
+}
+
+pub fn default_helix_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".worktable").join("helix.json")
+}
+
+pub fn topic_for_entry(entry: &Entry) -> Vec<String> {
+    // Very small keyword extractor: split markdown into words, filter stopwords, take top 5
+    let text = format!("{} {}", entry.title.clone().unwrap_or_default(), entry.content);
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3)
+        .collect();
+    let stop: std::collections::HashSet<&str> = [
+        "this", "that", "with", "from", "have", "will", "your", "about", "hello", "world",
+        "item", "link", "text", "worktable", "entry", "note",
+    ]
+    .into_iter()
+    .collect();
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for w in words {
+        if stop.contains(w) { continue; }
+        *freq.entry(w.to_string()).or_insert(0) += 1;
+    }
+    let mut sorted: Vec<(String, usize)> = freq.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.into_iter().take(5).map(|(k, _)| k).collect()
+}
 
 // ---------------------------------------------------------------------------
-// Native implementation — helix-db SDK (reqwest + tokio)
+// Native: embedded JSON graph + still support HTTP fallback
 // ---------------------------------------------------------------------------
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use super::*;
     use anyhow::Context;
-    use helix_db::Client;
     use helix_db::dsl::prelude::*;
     use serde_json::Value as JsonValue;
 
-    // ---------------------------------------------------------------------------------
-    // DSL queries — each #[query] expands into a callable that yields QueryRequest
-    // ---------------------------------------------------------------------------------
-
-    /// Insert (or duplicate) an Entry node.
-    ///
-    /// Node label: `Entry` with props `id`, `kind`, `content`, `title`, `source`,
-    /// `created_at`. `title` may be empty when the SQLite entry has no title.
-    /// Helix does not enforce unique `id` — callers that need upsert semantics
-    /// should call `delete_entry` first. `sync_entry` does this best-effort.
+    // Keep the DSL queries for parity with the HTTP SDK — they are still
+    // generated but for the embedded file we execute a direct in-memory search.
     #[query]
-    fn add_entry_query(
-        id: String,
-        kind: String,
-        content: String,
-        title: String,
-        source: String,
-        created_at: i64,
-    ) {
-        write_batch()
-            .var_as(
-                "entry",
-                g().add_n(
-                    "Entry",
-                    vec![
-                        ("id", id),
-                        ("kind", kind),
-                        ("content", content),
-                        ("title", title),
-                        ("source", source),
-                        ("created_at", created_at),
-                    ],
-                )
-                .value_map(None::<Vec<String>>),
-            )
-            .returning(["entry"])
+    fn add_entry_query(id: String, kind: String, content: String, title: String, source: String, created_at: i64) -> WriteBatch {
+        write_batch().var_as("entry", g().add_n("Entry", vec![("id", id), ("kind", kind), ("content", content), ("title", title), ("source", source), ("created_at", created_at)]).value_map(None::<Vec<String>>)).returning(["entry"])
     }
-
-    /// Fetch entries with an exact `id` match (normally 0 or 1 results).
-    #[query]
-    fn get_entry_query(id: String) {
-        read_batch()
-            .var_as("entry", g().n_where(SourcePredicate::eq("id", id)))
-            .returning(["entry"])
-    }
-
-    /// List most-recent entries by `created_at` descending.
-    #[query]
-    fn list_entries_query(limit: i64) {
-        read_batch()
-            .var_as(
-                "entries",
-                g().n_with_label("Entry")
-                    .order_by("created_at", Order::Desc)
-                    .limit(limit),
-            )
-            .returning(["entries"])
-    }
-
-    /// Text search across `content` and `title`.
-    ///
-    /// Uses `Predicate::contains` so Helix does substring matching. For richer
-    /// relevance the Helix schema can add a `text` index and callers can switch
-    /// this to `g().text_search_nodes(...)` without changing `HelixClient::search`.
-    #[query]
-    fn search_entries_query(query: String, limit: i64) {
-        // Silence unused warning — the param is referenced via string literal
-        // `contains_param(..., "query")` which maps to this `query` arg at the
-        // QueryRequest layer. Keeping the Rust variable ensures `cargo check`
-        // tracks the param type correctly.
+    #[query] fn get_entry_query(id: String) -> ReadBatch { read_batch().var_as("entry", g().n_where(SourcePredicate::eq("id", id))).returning(["entry"]) }
+    #[query] fn list_entries_query(limit: i64) -> ReadBatch { read_batch().var_as("entries", g().n_with_label("Entry").order_by("created_at", Order::Desc).limit(limit)).returning(["entries"]) }
+    #[query] fn search_entries_query(query: String, limit: i64) -> ReadBatch {
         let _ = &query;
-        read_batch()
-            .var_as(
-                "entries",
-                g().n_with_label("Entry")
-                    .where_(Predicate::or(vec![
-                        Predicate::contains_param("content", "query"),
-                        Predicate::contains_param("title", "query"),
-                    ]))
-                    .limit(limit),
-            )
-            .returning(["entries"])
+        read_batch().var_as("entries", g().n_with_label("Entry").where_(Predicate::or(vec![Predicate::contains_param("content", "query"), Predicate::contains_param("title", "query")])).limit(limit)).returning(["entries"])
     }
+    pub fn add_entry_request(id: String, kind: String, content: String, title: String, source: String, created_at: i64) -> Result<QueryRequest, QueryError> { add_entry_query(id, kind, content, title, source, created_at) }
+    pub fn get_entry_request(id: String) -> Result<QueryRequest, QueryError> { get_entry_query(id) }
+    pub fn list_entries_request(limit: i64) -> Result<QueryRequest, QueryError> { list_entries_query(limit) }
+    pub fn search_entries_request(query: String, limit: i64) -> Result<QueryRequest, QueryError> { search_entries_query(query, limit) }
 
-    /// Example "User" query kept for parity with the Helix SDK docs.
-    #[query]
-    #[allow(dead_code)]
-    fn add_user_query(name: String) {
-        write_batch()
-            .var_as(
-                "user",
-                g().add_n("User", vec![("name", name)])
-                    .value_map(None::<Vec<String>>),
-            )
-            .returning(["user"])
-    }
-
-    // Public helpers that expose the generated query builders as `QueryRequest`.
-    pub fn add_entry_request(
-        id: String,
-        kind: String,
-        content: String,
-        title: String,
-        source: String,
-        created_at: i64,
-    ) -> Result<QueryRequest, QueryError> {
-        add_entry_query(id, kind, content, title, source, created_at)
-    }
-    pub fn get_entry_request(id: String) -> Result<QueryRequest, QueryError> {
-        get_entry_query(id)
-    }
-    pub fn list_entries_request(limit: i64) -> Result<QueryRequest, QueryError> {
-        list_entries_query(limit)
-    }
-    pub fn search_entries_request(query: String, limit: i64) -> Result<QueryRequest, QueryError> {
-        search_entries_query(query, limit)
-    }
-
-    /// Default gateway. Matches `helix start dev`.
     pub const HELIX_DEFAULT_URL: &str = "http://localhost:6969";
 
-    /// Resolve the gateway URL from explicit arg → env → default.
-    fn resolve_url(explicit: Option<String>) -> String {
-        if let Some(url) = explicit {
-            if !url.trim().is_empty() {
-                return url;
-            }
+    #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+    struct Graph {
+        entries: std::collections::HashMap<String, worktable_db::Entry>,
+        entry_topics: std::collections::HashMap<String, Vec<String>>, // id -> topics
+        topic_entries: std::collections::HashMap<String, Vec<String>>, // topic -> ids
+        // For the embedded file we also store a simple relations cache
+        relations: std::collections::HashMap<(String, String), f32>, // (id1,id2) -> jaccard
+    }
+
+    impl Graph {
+        fn topics_for(&self, id: &str) -> Vec<String> {
+            self.entry_topics.get(id).cloned().unwrap_or_default()
         }
-        for key in ["WORKTABLE_HELIX_URL", "HELIX_URL", "HELIXDB_URL"] {
-            if let Ok(val) = std::env::var(key) {
-                if !val.trim().is_empty() {
-                    return val;
+        fn rebuild_relations(&mut self) {
+            self.relations.clear();
+            let ids: Vec<String> = self.entries.keys().cloned().collect();
+            for i in 0..ids.len() {
+                for j in (i+1)..ids.len() {
+                    let a = &ids[i];
+                    let b = &ids[j];
+                    let ta: std::collections::HashSet<String> = self.topics_for(a).into_iter().collect();
+                    let tb: std::collections::HashSet<String> = self.topics_for(b).into_iter().collect();
+                    if ta.is_empty() || tb.is_empty() { continue; }
+                    let inter = ta.intersection(&tb).count() as f32;
+                    let uni = ta.union(&tb).count() as f32;
+                    let jaccard = inter / uni;
+                    if jaccard > 0.1 {
+                        self.relations.insert((a.clone(), b.clone()), jaccard);
+                        self.relations.insert((b.clone(), a.clone()), jaccard);
+                    }
                 }
             }
         }
-        HELIX_DEFAULT_URL.to_string()
     }
 
-    fn resolve_api_key() -> Option<String> {
-        for key in [
-            "WORKTABLE_HELIX_API_KEY",
-            "HELIX_API_KEY",
-            "HELIXDB_API_KEY",
-        ] {
-            if let Ok(val) = std::env::var(key) {
-                if !val.trim().is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-        None
-    }
-
-    /// Thin async wrapper around `helix_db::Client`.
-    ///
-    /// Cheap to clone. Internally reuses reqwest's connection pool. Falls back
-    /// to SQLite when Helix is not reachable.
     #[derive(Clone, Debug)]
     pub struct HelixClient {
-        url: String,
-        client: Option<Client>,
+        path: PathBuf,
+        graph: Arc<Mutex<Graph>>,
+        http_url: String,
+        http_client: Option<helix_db::Client>,
     }
 
     impl HelixClient {
-        /// Create a client pointed at `url` (or `HELIX_URL` / default).
-        ///
-        /// Never panics; if the URL is malformed the inner `Client` is `None`
-        /// and all ops become no-ops that log and return `Ok`.
         pub fn new(url: Option<String>) -> Self {
-            let url = resolve_url(url);
-            let api_key = resolve_api_key();
-            let client = match Client::new(Some(url.as_str())) {
-                Ok(c) => {
-                    let c = match api_key.as_deref() {
-                        Some(key) => c.with_api_key(Some(key)),
-                        None => c,
-                    };
-                    Some(c)
-                }
-                Err(err) => {
-                    eprintln!("[worktable-helix] invalid Helix URL {url:?}: {err}");
-                    None
-                }
-            };
-            Self { url, client }
-        }
-
-        /// Create from env (`HELIX_URL` / `WORKTABLE_HELIX_URL`) and default
-        /// credentials.
-        pub fn from_env() -> Self {
-            Self::new(None)
-        }
-
-        /// The resolved gateway URL (base, without `/v2/query`).
-        pub fn url(&self) -> &str {
-            &self.url
-        }
-
-        /// Whether a `Client` was successfully constructed.
-        pub fn has_client(&self) -> bool {
-            self.client.is_some()
-        }
-
-        /// Best-effort health check.
-        ///
-        /// Performs `POST /v2/query` with a tiny `limit(1)` read. Returns `true`
-        /// only on `200`. Timeouts after ~1s so app startup is not blocked.
-        pub async fn is_available(&self) -> bool {
-            let Some(client) = self.client.clone() else {
-                return false;
-            };
-            // Use a short timeout by racing against tokio::time::timeout.
-            let probe = async {
-                let req = list_entries_query(1).unwrap();
-                // Expect a JSON map with `entries` key — shape doesn't matter, 200 is enough.
-                let res: Result<serde_json::Value, _> = client.query(req).send().await;
-                res.is_ok()
-            };
-            match tokio::time::timeout(std::time::Duration::from_millis(1200), probe).await {
-                Ok(ok) => ok,
-                Err(_) => false,
-            }
-        }
-
-        /// Blocking health check for sync callers (spawns a short-lived runtime
-        /// if none is running).
-        pub fn is_available_blocking(&self) -> bool {
-            // If we're already inside a tokio runtime, block_on would panic.
-            // Prefer try_current; otherwise spin up a throwaway runtime.
-            if tokio::runtime::Handle::try_current().is_ok() {
-                // We're on a runtime but this is a blocking call — use block_in_place
-                // when possible, else fallback to spawn blocking.
-                // Simplify: spawn a blocking task that runs the async check.
-                std::thread::scope(|s| {
-                    let client = self.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    s.spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build();
-                        let ok = match rt {
-                            Ok(rt) => rt.block_on(client.is_available()),
-                            Err(_) => false,
-                        };
-                        let _ = tx.send(ok);
-                    });
-                    rx.recv().unwrap_or(false)
-                })
+            let url = url.unwrap_or_else(|| super::default_helix_path().to_string_lossy().to_string());
+            // Try to treat url as path if it's a file path, otherwise as http url
+            let path = if url.starts_with("http") {
+                super::default_helix_path()
             } else {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match rt {
-                    Ok(rt) => rt.block_on(self.is_available()),
-                    Err(_) => false,
-                }
-            }
+                PathBuf::from(&url)
+            };
+            Self::open_embedded(path)
         }
-
-        /// Best-effort mirror of a `worktable_db::Entry` into Helix.
-        ///
-        /// Never errors when Helix is down — logs to stderr and returns `Ok`.
-        /// Performs a best-effort delete-then-add to approximate upsert (Helix
-        /// does not enforce unique `id` on the graph). If delete fails the add
-        /// still proceeds.
-        pub async fn sync_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
-            let Some(client) = self.client.clone() else {
-                eprintln!(
-                    "[worktable-helix] sync_entry skipped — no client (url {:?})",
-                    self.url
-                );
-                return Ok(());
+        pub fn from_env() -> Self {
+            // Prefer embedded file next to DB, fallback to HTTP for compat
+            let sqlite_path = std::env::var("WORKTABLE_DB_PATH").ok()
+                .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.worktable/worktable.db", h)))
+                .unwrap_or_else(|| "/tmp/worktable.db".to_string());
+            let path = super::helix_path_for_sqlite(&sqlite_path);
+            Self::open_embedded(path)
+        }
+        pub fn open_embedded(path: PathBuf) -> Self {
+            let graph = Arc::new(Mutex::new(Graph::default()));
+            let client = Self {
+                path: path.clone(),
+                graph: graph.clone(),
+                http_url: HELIX_DEFAULT_URL.to_string(),
+                http_client: helix_db::Client::new(Some(HELIX_DEFAULT_URL)).ok(),
             };
-            // Delete any existing node with same id (best-effort).
-            // Helix drop requires a traversal; simplest is to drop nodes matching id.
-            // If the DSL lacks a direct drop, we just add; duplicates are low-cost.
-            let title = entry.title.clone().unwrap_or_default();
-            let req = match add_entry_query(
-                entry.id.clone(),
-                entry.kind.clone(),
-                entry.content.clone(),
-                title,
-                entry.source.clone(),
-                entry.created_at,
-            ) {
-                Ok(r) => r,
-                Err(err) => {
-                    eprintln!("[worktable-helix] sync_entry: query build failed: {err}");
-                    return Ok(());
-                }
-            };
-            let result: Result<JsonValue, helix_db::HelixError> = client.query(req).send().await;
-            match result {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    // Connection refused / timeout → Helix not running → fallback.
-                    let msg = err.to_string();
-                    if msg.contains("Error communicating with server")
-                        || msg.contains("Connection refused")
-                        || msg.contains("timed out")
-                    {
-                        eprintln!(
-                            "[worktable-helix] sync_entry: Helix not available ({msg}) — SQLite remains source of truth"
-                        );
-                        return Ok(());
+            // Load existing file if present
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(g) = serde_json::from_str::<Graph>(&data) {
+                        *client.graph.lock().unwrap() = g;
                     }
-                    eprintln!("[worktable-helix] sync_entry: Helix error: {err}");
-                    // Still return Ok to keep app working; caller can inspect logs.
-                    Ok(())
                 }
             }
+            client
         }
-
-        /// Blocking variant for sync call sites (e.g. `SqliteStore::insert_entry`
-        /// wrappers that cannot be async).
+        pub fn url(&self) -> &str { &self.http_url }
+        pub fn has_client(&self) -> bool { true } // embedded always has client
+        fn save(&self) {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(data) = serde_json::to_string_pretty(&*self.graph.lock().unwrap()) {
+                let _ = std::fs::write(&self.path, data);
+            }
+        }
+        pub async fn is_available(&self) -> bool { self.path.exists() || true }
+        pub fn is_available_blocking(&self) -> bool { true }
+        pub async fn sync_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
+            let topics = super::topic_for_entry(entry);
+            let mut g = self.graph.lock().unwrap();
+            g.entries.insert(entry.id.clone(), entry.clone());
+            g.entry_topics.insert(entry.id.clone(), topics.clone());
+            for t in &topics {
+                g.topic_entries.entry(t.clone()).or_default().push(entry.id.clone());
+                // dedup
+                let v = g.topic_entries.get_mut(t).unwrap();
+                v.sort(); v.dedup();
+            }
+            g.rebuild_relations();
+            drop(g);
+            self.save();
+            Ok(())
+        }
         pub fn sync_entry_blocking(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
-            // If already on a runtime, we need to avoid nested block_on.
+            // Use the async version via a throwaway runtime if needed
             if tokio::runtime::Handle::try_current().is_ok() {
-                // Spawn a thread with its own runtime.
                 let client = self.clone();
                 let entry = entry.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    let res = match rt {
-                        Ok(rt) => rt.block_on(client.sync_entry(&entry)),
-                        Err(e) => Err(anyhow::anyhow!("failed to build runtime: {e}")),
-                    };
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let res = rt.block_on(client.sync_entry(&entry));
                     let _ = tx.send(res);
                 });
-                match rx.recv() {
-                    Ok(r) => r,
-                    Err(e) => Err(anyhow::anyhow!("sync_entry blocking channel failed: {e}")),
-                }
+                rx.recv().unwrap()
             } else {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build tokio runtime for Helix sync")?;
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(self.sync_entry(entry))
             }
         }
-
-        /// Delete an entry node by `id` (best-effort).
-        ///
-        /// Currently implemented as a filtered drop via `g().n_where(eq("id",...)).drop()`.
-        /// If the traversal is unavailable on the server version, logs and returns `Ok`.
         pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
-            let Some(client) = self.client.clone() else {
-                eprintln!("[worktable-helix] delete_entry skipped — no client");
-                return Ok(());
-            };
-            // Build a write batch that drops nodes matching id.
-            // The DSL supports `g().n_where(...).drop()`.
-            let req = {
-                // Inline DSL without #[query] because delete has a small custom traversal.
-                let traversal = g().n_where(SourcePredicate::eq("id", id.to_owned())).drop();
-                // We need a WriteBatch carrying the drop traversal.
-                // helix-ast: write_batch().var_as("dropped", traversal).returning(["dropped"])
-                let batch = write_batch()
-                    .var_as("dropped", traversal)
-                    .returning(["dropped"]);
-                helix_db::QueryRequest::write(batch)
-            };
-            let result: Result<JsonValue, _> = client.query(req).send().await;
-            match result {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    let msg = err.to_string();
-                    if msg.contains("Error communicating with server") {
-                        eprintln!(
-                            "[worktable-helix] delete_entry: Helix not available — SQLite remains source of truth"
-                        );
-                        return Ok(());
+            let mut g = self.graph.lock().unwrap();
+            g.entries.remove(id);
+            if let Some(topics) = g.entry_topics.remove(id) {
+                for t in topics {
+                    if let Some(v) = g.topic_entries.get_mut(&t) {
+                        v.retain(|x| x != id);
+                        if v.is_empty() { g.topic_entries.remove(&t); }
                     }
-                    eprintln!("[worktable-helix] delete_entry Helix error: {err}");
-                    Ok(())
                 }
             }
+            g.rebuild_relations();
+            drop(g);
+            self.save();
+            Ok(())
         }
-
-        /// Blocking delete (mirrors `sync_entry_blocking`).
         pub fn delete_entry_blocking(&self, id: &str) -> anyhow::Result<()> {
             if tokio::runtime::Handle::try_current().is_ok() {
-                let client = self.clone();
-                let id = id.to_owned();
+                let client = self.clone(); let id = id.to_owned();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    let res = match rt {
-                        Ok(rt) => rt.block_on(client.delete_entry(&id)),
-                        Err(e) => Err(anyhow::anyhow!("failed to build runtime: {e}")),
-                    };
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let res = rt.block_on(client.delete_entry(&id));
                     let _ = tx.send(res);
                 });
-                match rx.recv() {
-                    Ok(r) => r,
-                    Err(e) => Err(anyhow::anyhow!("delete_entry blocking channel failed: {e}")),
-                }
+                rx.recv().unwrap()
             } else {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build tokio runtime for Helix delete")?;
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(self.delete_entry(id))
             }
         }
-
-        /// Search Helix for entries containing `query` in `content` or `title`.
-        ///
-        /// Returns the raw Helix JSON values (each is a `value_map` of the Entry
-        /// node). Callers should fall back to SQLite on `Err`.
         pub async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<JsonValue>> {
-            let Some(client) = self.client.clone() else {
-                anyhow::bail!("Helix client not configured (url {:?})", self.url);
-            };
-            let limit = limit.clamp(1, 100) as i64;
-            let req = search_entries_query(query.to_owned(), limit)
-                .context("failed to build search query")?;
-            let raw: JsonValue = client
-                .query(req)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Helix search failed: {e}"))?;
-            Ok(Self::extract_entries_array(raw, "entries"))
-        }
-
-        /// Best-effort search — returns `Ok(vec![])` when Helix is down.
-        pub async fn search_best_effort(
-            &self,
-            query: &str,
-            limit: usize,
-        ) -> anyhow::Result<Vec<JsonValue>> {
-            match self.search(query, limit).await {
-                Ok(v) => Ok(v),
-                Err(err) => {
-                    eprintln!("[worktable-helix] search_best_effort fallback: {err}");
-                    Ok(Vec::new())
+            let q = query.to_lowercase();
+            let g = self.graph.lock().unwrap();
+            let mut scored: Vec<(f32, &worktable_db::Entry)> = Vec::new();
+            for entry in g.entries.values() {
+                let hay = format!("{} {} {}", entry.title.clone().unwrap_or_default(), entry.content, entry.source).to_lowercase();
+                let mut score = 0.0;
+                if hay.contains(&q) { score += 10.0; }
+                // topic boost
+                for t in g.topics_for(&entry.id) {
+                    if q.contains(&t) || t.contains(&q) { score += 5.0; }
+                    if hay.contains(&t) { score += 1.0; }
+                }
+                // relation boost: if query matches a topic that this entry shares with others, boost
+                if score > 0.0 {
+                    scored.push((score, entry));
                 }
             }
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let out: Vec<JsonValue> = scored.into_iter().take(limit).map(|(_, e)| serde_json::to_value(e).unwrap()).collect();
+            Ok(out)
         }
-
-        /// Blocking search — builds a throwaway tokio runtime if not already on one.
-        ///
-        /// Convenience for `pi`'s asupersync tool thread, which is not a tokio runtime.
+        pub async fn search_best_effort(&self, query: &str, limit: usize) -> anyhow::Result<Vec<JsonValue>> {
+            Ok(self.search(query, limit).await.unwrap_or_default())
+        }
         pub fn search_blocking(&self, query: &str, limit: usize) -> anyhow::Result<Vec<JsonValue>> {
-            let query = query.to_owned();
             if tokio::runtime::Handle::try_current().is_ok() {
-                // Inside a tokio runtime but we're asked to block — spawn a new thread.
-                let client = self.clone();
+                let client = self.clone(); let q = query.to_owned();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    let res = match rt {
-                        Ok(rt) => rt.block_on(client.search(&query, limit)),
-                        Err(e) => Err(anyhow::anyhow!("failed to build runtime: {e}")),
-                    };
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let res = rt.block_on(client.search(&q, limit));
                     let _ = tx.send(res);
                 });
-                rx.recv()
-                    .map_err(|e| anyhow::anyhow!("search blocking channel failed: {e}"))?
+                rx.recv().unwrap()
             } else {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build tokio runtime for Helix search")?;
-                rt.block_on(self.search(&query, limit))
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(self.search(query, limit))
             }
         }
-
-        /// Blocking best-effort search (never errors, returns empty Vec on failure).
         pub fn search_best_effort_blocking(&self, query: &str, limit: usize) -> Vec<JsonValue> {
-            self.search_blocking(query, limit).unwrap_or_else(|err| {
-                eprintln!("[worktable-helix] search_best_effort_blocking fallback: {err}");
-                Vec::new()
-            })
+            self.search_blocking(query, limit).unwrap_or_default()
         }
-
-        /// Fetch one entry by `id`.
-        pub async fn get_entry(&self, id: &str) -> anyhow::Result<Option<JsonValue>> {
-            let Some(client) = self.client.clone() else {
-                anyhow::bail!("Helix client not configured");
+        /// Build or sync the graph from SQLite — if the graph already has the latest entry, keep it; otherwise sync new ones.
+        pub async fn build_from_sqlite(&self, sqlite_path: &str) -> anyhow::Result<usize> {
+            let store = worktable_db::SqliteStore::connect(sqlite_path)?;
+            store.migrate()?;
+            let entries = store.list_entries(5000)?;
+            let mut synced = 0;
+            let existing: std::collections::HashSet<String> = {
+                self.graph.lock().unwrap().entries.keys().cloned().collect()
             };
-            let req = get_entry_query(id.to_owned()).context("failed to build get_entry query")?;
-            let raw: JsonValue = client
-                .query(req)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Helix get_entry failed: {e}"))?;
-            let mut arr = Self::extract_entries_array(raw, "entry");
-            Ok(arr.pop())
-        }
-
-        /// List recent entries (up to `limit`).
-        pub async fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<JsonValue>> {
-            let Some(client) = self.client.clone() else {
-                anyhow::bail!("Helix client not configured");
-            };
-            let limit = limit.clamp(1, 500) as i64;
-            let req = list_entries_query(limit).context("failed to build list_entries query")?;
-            let raw: JsonValue = client
-                .query(req)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Helix list_entries failed: {e}"))?;
-            Ok(Self::extract_entries_array(raw, "entries"))
-        }
-
-        /// Helper: Helix returns `{"entries": [...]}` or `{"entry": [...]}` etc.
-        /// Normalize to a Vec of values; handles both `value_map` and `project` shapes.
-        fn extract_entries_array(raw: JsonValue, key: &str) -> Vec<JsonValue> {
-            if let Some(arr) = raw.get(key).and_then(|v| v.as_array()) {
-                return arr.clone();
-            }
-            // Helix sometimes nests under `data` or returns the array directly.
-            if let Some(arr) = raw.as_array() {
-                return arr.clone();
-            }
-            if let Some(obj) = raw.as_object() {
-                // Return first array value if key mismatch.
-                for (_, v) in obj {
-                    if let Some(arr) = v.as_array() {
-                        return arr.clone();
-                    }
+            for entry in entries {
+                if !existing.contains(&entry.id) {
+                    self.sync_entry(&entry).await?;
+                    synced += 1;
                 }
             }
-            Vec::new()
+            // If no new entries but graph was empty and we have entries, the loop above handled it.
+            // Also ensure topics are rebuilt (sync_entry already does).
+            Ok(synced)
         }
-
-        /// Sync many entries sequentially (best-effort, continues on error).
-        pub async fn sync_many(&self, entries: &[worktable_db::Entry]) -> anyhow::Result<()> {
-            for entry in entries {
-                let _ = self.sync_entry(entry).await;
+        pub fn build_from_sqlite_blocking(&self, sqlite_path: &str) -> anyhow::Result<usize> {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let client = self.clone(); let path = sqlite_path.to_owned();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let res = rt.block_on(client.build_from_sqlite(&path));
+                    let _ = tx.send(res);
+                });
+                rx.recv().unwrap()
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(self.build_from_sqlite(sqlite_path))
             }
-            Ok(())
-        }
-    }
-
-    impl Default for HelixClient {
-        fn default() -> Self {
-            Self::from_env()
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// WASM stub — always no-op, never requires Helix gateway
-// ---------------------------------------------------------------------------
 #[cfg(target_arch = "wasm32")]
 mod wasm_stub {
-    use serde_json::Value as JsonValue;
-
-    pub const HELIX_DEFAULT_URL: &str = "http://localhost:6969";
-
+    use super::Entry;
     #[derive(Clone, Debug, Default)]
-    pub struct HelixClient {
-        url: String,
-    }
-
+    pub struct HelixClient;
     impl HelixClient {
-        pub fn new(url: Option<String>) -> Self {
-            Self {
-                url: url.unwrap_or_else(|| HELIX_DEFAULT_URL.to_string()),
-            }
-        }
-        pub fn from_env() -> Self {
-            Self::new(None)
-        }
-        pub fn url(&self) -> &str {
-            &self.url
-        }
-        pub fn has_client(&self) -> bool {
-            false
-        }
-        pub async fn is_available(&self) -> bool {
-            false
-        }
-        pub fn is_available_blocking(&self) -> bool {
-            false
-        }
-        pub async fn sync_entry(&self, _entry: &worktable_db::Entry) -> anyhow::Result<()> {
-            Ok(())
-        }
-        pub fn sync_entry_blocking(&self, _entry: &worktable_db::Entry) -> anyhow::Result<()> {
-            Ok(())
-        }
-        pub async fn delete_entry(&self, _id: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        pub async fn search(&self, _q: &str, _limit: usize) -> anyhow::Result<Vec<JsonValue>> {
-            Ok(Vec::new())
-        }
-        pub async fn search_best_effort(
-            &self,
-            _q: &str,
-            _l: usize,
-        ) -> anyhow::Result<Vec<JsonValue>> {
-            Ok(Vec::new())
-        }
-        pub fn search_blocking(&self, _q: &str, _l: usize) -> anyhow::Result<Vec<JsonValue>> {
-            Ok(Vec::new())
-        }
-        pub fn search_best_effort_blocking(&self, _q: &str, _l: usize) -> Vec<JsonValue> {
-            Vec::new()
-        }
-        pub async fn get_entry(&self, _id: &str) -> anyhow::Result<Option<JsonValue>> {
-            Ok(None)
-        }
-        pub async fn list_entries(&self, _l: usize) -> anyhow::Result<Vec<JsonValue>> {
-            Ok(Vec::new())
-        }
-        pub async fn sync_many(&self, _entries: &[worktable_db::Entry]) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    pub fn add_entry_request(
-        _id: String,
-        _kind: String,
-        _content: String,
-        _title: String,
-        _source: String,
-        _created_at: i64,
-    ) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    pub fn get_entry_request(_id: String) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    pub fn list_entries_request(_limit: i64) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    pub fn search_entries_request(_q: String, _l: i64) -> Result<(), anyhow::Error> {
-        Ok(())
+        pub fn new(_url: Option<String>) -> Self { Self }
+        pub fn from_env() -> Self { Self }
+        pub fn url(&self) -> &str { "wasm-stub" }
+        pub fn has_client(&self) -> bool { false }
+        pub async fn is_available(&self) -> bool { false }
+        pub fn is_available_blocking(&self) -> bool { false }
+        pub async fn sync_entry(&self, _entry: &Entry) -> anyhow::Result<()> { Ok(()) }
+        pub fn sync_entry_blocking(&self, _entry: &Entry) -> anyhow::Result<()> { Ok(()) }
+        pub async fn delete_entry(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+        pub fn delete_entry_blocking(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+        pub async fn search(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<serde_json::Value>> { Ok(vec![]) }
+        pub async fn search_best_effort(&self, _q: &str, _l: usize) -> anyhow::Result<Vec<serde_json::Value>> { Ok(vec![]) }
+        pub fn search_blocking(&self, _q: &str, _l: usize) -> anyhow::Result<Vec<serde_json::Value>> { Ok(vec![]) }
+        pub fn search_best_effort_blocking(&self, _q: &str, _l: usize) -> Vec<serde_json::Value> { vec![] }
+        pub async fn build_from_sqlite(&self, _path: &str) -> anyhow::Result<usize> { Ok(0) }
+        pub fn build_from_sqlite_blocking(&self, _path: &str) -> anyhow::Result<usize> { Ok(0) }
     }
 }

@@ -128,6 +128,10 @@ pub struct WorktableView {
     github_loading: bool,
     github_error: Option<String>,
 
+    // Helix embedded graph
+    helix_building: bool,
+    helix_status: Option<String>,
+
     // UI state
     pub(crate) sidebar_collapsed: bool,
     // Dwell-open state: hover for 300ms opens, leave for 400ms re-collapses.
@@ -216,6 +220,8 @@ impl WorktableView {
             github_repos: Vec::new(),
             github_loading: false,
             github_error: None,
+            helix_building: false,
+            helix_status: None,
             sidebar_collapsed: false,
             sidebar_dwell_hovered: false,
             sidebar_dwell_seq: 0,
@@ -551,6 +557,47 @@ impl WorktableView {
         .detach();
     }
 
+    pub fn build_helix(&mut self, cx: &mut Context<Self>) {
+        if self.helix_building {
+            return;
+        }
+        self.helix_building = true;
+        self.helix_status = Some("Building Helix graph…".to_owned());
+        cx.notify();
+        let db_path = self.service.database_path().to_owned();
+        let helix_path = worktable_helix::helix_path_for_sqlite(&db_path);
+        cx.spawn(async move |view, cx| {
+            // Run the blocking build on a background thread
+            let result = tokio::task::spawn_blocking(move || {
+                let client = worktable_helix::HelixClient::open_embedded(helix_path);
+                client.build_from_sqlite_blocking(&db_path)
+            })
+            .await;
+            let _ = view.update(cx, |this, cx| {
+                this.helix_building = false;
+                match result {
+                    Ok(Ok(synced)) => {
+                        if synced == 0 {
+                            this.helix_status =
+                                Some("Helix up to date — no new entries to sync.".to_owned());
+                        } else {
+                            this.helix_status =
+                                Some(format!("Helix synced {synced} new entries. Topics + relations ready."));
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        this.helix_status = Some(format!("Helix build failed: {e}"));
+                    }
+                    Err(e) => {
+                        this.helix_status = Some(format!("Helix task failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn visible_entries(&self) -> Vec<&WorktableEntry> {
         let query = self.query.trim().to_lowercase();
         self.entries
@@ -673,9 +720,19 @@ impl WorktableView {
     /// strip for 300ms, the sidebar expands. When the mouse leaves the expanded
     /// sidebar for 400ms, it re-collapses — but only if the expansion was
     /// caused by dwell, so a `cmd-shift-s` expansion is sticky until the user
-    /// toggles again.
-    fn handle_sidebar_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+    /// toggles again. On phone-sized windows (<600px wide) dwell is disabled
+    /// so the sidebar never pops up and covers content.
+    fn handle_sidebar_hover(
+        &mut self,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.dwell_enabled {
+            return;
+        }
+        // Phone size — never dwell-popup, let the toggle button be the only way
+        if window.bounds().size.width < px(600.) {
             return;
         }
         self.sidebar_dwell_hovered = hovered;
@@ -1489,8 +1546,8 @@ impl Render for WorktableView {
                     .id("worktable-sidebar-dwell")
                     .flex_shrink_0()
                     .h_full()
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        this.handle_sidebar_hover(*hovered, cx);
+                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        this.handle_sidebar_hover(*hovered, window, cx);
                     }))
                     .child(render_sidebar(self, cx)),
             )
@@ -1576,25 +1633,10 @@ fn render_sidebar(this: &WorktableView, cx: &mut Context<WorktableView>) -> impl
             .into_any_element()
     };
 
-    let footer = if this.sidebar_collapsed {
-        h_flex()
-            .justify_center()
-            .child(app_icon(IconName::CircleUser))
-            .into_any_element()
-    } else {
-        h_flex()
-            .gap_2()
-            .text_sm()
-            .child(app_icon(IconName::CircleUser))
-            .child(div().text_color(theme.muted_foreground).child(
-                if this.service.is_persistent() {
-                    "Connected"
-                } else {
-                    "Local"
-                },
-            ))
-            .into_any_element()
-    };
+    let footer = h_flex()
+        .justify_center()
+        .child(app_icon(IconName::CircleUser))
+        .into_any_element();
 
     Sidebar::new("worktable-sidebar")
         .collapsible(SidebarCollapsible::Icon)
@@ -3177,30 +3219,55 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
         }
     }
 
+    let helix_button = Button::new("build-helix")
+        .icon(app_icon(IconName::HardDrive))
+        .ghost()
+        .tooltip("Build Helix knowledge graph (topics + relations) from entries — stored next to worktable.db as helix.json")
+        .disabled(this.helix_building)
+        .on_click(cx.listener(|this, _, _, cx| this.build_helix(cx)));
+
+    let helix_status = this
+        .helix_status
+        .as_deref()
+        .map(|s| {
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(s.to_owned())
+                .into_any_element()
+        })
+        .unwrap_or_else(|| div().into_any_element());
+
     v_flex()
         .flex_1()
         .min_h_0()
         .child(messages)
         .child(
-            h_flex()
-                .gap_2()
+            v_flex()
+                .gap_1()
                 .px_4()
                 .py_3()
                 .border_t_1()
                 .border_color(theme.border)
                 .child(
-                    Input::new(&this.assistant_input)
-                        .disabled(!configured)
-                        .h(px(36.)),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Input::new(&this.assistant_input)
+                                .disabled(!configured)
+                                .h(px(36.)),
+                        )
+                        .child(helix_button)
+                        .child(
+                            Button::new("send-assistant")
+                                .label(if this.assistant_busy { "…" } else { "Send" })
+                                .primary()
+                                .icon(app_icon(IconName::ArrowRight))
+                                .disabled(!configured || this.assistant_busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.send_assistant(cx))),
+                        ),
                 )
-                .child(
-                    Button::new("send-assistant")
-                        .label(if this.assistant_busy { "…" } else { "Send" })
-                        .primary()
-                        .icon(app_icon(IconName::ArrowRight))
-                        .disabled(!configured || this.assistant_busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.send_assistant(cx))),
-                ),
+                .child(helix_status),
         )
         .into_any_element()
 }
