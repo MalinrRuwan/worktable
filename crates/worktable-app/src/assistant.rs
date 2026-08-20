@@ -1,8 +1,8 @@
-//! The AI assistant pane: a chat interface backed by the Pi worker.
+//! The AI assistant pane: a chat interface backed by the embedded Pi agent.
 
-use gpui::{InteractiveElement as _, ParentElement as _, Justify, Styled, div, px, relative};
+use gpui::{ParentElement as _, Styled, div, prelude::FluentBuilder, px, relative};
 use gpui_component::theme::Theme;
-use gpui_component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
+use gpui_component::{Icon, IconName, h_flex, v_flex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -56,7 +56,7 @@ pub fn welcome_panel(theme: &Theme, configured: bool) -> impl gpui::IntoElement 
                 .child(if configured {
                     "Ask about your notes — summarize, search, or brainstorm. Responses stream in as they're generated."
                 } else {
-                    "The AI assistant isn't configured yet.\n\nSet TURSO_DATABASE_URL / TURSO_AUTH_TOKEN / PI_PROVIDER / PI_MODEL and build the worker (cd agent && npm run build) to enable it."
+                    "The AI assistant isn't configured yet.\n\nOpen Settings (⌘,) to pick a provider, add an API key, or sign in with OAuth."
                 }),
         )
 }
@@ -75,7 +75,8 @@ pub fn render_message<'a>(
 
     h_flex()
         .w_full()
-        .justify(if is_user { Justify::End } else { Justify::Start })
+        .when(is_user, |this| this.justify_end())
+        .when(!is_user, |this| this.justify_start())
         .child(
             div()
                 .max_w(relative(0.85))

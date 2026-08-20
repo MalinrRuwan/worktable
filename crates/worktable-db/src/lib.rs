@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use turso_serverless::{Builder, Connection};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -75,6 +77,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS wt_entries_created_at_idx
         ON wt_entries (created_at DESC);
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS wt_ai_provider_credentials (
+        provider_id TEXT PRIMARY KEY,
+        credential_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 #[derive(Debug, Clone)]
@@ -87,101 +102,110 @@ pub struct Entry {
     pub created_at: i64,
 }
 
-#[derive(Clone)]
-pub struct TursoStore {
-    connection: Arc<Connection>,
-    database_url: String,
-    auth_token: String,
+/// A stored AI provider credential (serialized into `wt_ai_provider_credentials`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCredential {
+    pub kind: String,
+    pub key: String,
 }
 
-impl TursoStore {
-    pub async fn connect(url: &str, auth_token: &str) -> anyhow::Result<Self> {
-        let database = Builder::new_remote(url.to_owned())
-            .with_auth_token(auth_token.to_owned())
-            .build()
-            .await
-            .context("failed to connect to Turso")?;
+/// Local SQLite store shared with the in-process Pi agent runtime.
+///
+/// The AI agent runs in-process (`pi_agent_rust`) and reads/writes the same
+/// database file through this `SqliteStore`, so the connection is opened in WAL
+/// mode with a busy timeout — plain SQLite's locking keeps concurrent reads
+/// reliable, and no separate database engine is involved.
+#[derive(Clone)]
+pub struct SqliteStore {
+    connection: Arc<Mutex<Connection>>,
+    database_path: String,
+}
 
-        let connection = database
-            .connect()
-            .context("failed to create Turso connection")?;
+impl SqliteStore {
+    /// Open (or create) the local SQLite datafile.
+    pub fn connect(path: &str) -> anyhow::Result<Self> {
+        let connection = Connection::open(path).context("failed to open local SQLite database")?;
+        // WAL mode keeps concurrent reads reliable and avoids read/write lockups
+        // during AI requests.
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable WAL mode")?;
+        connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .context("failed to configure synchronous mode")?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .context("failed to set busy timeout")?;
 
         Ok(Self {
-            connection: Arc::new(connection),
-            database_url: url.to_owned(),
-            auth_token: auth_token.to_owned(),
+            connection: Arc::new(Mutex::new(connection)),
+            database_path: path.to_owned(),
         })
     }
 
-    pub async fn migrate(&self) -> anyhow::Result<()> {
-        self.connection
+    pub fn database_path(&self) -> &str {
+        &self.database_path
+    }
+
+    pub fn migrate(&self) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS wt_schema_migrations (
                     version INTEGER PRIMARY KEY,
                     applied_at TEXT NOT NULL
                 )",
             )
-            .await
-            .context("failed to initialize Turso migration tracking")?;
+            .context("failed to initialize migration tracking")?;
 
         for (index, migration) in MIGRATIONS.iter().enumerate() {
             let version = (index + 1) as i64;
 
-            let already_applied = self
-                .connection
-                .query(
+            let already_applied = connection
+                .query_row(
                     "SELECT 1 FROM wt_schema_migrations WHERE version = ?",
                     [version],
+                    |_| Ok(()),
                 )
-                .await
-                .context("failed to inspect Turso migrations")?
-                .next()
-                .await
-                .context("failed to read Turso migration state")?
-                .is_some();
+                .is_ok();
 
             if already_applied {
                 continue;
             }
 
-            self.connection
+            connection
                 .execute_batch(migration)
-                .await
-                .with_context(|| format!("failed to apply Turso migration {version}"))?;
+                .with_context(|| format!("failed to apply migration {version}"))?;
 
-            self.connection
+            connection
                 .execute(
                     "INSERT OR IGNORE INTO wt_schema_migrations (version, applied_at)
                      VALUES (?, datetime('now'))",
                     [version],
                 )
-                .await
-                .with_context(|| format!("failed to record Turso migration {version}"))?;
+                .with_context(|| format!("failed to record migration {version}"))?;
         }
 
         Ok(())
     }
 
-    pub async fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<Entry>> {
+    pub fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<Entry>> {
         let limit = limit.clamp(1, 500) as i64;
-        let mut rows = self
-            .connection
-            .query(
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let mut statement = connection
+            .prepare(
                 "SELECT id, kind, content, title, source, created_at
                  FROM wt_entries
                  ORDER BY created_at DESC
                  LIMIT ?",
-                [limit],
             )
-            .await
-            .context("failed to list Worktable entries")?;
+            .context("failed to prepare entry list")?;
+        let mut rows = statement
+            .query([limit])
+            .context("failed to query Worktable entries")?;
         let mut entries = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .context("failed to read a Worktable entry")?
-        {
+        while let Some(row) = rows.next().context("failed to read a Worktable entry")? {
             entries.push(Entry {
                 id: row.get(0).context("invalid entry id")?,
                 kind: row.get(1).context("invalid entry kind")?,
@@ -195,13 +219,14 @@ impl TursoStore {
         Ok(entries)
     }
 
-    pub async fn insert_entry(&self, entry: &Entry) -> anyhow::Result<()> {
-        self.connection
+    pub fn insert_entry(&self, entry: &Entry) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute(
                 "INSERT INTO wt_entries
                     (id, kind, content, title, source, created_at)
                  VALUES (?, ?, ?, ?, ?, ?)",
-                turso_serverless::params![
+                params![
                     entry.id.clone(),
                     entry.kind.clone(),
                     entry.content.clone(),
@@ -210,28 +235,28 @@ impl TursoStore {
                     entry.created_at
                 ],
             )
-            .await
             .context("failed to insert Worktable entry")?;
 
         Ok(())
     }
 
-    pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
-        self.connection
+    pub fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute("DELETE FROM wt_entries WHERE id = ?", [id])
-            .await
             .context("failed to delete Worktable entry")?;
 
         Ok(())
     }
 
-    pub async fn ensure_session(
+    pub fn ensure_session(
         &self,
         session_id: &str,
         title: Option<&str>,
         now_ms: i64,
     ) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute(
                 "INSERT INTO wt_ai_sessions
                     (id, pi_session_id, title, state, created_at, updated_at)
@@ -239,41 +264,38 @@ impl TursoStore {
                  ON CONFLICT(pi_session_id) DO UPDATE SET
                     title = COALESCE(excluded.title, wt_ai_sessions.title),
                     updated_at = excluded.updated_at",
-                turso_serverless::params![session_id, session_id, title, now_ms, now_ms],
+                params![session_id, session_id, title, now_ms, now_ms],
             )
-            .await
             .context("failed to ensure AI session")?;
 
         Ok(())
     }
 
-    pub async fn begin_run(
+    pub fn begin_run(
         &self,
         run_id: &str,
         session_id: &str,
         request_id: &str,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        let affected = self
-            .connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let affected = connection
             .execute(
                 "INSERT OR IGNORE INTO wt_ai_runs
                     (id, session_id, request_id, state, started_at)
                  VALUES (?, ?, ?, 'running', ?)",
-                turso_serverless::params![run_id, session_id, request_id, now_ms],
+                params![run_id, session_id, request_id, now_ms],
             )
-            .await
             .context("failed to begin AI run")?;
 
         if affected == 1 {
-            self.set_session_state(session_id, "running", Some(run_id), now_ms)
-                .await?;
+            self.set_session_state(session_id, "running", Some(run_id), now_ms)?;
         }
 
         Ok(affected == 1)
     }
 
-    pub async fn claim_session_lease(
+    pub fn claim_session_lease(
         &self,
         session_id: &str,
         owner_id: &str,
@@ -281,8 +303,8 @@ impl TursoStore {
         now_ms: i64,
         lease_until_ms: i64,
     ) -> anyhow::Result<bool> {
-        let affected = self
-            .connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let affected = connection
             .execute(
                 "INSERT INTO wt_ai_session_leases
                     (session_id, owner_id, run_id, lease_until, updated_at)
@@ -295,34 +317,32 @@ impl TursoStore {
                  WHERE wt_ai_session_leases.lease_until <= excluded.updated_at
                     OR (wt_ai_session_leases.owner_id = excluded.owner_id
                         AND wt_ai_session_leases.run_id = excluded.run_id)",
-                turso_serverless::params![session_id, owner_id, run_id, lease_until_ms, now_ms],
+                params![session_id, owner_id, run_id, lease_until_ms, now_ms],
             )
-            .await
             .context("failed to claim AI session lease")?;
 
         Ok(affected == 1)
     }
 
-    pub async fn release_session_lease(
+    pub fn release_session_lease(
         &self,
         session_id: &str,
         owner_id: &str,
         run_id: &str,
     ) -> anyhow::Result<bool> {
-        let affected = self
-            .connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let affected = connection
             .execute(
                 "DELETE FROM wt_ai_session_leases
                  WHERE session_id = ? AND owner_id = ? AND run_id = ?",
-                turso_serverless::params![session_id, owner_id, run_id],
+                params![session_id, owner_id, run_id],
             )
-            .await
             .context("failed to release AI session lease")?;
 
         Ok(affected == 1)
     }
 
-    pub async fn renew_session_lease(
+    pub fn renew_session_lease(
         &self,
         session_id: &str,
         owner_id: &str,
@@ -330,21 +350,20 @@ impl TursoStore {
         now_ms: i64,
         lease_until_ms: i64,
     ) -> anyhow::Result<bool> {
-        let affected = self
-            .connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let affected = connection
             .execute(
                 "UPDATE wt_ai_session_leases
                  SET lease_until = ?, updated_at = ?
                  WHERE session_id = ? AND owner_id = ? AND run_id = ?",
-                turso_serverless::params![lease_until_ms, now_ms, session_id, owner_id, run_id],
+                params![lease_until_ms, now_ms, session_id, owner_id, run_id],
             )
-            .await
             .context("failed to renew AI session lease")?;
 
         Ok(affected == 1)
     }
 
-    pub async fn record_event(
+    pub fn record_event(
         &self,
         event_id: &str,
         run_id: &str,
@@ -352,20 +371,20 @@ impl TursoStore {
         payload_json: &str,
         now_ms: i64,
     ) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute(
                 "INSERT INTO wt_ai_events
                     (id, run_id, event_type, payload_json, created_at)
                  VALUES (?, ?, ?, ?, ?)",
-                turso_serverless::params![event_id, run_id, event_type, payload_json, now_ms],
+                params![event_id, run_id, event_type, payload_json, now_ms],
             )
-            .await
             .context("failed to record AI event")?;
 
         Ok(())
     }
 
-    pub async fn finish_run(
+    pub fn finish_run(
         &self,
         run_id: &str,
         session_id: &str,
@@ -373,58 +392,162 @@ impl TursoStore {
         error: Option<&str>,
         now_ms: i64,
     ) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute(
                 "UPDATE wt_ai_runs
                  SET state = ?, completed_at = ?, error = ?
                  WHERE id = ?",
-                turso_serverless::params![state, now_ms, error, run_id],
+                params![state, now_ms, error, run_id],
             )
-            .await
             .context("failed to finish AI run")?;
 
-        self.connection
+        connection
             .execute(
                 "UPDATE wt_ai_sessions
                  SET state = 'idle', active_run_id = NULL, updated_at = ?
                  WHERE pi_session_id = ? AND active_run_id = ?",
-                turso_serverless::params![now_ms, session_id, run_id],
+                params![now_ms, session_id, run_id],
             )
-            .await
             .context("failed to finish AI session")?;
 
         Ok(())
     }
 
-    pub fn connection(&self) -> Arc<Connection> {
-        Arc::clone(&self.connection)
+    // ---- AI provider credentials + active selection (shared with the AI runtime) ----
+
+    /// Read a stored provider credential (e.g. an API key).
+    pub fn read_provider_credential(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Option<ProviderCredential>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let credential_json: Option<String> = connection
+            .query_row(
+                "SELECT credential_json FROM wt_ai_provider_credentials WHERE provider_id = ?",
+                [provider_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read provider credential")?;
+        let Some(credential_json) = credential_json else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(&credential_json).unwrap_or(None))
     }
 
-    pub fn database_url(&self) -> &str {
-        &self.database_url
+    /// Read every stored credential as a provider_id -> credential map.
+    pub fn list_provider_credentials(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, ProviderCredential>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let mut statement = connection
+            .prepare("SELECT provider_id, credential_json FROM wt_ai_provider_credentials")
+            .context("failed to prepare credential list")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed to query provider credentials")?;
+        let mut credentials = std::collections::HashMap::new();
+        for row in rows {
+            let (provider_id, credential_json) = row.context("failed to read credential row")?;
+            if let Ok(Some(credential)) =
+                serde_json::from_str::<Option<ProviderCredential>>(&credential_json)
+            {
+                credentials.insert(provider_id, credential);
+            }
+        }
+        Ok(credentials)
     }
 
-    pub fn auth_token(&self) -> &str {
-        &self.auth_token
+    /// Upsert a provider credential.
+    pub fn write_provider_credential(
+        &self,
+        provider_id: &str,
+        credential: &ProviderCredential,
+    ) -> anyhow::Result<()> {
+        let credential_json = serde_json::to_string(&Some(credential))?;
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
+            .execute(
+                "INSERT INTO wt_ai_provider_credentials (provider_id, credential_json, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(provider_id) DO UPDATE SET
+                   credential_json = excluded.credential_json,
+                   updated_at = excluded.updated_at",
+                params![provider_id, credential_json, now_ms()],
+            )
+            .context("failed to write provider credential")?;
+        Ok(())
     }
 
-    async fn set_session_state(
+    /// Remove a stored provider credential.
+    pub fn delete_provider_credential(&self, provider_id: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
+            .execute(
+                "DELETE FROM wt_ai_provider_credentials WHERE provider_id = ?",
+                [provider_id],
+            )
+            .context("failed to delete provider credential")?;
+        Ok(())
+    }
+
+    /// Read a `wt_ai_config` value (e.g. `active_provider`, `active_model`).
+    pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM wt_ai_config WHERE key = ?",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read AI config")?;
+        Ok(value)
+    }
+
+    /// Upsert a `wt_ai_config` value (e.g. `active_provider`, `active_model`).
+    pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
+            .execute(
+                "INSERT INTO wt_ai_config (key, value, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   updated_at = excluded.updated_at",
+                params![key, value, now_ms()],
+            )
+            .context("failed to write AI config")?;
+        Ok(())
+    }
+
+    fn set_session_state(
         &self,
         session_id: &str,
         state: &str,
         active_run_id: Option<&str>,
         now_ms: i64,
     ) -> anyhow::Result<()> {
-        self.connection
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
             .execute(
                 "UPDATE wt_ai_sessions
                  SET state = ?, active_run_id = ?, updated_at = ?
                  WHERE pi_session_id = ?",
-                turso_serverless::params![state, active_run_id, now_ms, session_id],
+                params![state, active_run_id, now_ms, session_id],
             )
-            .await
             .context("failed to update AI session state")?;
 
         Ok(())
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }

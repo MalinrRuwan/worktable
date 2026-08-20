@@ -7,19 +7,28 @@
 
 #![cfg(target_os = "macos")]
 
-use crate::service::AppCommand;
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::{define_class, msg_send, sel, MainThreadMarker};
-use objc2_app_kit::{
-    NSApplication, NSImage, NSMenuItem, NSMenu, NSStatusBar, NSStatusItem,
+use std::{
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
-use objc2_foundation::{NSPoint, NSSize, NSString};
-use std::sync::Arc;
+
+use crate::service::{AppCommand, CommandSender};
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::NSObject;
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, sel};
+use objc2_app_kit::{
+    NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSImage, NSImageScaling, NSMenu,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar,
+};
+use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
+use objc2_foundation::{NSSize, NSString};
 
 /// A small Objective-C object that forwards menu clicks to the command sender.
 struct MenuTargetIvars {
-    sender: Arc<crate::service::CommandSender>,
+    sender: CommandSender,
 }
 
 define_class!(
@@ -31,63 +40,188 @@ define_class!(
     impl MenuTarget {
         #[unsafe(method(menuItemClicked:))]
         fn menu_item_clicked(&self, sender: &NSMenuItem) {
-            let result = unsafe { sender.tag() };
-            let ivar = self.ivars().sender.clone();
+            let result = sender.tag();
             let command = match result {
-                0 => AppCommand::ToggleWindow,
-                1 => AppCommand::NewNote,
-                2 => AppCommand::NewLink,
-                3 => AppCommand::Quit,
+                0 => AppCommand::OpenWindow,
+                1 => AppCommand::ToggleWindow,
+                2 => AppCommand::NewNote,
+                3 => AppCommand::NewLink,
+                4 => AppCommand::Quit,
                 _ => return,
             };
-            ivar.send(command);
+            self.ivars().sender.send(command);
         }
     }
 );
 
 impl MenuTarget {
-    fn new(sender: Arc<crate::service::CommandSender>) -> Retained<Self> {
+    fn new(sender: CommandSender) -> Retained<Self> {
         let this = Self::alloc().set_ivars(MenuTargetIvars { sender });
         unsafe { msg_send![super(this), init] }
     }
 }
 
 /// Create the status item in the macOS menu bar.
-pub fn install(sender: Arc<crate::service::CommandSender>) -> Option<()> {
+pub fn install(sender: CommandSender) -> Option<()> {
     let mtm = MainThreadMarker::new()?;
 
-    unsafe {
-        let status_bar = NSStatusBar::systemStatusBar();
-        // 22 is the standard menu bar icon slot size.
-        let item = NSStatusItem::alloc(mtm);
-        let item: Retained<NSStatusItem> =
-            msg_send![item, initWithStatusBar: &*status_bar, length: 22.0];
+    let status_bar = NSStatusBar::systemStatusBar();
+    // 22 is the standard menu bar icon slot size.
+    let item = status_bar.statusItemWithLength(22.0);
 
-        let button = item.button();
+    if let Some(button) = item.button(mtm) {
         if let Some(image) = make_template_image() {
             button.setImage(Some(&image));
-            button.setImageScaling(1); // NSImageScaleProportionallyDown
+            button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+        } else {
+            // Keep a visible fallback if SF Symbols are unavailable in the
+            // current runtime or application bundle.
+            button.setTitle(&NSString::from_str("W"));
         }
-        button.setToolTip(&NSString::from_str("Worktable"));
-
-        let menu = build_menu(sender, mtm);
-        item.setMenu(Some(&menu));
-
-        // Keep the status item alive. `NSStatusItem` returned by the system is
-        // retained by the status bar, and `item` past this function is dropped;
-        // the strong reference held by `NSStatusBar` keeps it installed. Because
-        // the item object is already permanently owned by the status bar, we
-        // simply forget our local handle.
-        let _ = item;
+        let tooltip = NSString::from_str("Worktable");
+        button.setToolTip(Some(&tooltip));
     }
+
+    let menu = build_menu(sender.clone(), mtm);
+    item.setMenu(Some(&menu));
+    item.setVisible(true);
+
+    // Keep the native item alive for the lifetime of the process. The status
+    // bar normally retains it too, but explicitly retaining it avoids the
+    // icon disappearing when the local handle is released.
+    std::mem::forget(item);
+    install_shift_capture_monitor(sender);
 
     Some(())
 }
 
-fn build_menu(sender: Arc<crate::service::CommandSender>, mtm: MainThreadMarker) -> Retained<NSMenu> {
+struct ShiftTracker {
+    count: u8,
+    last_press: Option<Instant>,
+    shift_active: bool,
+}
+
+impl ShiftTracker {
+    fn register_press(&mut self) -> bool {
+        const TRIPLE_PRESS_WINDOW: Duration = Duration::from_millis(700);
+        let now = Instant::now();
+        if self
+            .last_press
+            .map(|last| now.duration_since(last) > TRIPLE_PRESS_WINDOW)
+            .unwrap_or(true)
+        {
+            self.count = 0;
+        }
+
+        self.count = self.count.saturating_add(1);
+        self.last_press = Some(now);
+        if self.count >= 3 {
+            self.count = 0;
+            self.last_press = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Watch global Shift transitions and capture the foreground app's selection
+/// after three quick presses. The returned monitor is intentionally leaked so
+/// AppKit keeps it installed for the lifetime of the process.
+fn install_shift_capture_monitor(sender: CommandSender) {
+    let tracker = Arc::new(Mutex::new(ShiftTracker {
+        count: 0,
+        last_press: None,
+        shift_active: false,
+    }));
+    let handler = RcBlock::new(move |event: NonNull<NSEvent>| {
+        let event = unsafe { event.as_ref() };
+        if !matches!(event.keyCode(), 56 | 60) {
+            return;
+        }
+
+        let shift_active = event.modifierFlags().contains(NSEventModifierFlags::Shift);
+        let should_capture = tracker
+            .lock()
+            .map(|mut tracker| {
+                let pressed = shift_active && !tracker.shift_active;
+                tracker.shift_active = shift_active;
+                pressed && tracker.register_press()
+            })
+            .unwrap_or(false);
+
+        if should_capture {
+            capture_foreground_selection(sender.clone());
+        }
+    });
+
+    let monitor =
+        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::FlagsChanged, &handler);
+    if let Some(monitor) = monitor {
+        std::mem::forget(monitor);
+        std::mem::forget(handler);
+    } else {
+        eprintln!("Worktable: failed to install the global Shift monitor");
+    }
+}
+
+fn capture_foreground_selection(sender: CommandSender) {
+    thread::spawn(move || {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let before_count = pasteboard.changeCount();
+        let string_type = unsafe { NSPasteboardTypeString };
+        let previous_text = pasteboard
+            .stringForType(string_type)
+            .map(|value| value.to_string());
+
+        post_copy_shortcut();
+        thread::sleep(Duration::from_millis(80));
+
+        let after_count = pasteboard.changeCount();
+        let captured = if after_count != before_count {
+            pasteboard
+                .stringForType(string_type)
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+
+        if after_count != before_count {
+            if let Some(previous_text) = previous_text {
+                let previous_text = NSString::from_str(&previous_text);
+                let _ = pasteboard.setString_forType(&previous_text, string_type);
+            }
+        }
+
+        if let Some(text) = captured {
+            sender.send(AppCommand::CaptureText(text));
+        }
+    });
+}
+
+fn post_copy_shortcut() {
+    let Some(key_down) = CGEvent::new_keyboard_event(None, 8, true) else {
+        return;
+    };
+    CGEvent::set_flags(Some(&key_down), CGEventFlags::MaskCommand);
+    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&key_down));
+
+    let Some(key_up) = CGEvent::new_keyboard_event(None, 8, false) else {
+        return;
+    };
+    CGEvent::set_flags(Some(&key_up), CGEventFlags::MaskCommand);
+    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&key_up));
+}
+
+fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     unsafe {
         menu.setAutoenablesItems(false);
+
+        let open = NSMenuItem::new(mtm);
+        open.setTitle(&NSString::from_str("Open Window"));
+        menu.addItem(&open);
 
         let show = NSMenuItem::new(mtm);
         show.setTitle(&NSString::from_str("Show / Hide Worktable"));
@@ -96,13 +230,13 @@ fn build_menu(sender: Arc<crate::service::CommandSender>, mtm: MainThreadMarker)
         let note = NSMenuItem::new(mtm);
         note.setTitle(&NSString::from_str("New Note"));
         note.setKeyEquivalent(&NSString::from_str("n"));
-        note.setKeyEquivalentModifierMask(1 << 20); // Command
+        note.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         menu.addItem(&note);
 
         let link = NSMenuItem::new(mtm);
         link.setTitle(&NSString::from_str("New Link"));
         link.setKeyEquivalent(&NSString::from_str("l"));
-        link.setKeyEquivalentModifierMask(1 << 20);
+        link.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         menu.addItem(&link);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -110,18 +244,20 @@ fn build_menu(sender: Arc<crate::service::CommandSender>, mtm: MainThreadMarker)
         let quit = NSMenuItem::new(mtm);
         quit.setTitle(&NSString::from_str("Quit Worktable"));
         quit.setKeyEquivalent(&NSString::from_str("q"));
-        quit.setKeyEquivalentModifierMask(1 << 20);
+        quit.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         menu.addItem(&quit);
 
         // Tag each actionable item and point them at the target object.
         let target = MenuTarget::new(sender);
-        let items = [&show, &note, &link, &quit];
+        let items = [&open, &show, &note, &link, &quit];
         for (index, ns_item) in items.iter().enumerate() {
             ns_item.setTag(index as isize);
-            let target_any: *const AnyObject = target.as_ref().as_ptr();
-            ns_item.setTarget(Some(&*target_any));
+            ns_item.setTarget(Some(&*target));
             ns_item.setAction(Some(sel!(menuItemClicked:)));
         }
+        // NSMenuItem targets are not retained by AppKit. Keep the target alive
+        // for the lifetime of the status menu.
+        std::mem::forget(target);
     }
     menu
 }
@@ -129,21 +265,13 @@ fn build_menu(sender: Arc<crate::service::CommandSender>, mtm: MainThreadMarker)
 /// Build a monochrome (template) image from a named SF Symbol so it adapts to
 /// the menu-bar appearance.
 fn make_template_image() -> Option<Retained<NSImage>> {
-    let mtm = MainThreadMarker::new()?;
+    let _mtm = MainThreadMarker::new()?;
     let symbol = NSString::from_str("square.grid.2x2");
-    unsafe {
-        let image = NSImage::alloc(mtm);
-        let image: Retained<NSImage> =
-            msg_send![image, initWithSymbolConfiguration: nil];
-        let image: Retained<NSImage> = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &symbol,
-            None,
-        )?;
-        image.setTemplate(true);
-        image.setSize(NSSize::new(18.0, 18.0));
-        let _ = image;
-        Some(image)
-    }
+    let image: Retained<NSImage> =
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, None)?;
+    image.setTemplate(true);
+    image.setSize(NSSize::new(18.0, 18.0));
+    Some(image)
 }
 
 /// Keep the app alive / present when the status item is used.

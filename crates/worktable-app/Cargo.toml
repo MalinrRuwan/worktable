@@ -11,20 +11,29 @@ gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 worktable-ai = { path = "../worktable-ai" }
+worktable-events = { path = "../worktable-events" }
 uuid = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
-    "NSMenu",
-    "NSMenuItem",
-    "NSView",
-    "NSWindow",
-    "NSResponder",
-    "NSEvent",
-    "NSImage",
-    "NSStatusItem",
-    "NSStatusBar",
-    "NSApplication",
+  "NSMenu",
+  "NSMenuItem",
+  "NSView",
+  "NSWindow",
+  "NSResponder",
+  "NSEvent",
+  "NSPasteboard",
+  "NSImage",
+  "NSStatusItem",
+  "NSStatusBar",
+  "NSApplication",
+  "block2",
 ] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry"] }
+block2 = { version = "0.6", features = ["alloc"] }
+objc2-core-graphics = { version = "0.3", features = [
+  "CGEvent",
+  "CGEventTypes",
+  "CGRemoteOperation",
+] }

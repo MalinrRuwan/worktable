@@ -11,15 +11,16 @@ use tokio::{
     time::{self, Duration},
 };
 use uuid::Uuid;
-use worktable_db::TursoStore;
-use worktable_events::{EventBus, WorktableEvent};
+use worktable_db::SqliteStore;
+use worktable_events::{AuthNotifyKind, AuthPromptKind, EventBus, WorktableEvent};
 
 use crate::{
-    ai_agent::AiAgentRuntime,
+    pi_agent::PiAgentRuntime,
     worker_protocol::{WorkerEvent, WorkerRequest},
 };
 
 const SESSION_LEASE_MS: i64 = 30_000;
+const EVENT_PUMP_POLL_MS: u64 = 25;
 
 #[derive(Debug, Clone)]
 pub struct AiRun {
@@ -30,17 +31,19 @@ pub struct AiRun {
 
 #[derive(Clone)]
 pub struct WorktableRuntime {
-    store: TursoStore,
-    ai_agent: Arc<Mutex<Option<AiAgentRuntime>>>,
+    store: SqliteStore,
+    ai_agent: Arc<Mutex<Option<PiAgentRuntime>>>,
     owner_id: String,
     events: EventBus,
     lease_tasks: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
+    active_runs: Arc<Mutex<BTreeMap<String, AiRun>>>,
+    pump_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl WorktableRuntime {
-    pub async fn connect(database_url: &str, auth_token: &str) -> anyhow::Result<Self> {
-        let store = TursoStore::connect(database_url, auth_token).await?;
-        store.migrate().await?;
+    pub async fn connect(database_path: &str) -> anyhow::Result<Self> {
+        let store = SqliteStore::connect(database_path)?;
+        store.migrate()?;
 
         Ok(Self {
             store,
@@ -48,6 +51,8 @@ impl WorktableRuntime {
             owner_id: Uuid::new_v4().to_string(),
             events: EventBus::new(256),
             lease_tasks: Arc::new(Mutex::new(BTreeMap::new())),
+            active_runs: Arc::new(Mutex::new(BTreeMap::new())),
+            pump_task: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -55,40 +60,39 @@ impl WorktableRuntime {
         self.events.clone()
     }
 
+    pub fn database_path(&self) -> &str {
+        self.store.database_path()
+    }
+
     pub async fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<worktable_db::Entry>> {
-        self.store.list_entries(limit).await
+        self.store.list_entries(limit)
     }
 
     pub async fn insert_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
-        self.store.insert_entry(entry).await
+        self.store.insert_entry(entry)
     }
 
     pub async fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
-        self.store.delete_entry(id).await
+        self.store.delete_entry(id)
     }
 
-    pub async fn start_ai_worker(
-        &self,
-        worker_command: &str,
-        worker_args: Vec<String>,
-        mut environment: BTreeMap<String, String>,
-    ) -> anyhow::Result<()> {
+    pub async fn start_ai_worker(&self) -> anyhow::Result<()> {
         let mut agent = self.ai_agent.lock().await;
         if agent.is_some() {
             return Err(anyhow::anyhow!("AI worker is already running"));
         }
 
-        environment.insert(
-            "TURSO_DATABASE_URL".to_owned(),
-            self.store.database_url().to_owned(),
-        );
-        environment.insert(
-            "TURSO_AUTH_TOKEN".to_owned(),
-            self.store.auth_token().to_owned(),
-        );
-
-        let worker = AiAgentRuntime::start(worker_command, worker_args, environment).await?;
+        let worker = PiAgentRuntime::start(self.store.clone());
         *agent = Some(worker);
+
+        // Start the event pump that drains worker output into the event bus and
+        // finalizes runs. This is what keeps sessions/leases from being leaked.
+        let runtime = self.clone();
+        let pump = tokio::spawn(async move {
+            runtime.pump_worker_events().await;
+        });
+        *self.pump_task.lock().await = Some(pump);
+
         Ok(())
     }
 
@@ -99,31 +103,26 @@ impl WorktableRuntime {
         content: &str,
     ) -> anyhow::Result<Option<AiRun>> {
         let now_ms = unix_time_ms()?;
-        self.store.ensure_session(session_id, None, now_ms).await?;
+        self.store.ensure_session(session_id, None, now_ms)?;
 
         let run_id = Uuid::new_v4().to_string();
-        let claimed = self
-            .store
-            .claim_session_lease(
-                session_id,
-                &self.owner_id,
-                &run_id,
-                now_ms,
-                now_ms + SESSION_LEASE_MS,
-            )
-            .await?;
+        let claimed = self.store.claim_session_lease(
+            session_id,
+            &self.owner_id,
+            &run_id,
+            now_ms,
+            now_ms + SESSION_LEASE_MS,
+        )?;
         if !claimed {
             return Ok(None);
         }
 
         let started = self
             .store
-            .begin_run(&run_id, session_id, request_id, now_ms)
-            .await?;
+            .begin_run(&run_id, session_id, request_id, now_ms)?;
         if !started {
             self.store
-                .release_session_lease(session_id, &self.owner_id, &run_id)
-                .await?;
+                .release_session_lease(session_id, &self.owner_id, &run_id)?;
             return Ok(None);
         }
 
@@ -140,19 +139,15 @@ impl WorktableRuntime {
         };
 
         if let Err(error) = send_result {
-            let finish_error = self
-                .store
-                .finish_run(
-                    &run_id,
-                    session_id,
-                    "failed",
-                    Some(&error.to_string()),
-                    unix_time_ms()?,
-                )
-                .await;
+            let finish_error = self.store.finish_run(
+                &run_id,
+                session_id,
+                "failed",
+                Some(&error.to_string()),
+                unix_time_ms()?,
+            );
             self.store
-                .release_session_lease(session_id, &self.owner_id, &run_id)
-                .await?;
+                .release_session_lease(session_id, &self.owner_id, &run_id)?;
             finish_error?;
             return Err(error);
         }
@@ -162,6 +157,10 @@ impl WorktableRuntime {
             request_id: request_id.to_owned(),
             session_id: session_id.to_owned(),
         };
+        self.active_runs
+            .lock()
+            .await
+            .insert(run.request_id.clone(), run.clone());
         self.start_lease_renewal(&run).await;
 
         self.events.publish(WorktableEvent::AiRunStarted {
@@ -173,13 +172,64 @@ impl WorktableRuntime {
         Ok(Some(run))
     }
 
+    /// Drain one worker event, if any is available.
     pub async fn try_recv_agent_event(&self) -> Option<WorkerEvent> {
         let mut agent = self.ai_agent.lock().await;
-        let event = agent.as_mut()?.try_recv();
-        if let Some(event) = &event {
-            publish_worker_event(&self.events, event);
+        agent.as_mut()?.try_recv()
+    }
+
+    /// Long-lived task: poll the worker, publish deltas to the event bus, and
+    /// finalize runs when the worker reports completion/failure.
+    async fn pump_worker_events(&self) {
+        let mut interval = time::interval(Duration::from_millis(EVENT_PUMP_POLL_MS));
+        loop {
+            interval.tick().await;
+
+            let event = match self.try_recv_agent_event().await {
+                Some(event) => event,
+                None => continue,
+            };
+
+            match &event {
+                WorkerEvent::RunCompleted { request_id, .. } => {
+                    self.finish_prompt_request(request_id, "completed", None)
+                        .await;
+                }
+                WorkerEvent::RunFailed {
+                    request_id, error, ..
+                } => {
+                    self.finish_prompt_request(request_id, "failed", Some(error))
+                        .await;
+                }
+
+                WorkerEvent::Ready => {
+                    eprintln!("Worktable: AI worker is ready");
+                }
+                WorkerEvent::WorkerError { error } => {
+                    eprintln!("Worktable: AI worker error: {error}");
+                    publish_worker_event(&self.events, &event);
+                }
+                _ => {
+                    publish_worker_event(&self.events, &event);
+                }
+            }
         }
-        event
+    }
+
+    async fn finish_prompt_request(&self, request_id: &str, state: &str, error: Option<&str>) {
+        let run = self.active_runs.lock().await.remove(request_id);
+        let Some(run) = run else {
+            // Unknown request: nothing to finalize, but still surface the event.
+            self.events.publish(WorktableEvent::AiWorkerError {
+                error: format!("worker finished unknown request {request_id}"),
+            });
+            return;
+        };
+        if let Err(finish_error) = self.finish_prompt(&run, state, error).await {
+            self.events.publish(WorktableEvent::AiWorkerError {
+                error: format!("failed to finalize AI run: {finish_error}"),
+            });
+        }
     }
 
     pub async fn finish_prompt(
@@ -194,11 +244,9 @@ impl WorktableRuntime {
 
         let now_ms = unix_time_ms()?;
         self.store
-            .finish_run(&run.run_id, &run.session_id, state, error, now_ms)
-            .await?;
+            .finish_run(&run.run_id, &run.session_id, state, error, now_ms)?;
         self.store
-            .release_session_lease(&run.session_id, &self.owner_id, &run.run_id)
-            .await?;
+            .release_session_lease(&run.session_id, &self.owner_id, &run.run_id)?;
         if state == "completed" {
             self.events.publish(WorktableEvent::AiRunFinished {
                 request_id: run.request_id.clone(),
@@ -217,14 +265,77 @@ impl WorktableRuntime {
         Ok(())
     }
 
+    // ---- Provider / auth configuration (relayed to the worker) -------------
+
+    pub async fn list_providers(&self) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::ListProviders).await
+    }
+
+    pub async fn set_api_key(&self, provider_id: &str, api_key: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::SetApiKey {
+            provider_id: provider_id.to_owned(),
+            api_key: api_key.to_owned(),
+        })
+        .await
+    }
+
+    pub async fn set_model(&self, provider_id: &str, model_id: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::SetModel {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+        })
+        .await
+    }
+
+    pub async fn logout_provider(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::Logout {
+            provider_id: provider_id.to_owned(),
+        })
+        .await
+    }
+
+    pub async fn login_oauth(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::LoginOAuth {
+            provider_id: provider_id.to_owned(),
+        })
+        .await
+    }
+
+    pub async fn cancel_login(&self, provider_id: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::CancelLogin {
+            provider_id: provider_id.to_owned(),
+        })
+        .await
+    }
+
+    pub async fn answer_auth_prompt(&self, prompt_id: &str, answer: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::AnswerAuthPrompt {
+            prompt_id: prompt_id.to_owned(),
+            answer: answer.to_owned(),
+        })
+        .await
+    }
+
+    async fn send_to_worker(&self, request: WorkerRequest) -> anyhow::Result<()> {
+        let agent = self.ai_agent.lock().await;
+        let agent = agent
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("AI worker has not been started"))?;
+        agent.send(request)
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        if let Some(task) = self.pump_task.lock().await.take() {
+            task.abort();
+        }
+
         for task in self.lease_tasks.lock().await.values() {
             task.abort();
         }
 
         let agent = self.ai_agent.lock().await.take();
         if let Some(agent) = agent {
-            agent.shutdown().await?;
+            agent.shutdown();
         }
         Ok(())
     }
@@ -241,16 +352,13 @@ impl WorktableRuntime {
                 let Ok(now_ms) = unix_time_ms() else {
                     break;
                 };
-                let Ok(renewed) = store
-                    .renew_session_lease(
-                        &lease_run.session_id,
-                        &owner_id,
-                        &lease_run.run_id,
-                        now_ms,
-                        now_ms + SESSION_LEASE_MS,
-                    )
-                    .await
-                else {
+                let Ok(renewed) = store.renew_session_lease(
+                    &lease_run.session_id,
+                    &owner_id,
+                    &lease_run.run_id,
+                    now_ms,
+                    now_ms + SESSION_LEASE_MS,
+                ) else {
                     break;
                 };
 
@@ -309,6 +417,87 @@ fn publish_worker_event(events: &EventBus, event: &WorkerEvent) {
         WorkerEvent::RunCompleted { .. } | WorkerEvent::RunFailed { .. } => return,
         WorkerEvent::WorkerError { error } => WorktableEvent::AiWorkerError {
             error: error.clone(),
+        },
+        WorkerEvent::ProvidersSnapshot { snapshot } => WorktableEvent::AiProvidersSnapshot {
+            snapshot: snapshot.clone(),
+        },
+        WorkerEvent::AuthPrompt {
+            prompt_id,
+            provider_id,
+            prompt,
+        } => WorktableEvent::AiAuthPrompt {
+            prompt_id: prompt_id.clone(),
+            provider_id: provider_id.clone(),
+            prompt: match prompt {
+                AuthPromptKind::Text {
+                    message,
+                    placeholder,
+                } => AuthPromptKind::Text {
+                    message: message.clone(),
+                    placeholder: placeholder.clone(),
+                },
+                AuthPromptKind::Secret {
+                    message,
+                    placeholder,
+                } => AuthPromptKind::Secret {
+                    message: message.clone(),
+                    placeholder: placeholder.clone(),
+                },
+                AuthPromptKind::ManualCode {
+                    message,
+                    placeholder,
+                } => AuthPromptKind::ManualCode {
+                    message: message.clone(),
+                    placeholder: placeholder.clone(),
+                },
+                AuthPromptKind::Select { message, options } => AuthPromptKind::Select {
+                    message: message.clone(),
+                    options: options.clone(),
+                },
+            },
+        },
+        WorkerEvent::AuthNotify {
+            provider_id,
+            notify,
+        } => WorktableEvent::AiAuthNotify {
+            provider_id: provider_id.clone(),
+            notify: match notify {
+                AuthNotifyKind::Info { message } => AuthNotifyKind::Info {
+                    message: message.clone(),
+                },
+                AuthNotifyKind::AuthUrl { url, instructions } => AuthNotifyKind::AuthUrl {
+                    url: url.clone(),
+                    instructions: instructions.clone(),
+                },
+                AuthNotifyKind::DeviceCode {
+                    user_code,
+                    verification_uri,
+                    expires_in_seconds,
+                } => AuthNotifyKind::DeviceCode {
+                    user_code: user_code.clone(),
+                    verification_uri: verification_uri.clone(),
+                    expires_in_seconds: *expires_in_seconds,
+                },
+                AuthNotifyKind::Progress { message } => AuthNotifyKind::Progress {
+                    message: message.clone(),
+                },
+            },
+        },
+        WorkerEvent::LoginResult {
+            provider_id,
+            ok,
+            error,
+        } => WorktableEvent::AiLoginResult {
+            provider_id: provider_id.clone(),
+            ok: *ok,
+            error: error.clone(),
+        },
+        WorkerEvent::ConfigChanged {
+            active_provider,
+            active_model,
+        } => WorktableEvent::AiConfigChanged {
+            active_provider: active_provider.clone(),
+            active_model: active_model.clone(),
         },
     };
 

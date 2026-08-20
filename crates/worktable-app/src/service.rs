@@ -1,11 +1,10 @@
 //! Bridge between the GPUI main thread and the async `WorktableRuntime`.
 //!
 //! All database work runs on a dedicated Tokio runtime so the UI never blocks.
-//! When Turso is not configured the service transparently falls back to an
-//! in-memory store so the app stays fully usable.
+//! When the local SQLite database cannot be opened the service transparently
+//! falls back to an in-memory store so the app stays fully usable.
 
 use std::{
-    collections::BTreeMap,
     future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -26,8 +25,10 @@ pub type EmptyResult = Result<(), String>;
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     ToggleWindow,
+    OpenWindow,
     NewNote,
     NewLink,
+    CaptureText(String),
     Quit,
 }
 
@@ -48,11 +49,11 @@ impl CommandSender {
 pub struct WorktableService {
     tokio: Arc<Runtime>,
     runtime: Option<Arc<WorktableRuntime>>,
-    /// In-memory fallback used when Turso is not configured.
+    /// In-memory fallback used when the local database is unavailable.
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
     persistent: bool,
     command_tx: mpsc::UnboundedSender<AppCommand>,
-    command_rx: Option<mpsc::UnboundedReceiver<AppCommand>>,
+    command_rx: Option<std::sync::Mutex<Option<mpsc::UnboundedReceiver<AppCommand>>>>,
 }
 
 impl WorktableService {
@@ -68,17 +69,17 @@ impl WorktableService {
 
         let (runtime, persistent, seed) = bootstrap_runtime(&tokio);
 
-        let mut service = Self {
+        let service = Self {
             tokio,
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             persistent,
             command_tx,
-            command_rx: Some(command_rx),
+            command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
 
-        // Seed the in-memory store with any entries we loaded from Turso so the
-        // fallback path still shows the user's saved data.
+        // Seed the in-memory store with any entries we loaded from the local
+        // database so the fallback path still shows the user's saved data.
         if let Some(entries) = seed {
             let memory = Arc::clone(&service.memory);
             service.tokio.spawn(async move {
@@ -95,8 +96,8 @@ impl WorktableService {
         }
     }
 
-    pub fn take_command_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<AppCommand>> {
-        self.command_rx.take()
+    pub fn take_command_receiver(&self) -> Option<mpsc::UnboundedReceiver<AppCommand>> {
+        self.command_rx.as_ref()?.lock().ok()?.take()
     }
 
     pub fn is_persistent(&self) -> bool {
@@ -109,7 +110,9 @@ impl WorktableService {
 
     /// Subscribe to runtime events (AI deltas etc.).
     pub fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<WorktableEvent>> {
-        self.runtime.as_ref().map(|runtime| runtime.events().subscribe())
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.events().subscribe())
     }
 
     /// Fetch the list of entries.
@@ -124,7 +127,7 @@ impl WorktableService {
         }
     }
 
-    /// Insert an entry, persisting to Turso when available.
+    /// Insert an entry, persisting to the local database when available.
     pub async fn insert_entry(&self, entry: WorktableEntry) -> EmptyResult {
         if let Some(runtime) = &self.runtime {
             runtime
@@ -156,13 +159,72 @@ impl WorktableService {
         session_id: &str,
         content: &str,
     ) -> Result<Option<worktable_ai::AiRun>, String> {
-        let Some(runtime) = &self.runtime else {
-            return Err("AI assistant is not configured".to_owned());
-        };
-        runtime
-            .submit_prompt(request_id, session_id, content)
+        let request_id = request_id.to_owned();
+        let session_id = session_id.to_owned();
+        let content = content.to_owned();
+        self.run_on_tokio(move |runtime| async move {
+            runtime
+                .submit_prompt(&request_id, &session_id, &content)
+                .await
+        })
+        .await
+    }
+
+    /// Ask the worker for a fresh provider catalog + auth status snapshot.
+    pub async fn list_providers(&self) -> EmptyResult {
+        self.run_on_tokio(|runtime| async move { runtime.list_providers().await })
             .await
-            .map_err(|error| error.to_string())
+    }
+
+    /// Store an API key for a provider (and activate it).
+    pub async fn set_api_key(&self, provider_id: &str, api_key: &str) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        let api_key = api_key.to_owned();
+        self.run_on_tokio(move |runtime| async move {
+            runtime.set_api_key(&provider_id, &api_key).await
+        })
+        .await
+    }
+
+    /// Select the active provider + model.
+    pub async fn set_model(&self, provider_id: &str, model_id: &str) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        let model_id = model_id.to_owned();
+        self.run_on_tokio(
+            move |runtime| async move { runtime.set_model(&provider_id, &model_id).await },
+        )
+        .await
+    }
+
+    /// Remove the stored credential for a provider.
+    pub async fn logout_provider(&self, provider_id: &str) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        self.run_on_tokio(move |runtime| async move { runtime.logout_provider(&provider_id).await })
+            .await
+    }
+
+    /// Start an OAuth login flow for a provider.
+    pub async fn login_oauth(&self, provider_id: &str) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        self.run_on_tokio(move |runtime| async move { runtime.login_oauth(&provider_id).await })
+            .await
+    }
+
+    /// Abort an in-progress OAuth login.
+    pub async fn cancel_login(&self, provider_id: &str) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        self.run_on_tokio(move |runtime| async move { runtime.cancel_login(&provider_id).await })
+            .await
+    }
+
+    /// Answer a pending login prompt from the worker.
+    pub async fn answer_auth_prompt(&self, prompt_id: &str, answer: &str) -> EmptyResult {
+        let prompt_id = prompt_id.to_owned();
+        let answer = answer.to_owned();
+        self.run_on_tokio(move |runtime| async move {
+            runtime.answer_auth_prompt(&prompt_id, &answer).await
+        })
+        .await
     }
 
     pub async fn shutdown(&self) {
@@ -170,24 +232,49 @@ impl WorktableService {
             let _ = runtime.shutdown().await;
         }
     }
+
+    /// Run a runtime operation on the service's Tokio runtime.
+    ///
+    /// The UI calls these database and worker operations from GPUI's executor,
+    /// so the work is forwarded onto the service's dedicated Tokio runtime.
+    async fn run_on_tokio<T, Fut, F>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(Arc<WorktableRuntime>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(runtime) = self.runtime.clone() else {
+            return Err("AI assistant is not configured".to_owned());
+        };
+        let tokio = self.tokio.clone();
+        tokio
+            .spawn(async move { f(runtime).await })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
 }
 
-/// Create (and start) the `WorktableRuntime` when Turso is configured.
+/// Create (and start) the `WorktableRuntime` backed by a local database file.
 fn bootstrap_runtime(
     tokio: &Arc<Runtime>,
-) -> (Option<Arc<WorktableRuntime>>, bool, Option<Vec<WorktableEntry>>) {
-    let database_url = std::env::var("TURSO_DATABASE_URL").ok();
-    let auth_token = std::env::var("TURSO_AUTH_TOKEN").ok();
-
-    let (Some(database_url), Some(auth_token)) = (database_url, auth_token) else {
-        eprintln!("Worktable: Turso is not configured; running with in-memory storage");
-        return (None, false, None);
+) -> (
+    Option<Arc<WorktableRuntime>>,
+    bool,
+    Option<Vec<WorktableEntry>>,
+) {
+    let database_path = match resolve_database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Worktable: {error}");
+            return (None, false, None);
+        }
     };
 
-    let runtime = match tokio.block_on(WorktableRuntime::connect(&database_url, &auth_token)) {
+    let runtime = match tokio.block_on(WorktableRuntime::connect(&database_path)) {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("Worktable: failed to connect to Turso: {error:#}");
+            eprintln!("Worktable: failed to open database at {database_path}: {error:#}");
             return (None, false, None);
         }
     };
@@ -205,56 +292,28 @@ fn bootstrap_runtime(
     (Some(Arc::new(runtime)), true, Some(entries))
 }
 
-/// Start the AgentOS Pi worker when it has been built.
-fn start_ai_worker(tokio: &Arc<Runtime>, runtime: &WorktableRuntime) {
-    const DEFAULT_WORKER_PATH: &str = "agent/dist/worker.js";
-
-    let worker_path =
-        std::env::var("WORKTABLE_PI_WORKER").unwrap_or_else(|_| DEFAULT_WORKER_PATH.to_owned());
-    if !std::path::Path::new(&worker_path).exists() {
-        eprintln!(
-            "Worktable: AI worker is not built; run `cd agent && npm run build` or set WORKTABLE_PI_WORKER (currently `{worker_path}`)"
-        );
-        return;
+/// Resolve the local database file path: `WORKTABLE_DB_PATH` or
+/// `~/.worktable/worktable.db`.
+fn resolve_database_path() -> anyhow::Result<String> {
+    if let Ok(path) = std::env::var("WORKTABLE_DB_PATH") {
+        if !path.is_empty() {
+            return Ok(path);
+        }
     }
 
-    let worker_command =
-        std::env::var("WORKTABLE_PI_WORKER_COMMAND").unwrap_or_else(|_| "node".to_owned());
-    let environment = worker_environment();
-    if let Err(error) = tokio.block_on(runtime.start_ai_worker(
-        &worker_command,
-        vec![worker_path],
-        environment,
-    )) {
-        eprintln!("Worktable: failed to start the AgentOS Pi worker: {error:#}");
-    }
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("neither WORKTABLE_DB_PATH nor HOME is set"))?;
+    let dir = std::path::Path::new(&home).join(".worktable");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| anyhow::anyhow!("failed to create {}: {error}", dir.display()))?;
+    Ok(dir.join("worktable.db").to_string_lossy().into_owned())
 }
 
-fn worker_environment() -> BTreeMap<String, String> {
-    const FORWARDED_VARS: &[&str] = &[
-        "PI_PROVIDER",
-        "PI_MODEL",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "MISTRAL_API_KEY",
-        "XAI_API_KEY",
-        "GROQ_API_KEY",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_REGION",
-    ];
-
-    FORWARDED_VARS
-        .iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| ((*name).to_owned(), value))
-        })
-        .collect()
+/// Start the embedded Pi agent runtime.
+fn start_ai_worker(tokio: &Arc<Runtime>, runtime: &WorktableRuntime) {
+    if let Err(error) = tokio.block_on(runtime.start_ai_worker()) {
+        eprintln!("Worktable: failed to start the AI agent: {error:#}");
+    }
 }
 
 pub fn unix_time_ms() -> i64 {

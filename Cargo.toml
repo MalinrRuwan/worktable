@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/worktable-ai",
-    "crates/worktable-app",
-    "crates/worktable-db",
-    "crates/worktable-events",
+  "crates/worktable-ai",
+  "crates/worktable-app",
+  "crates/worktable-db",
+  "crates/worktable-events",
 ]
 resolver = "3"
 
@@ -11,10 +11,22 @@ resolver = "3"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
-# GPUI (Zed) and the GPUI Component library — pinned to the same commits that
-# `longbridge/gpui-component` uses so the two stay API-compatible.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = ["profiler"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = ["font-kit"] }
-gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5" }
+# GPUI (Zed) and the GPUI Component library. `gpui-component` declares its Zed
+# dependencies without a revision, so we do the same here — Cargo then resolves
+# every Zed dependency to a single commit, which the committed Cargo.lock pins
+# for reproducibility. Pinning a workspace `rev` here would instead produce two
+# incompatible `gpui` crates in the same graph.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
+
+# Keep shipped binaries small without affecting debug iteration speed.
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false

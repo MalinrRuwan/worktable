@@ -54,5 +54,5 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d as i64)
+    (y, m as i64, d as i64)
 }

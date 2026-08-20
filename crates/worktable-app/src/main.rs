@@ -1,283 +1,278 @@
-use std::{collections::BTreeMap, env, path::Path, sync::Arc};
+//! Worktable app entry point.
+//!
+//! Bootstraps the Tokio runtime + `WorktableService`, opens the main GPUI
+//! window, installs the macOS status item, and wires keybindings + status-item
+//! commands to the main view.
+
+mod actions;
+mod assistant;
+mod format;
+mod service;
+mod status_item;
+mod worktable_view;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Context as _;
 use gpui::{
-    App, Application, Bounds, Context, Render, Subscription, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
+    App, AppContext as _, Application, AsyncApp, Bounds, Context, KeyBinding, SharedString,
+    WindowBounds, WindowOptions, px, size,
 };
-use tokio::runtime::{Builder, Runtime};
-use worktable_ai::{WorktableEntry, WorktableRuntime};
+use gpui_component::{Root, Theme, ThemeRegistry};
+use tokio::runtime::Runtime;
+use worktable_view::WorktableView;
 
-const DEFAULT_WORKER_PATH: &str = "agent/dist/worker.js";
+use crate::service::{AppCommand, WorktableService};
 
-struct AppBootstrap {
-    tokio: Arc<Runtime>,
-    service: Option<Arc<WorktableRuntime>>,
-    entries: Vec<WorktableEntry>,
-}
-
-struct WorktableView {
-    _tokio: Arc<Runtime>,
-    _service: Option<Arc<WorktableRuntime>>,
-    _quit_subscription: Option<Subscription>,
-    entries: Vec<WorktableEntry>,
-}
-
-impl WorktableView {
-    fn new(bootstrap: AppBootstrap, quit_subscription: Option<Subscription>) -> Self {
-        Self {
-            _tokio: bootstrap.tokio,
-            _service: bootstrap.service,
-            _quit_subscription: quit_subscription,
-            entries: bootstrap.entries,
-        }
-    }
-}
-
-impl Render for WorktableView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x111312))
-            .p_8()
-            .text_color(rgb(0xf0f2ee))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_end()
-                    .border_b_1()
-                    .border_color(rgb(0x2a302c))
-                    .pb_5()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(30.))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Worktable"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8d968f))
-                                    .child("Your saved entries"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8d968f))
-                            .child(entry_count(self.entries.len())),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .pt_6()
-                    .child(render_entry_list(&self.entries)),
-            )
-    }
-}
-
-fn render_entry_list(entries: &[WorktableEntry]) -> impl IntoElement {
-    let mut list = div().flex().flex_col();
-
-    if entries.is_empty() {
-        return list
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .text_color(rgb(0x8d968f))
-            .child("No entries yet");
-    }
-
-    for entry in entries {
-        list = list.child(render_entry(entry));
-    }
-
-    list
-}
-
-fn render_entry(entry: &WorktableEntry) -> impl IntoElement {
-    let heading = entry.title.as_deref().unwrap_or(&entry.content);
-    let kind = entry_kind(&entry.kind);
-
-    let mut row = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .border_b_1()
-        .border_color(rgb(0x2a302c))
-        .py_5()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(div().text_xs().text_color(rgb(0xa8cbb4)).child(kind))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x657068))
-                        .child(entry.source.clone()),
-                ),
-        )
-        .child(
-            div()
-                .text_lg()
-                .text_color(rgb(0xf0f2ee))
-                .child(heading.to_owned()),
-        );
-
-    if entry.title.is_some() {
-        row = row.child(
-            div()
-                .text_sm()
-                .text_color(rgb(0x9ba59d))
-                .child(entry.content.clone()),
-        );
-    }
-
-    row
-}
-
-fn entry_kind(kind: &str) -> &'static str {
-    match kind {
-        "text" => "TEXT",
-        "link" => "LINK",
-        "image" => "IMAGE",
-        _ => "ENTRY",
-    }
-}
-
-fn entry_count(count: usize) -> String {
-    match count {
-        1 => "1 entry".to_owned(),
-        count => format!("{count} entries"),
-    }
-}
+/// Global handle to the main view so commands (status item) can reach it.
+struct MainView(gpui::Entity<WorktableView>);
+impl gpui::Global for MainView {}
 
 fn main() -> anyhow::Result<()> {
-    let tokio = Arc::new(
-        Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("failed to create Worktable Tokio runtime")?,
-    );
-    let bootstrap = bootstrap(tokio);
+    let tokio = Arc::new(Runtime::new().context("failed to create Worktable Tokio runtime")?);
+    let service = Arc::new(WorktableService::new()?);
 
-    Application::new().run(move |cx: &mut App| {
-        let quit_subscription = bootstrap.service.clone().map(|service| {
-            let tokio = bootstrap.tokio.clone();
-            cx.on_app_quit(move |_| {
-                let service = service.clone();
-                let tokio = tokio.clone();
-                async move {
-                    let _ = tokio.block_on(service.shutdown());
-                }
-            })
+    let visible = Arc::new(AtomicBool::new(true));
+    let service_for_reopen = service.clone();
+    let visible_for_reopen = visible.clone();
+    let application = Application::with_platform(gpui_platform::current_platform(false))
+        .with_assets(gpui_component_assets::Assets);
+    application.on_reopen(move |cx| {
+        open_window(cx, &visible_for_reopen, &service_for_reopen);
+    });
+
+    application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        init_theme(cx);
+
+        // Keep the quit hook alive for the lifetime of the app.
+        let tokio_for_quit = tokio.clone();
+        let service_for_quit = service.clone();
+        let quit_subscription = cx.on_app_quit(move |cx| {
+            let _ = cx;
+            let service = service_for_quit.clone();
+            let tokio = tokio_for_quit.clone();
+            async move {
+                let _ = tokio.block_on(service.shutdown());
+            }
+        });
+        std::mem::forget(quit_subscription);
+
+        // Keyboard shortcuts.
+        cx.bind_keys(bindings());
+        cx.on_action(|_: &crate::actions::Quit, cx: &mut App| {
+            cx.quit();
         });
 
-        let bounds = Bounds::centered(None, size(px(980.), px(680.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..WindowOptions::default()
-            },
-            move |_, cx| cx.new(|_| WorktableView::new(bootstrap, quit_subscription)),
-        )
-        .expect("failed to open Worktable window");
+        // Window visibility state (driven by the status item and Dock).
+
+        // Open the main window.
+        if let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
+            eprintln!("Worktable: failed to open window: {error:#}");
+        }
+
+        // Install the macOS menu-bar item.
+        #[cfg(target_os = "macos")]
+        {
+            let sender = service.command_sender();
+            if status_item::install(sender).is_none() {
+                eprintln!("Worktable: failed to install the macOS menu-bar item");
+            }
+        }
+        // Route status-item commands into the app.
+        let mut command_rx = service
+            .take_command_receiver()
+            .expect("command receiver should be available");
+        let visible_for_commands = visible.clone();
+        let service_for_commands = service.clone();
+        cx.spawn(|cx: &mut AsyncApp| {
+            let cx = cx.clone();
+            async move {
+                while let Some(command) = command_rx.recv().await {
+                    let visible = visible_for_commands.clone();
+                    let service = service_for_commands.clone();
+                    let _ = cx.update(move |cx| handle_command(command, cx, &visible, &service));
+                }
+            }
+        })
+        .detach();
+
         cx.activate(true);
     });
 
     Ok(())
 }
 
-fn bootstrap(tokio: Arc<Runtime>) -> AppBootstrap {
-    let database_url = env::var("TURSO_DATABASE_URL");
-    let auth_token = env::var("TURSO_AUTH_TOKEN");
-
-    let (database_url, auth_token) = match (database_url, auth_token) {
-        (Ok(database_url), Ok(auth_token)) => (database_url, auth_token),
-        (Err(_), _) | (_, Err(_)) => {
-            eprintln!("Turso is not configured; Worktable started without persisted entries");
-            return AppBootstrap {
-                tokio,
-                service: None,
-                entries: Vec::new(),
-            };
+/// Load the application's theme files and keep the active theme in sync with
+/// changes made while the app is running.
+fn init_theme(cx: &mut App) {
+    let theme_name = SharedString::from("Ayu Light");
+    let themes_dir = resolve_themes_dir();
+    if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, move |cx| {
+        if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
+            let mode = Theme::global(cx).mode;
+            Theme::global_mut(cx).apply_config(&theme);
+            // `apply_config` updates the component theme. Calling `change`
+            // also refreshes GPUI Base's semantic tokens and scrollbars.
+            Theme::change(mode, None, cx);
         }
-    };
-
-    let service = match tokio.block_on(WorktableRuntime::connect(&database_url, &auth_token)) {
-        Ok(service) => Arc::new(service),
-        Err(error) => {
-            eprintln!("failed to connect Worktable to Turso: {error:#}");
-            return AppBootstrap {
-                tokio,
-                service: None,
-                entries: Vec::new(),
-            };
-        }
-    };
-
-    let entries = match tokio.block_on(service.list_entries(100)) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("failed to load Worktable entries: {error:#}");
-            Vec::new()
-        }
-    };
-
-    let worker_path =
-        env::var("WORKTABLE_PI_WORKER").unwrap_or_else(|_| DEFAULT_WORKER_PATH.to_owned());
-    if !Path::new(&worker_path).exists() {
-        eprintln!(
-            "AI worker is not built; run `cd agent && npm run build` or set WORKTABLE_PI_WORKER (currently `{worker_path}`)"
-        );
-    } else {
-        let worker_command =
-            env::var("WORKTABLE_PI_WORKER_COMMAND").unwrap_or_else(|_| "node".to_owned());
-        let environment = worker_environment();
-        if let Err(error) =
-            tokio.block_on(service.start_ai_worker(&worker_command, vec![worker_path], environment))
-        {
-            eprintln!("failed to start the AgentOS Pi worker: {error:#}");
-        }
-    }
-
-    AppBootstrap {
-        tokio,
-        service: Some(service),
-        entries,
+    }) {
+        eprintln!("Worktable: failed to watch themes directory: {error}");
     }
 }
 
-fn worker_environment() -> BTreeMap<String, String> {
-    const FORWARDED_VARS: &[&str] = &[
-        "PI_PROVIDER",
-        "PI_MODEL",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "MISTRAL_API_KEY",
-        "XAI_API_KEY",
-        "GROQ_API_KEY",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_REGION",
-    ];
+fn resolve_themes_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("WORKTABLE_THEMES_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return path;
+        }
+    }
 
-    FORWARDED_VARS
-        .iter()
-        .filter_map(|name| env::var(name).ok().map(|value| ((*name).to_owned(), value)))
-        .collect()
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            candidates.push(directory.join("../Resources/themes"));
+            candidates.push(directory.join("../../themes"));
+        }
+    }
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("themes"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| Path::new("themes").to_path_buf())
+}
+
+/// All keyboard shortcuts for the app.
+fn bindings() -> Vec<KeyBinding> {
+    use crate::actions::*;
+    vec![
+        KeyBinding::new("cmd-n", NewNote, None),
+        KeyBinding::new("cmd-l", NewLink, None),
+        KeyBinding::new("cmd-f", FocusSearch, None),
+        KeyBinding::new("cmd-1", ShowEntries, None),
+        KeyBinding::new("cmd-2", ShowAssistant, None),
+        KeyBinding::new("cmd-,", ShowSettings, None),
+        KeyBinding::new("cmd-shift-s", ToggleSidebar, None),
+        KeyBinding::new("cmd-t", ToggleTheme, None),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("backspace", DeleteEntry, Some("worktable-list")),
+        KeyBinding::new("enter", OpenEntry, Some("worktable-list")),
+        KeyBinding::new("cmd-c", CopyEntry, Some("worktable-list")),
+        KeyBinding::new("cmd-shift-c", CopyLink, Some("worktable-list")),
+        KeyBinding::new("escape", CancelComposer, None),
+        KeyBinding::new("cmd-enter", SubmitComposer, None),
+        KeyBinding::new("cmd-shift-p", ClearSearch, Some("worktable-list")),
+    ]
+}
+
+/// Handle a command from the macOS status item.
+fn handle_command(
+    command: AppCommand,
+    cx: &mut App,
+    visible: &Arc<AtomicBool>,
+    service: &Arc<WorktableService>,
+) {
+    match command {
+        AppCommand::ToggleWindow => toggle_window(cx, visible, service),
+        AppCommand::OpenWindow => open_window(cx, visible, service),
+        AppCommand::NewNote => {
+            let _ = dispatch_main_view(cx, |this, window, cx| this.open_composer_note(window, cx));
+            cx.activate(true);
+        }
+        AppCommand::NewLink => {
+            let _ = dispatch_main_view(cx, |this, window, cx| this.open_composer_link(window, cx));
+            cx.activate(true);
+        }
+        AppCommand::CaptureText(text) => {
+            if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
+                let _ = view.update(cx, |this, cx| this.add_captured_text(text, cx));
+            }
+        }
+        AppCommand::Quit => cx.quit(),
+    }
+}
+
+/// Bring the app forward / hide it (driven by the status item).
+fn toggle_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableService>) {
+    if cx.windows().is_empty() {
+        open_window(cx, visible, service);
+        return;
+    }
+
+    let currently_visible = visible.swap(false, Ordering::SeqCst);
+    if currently_visible {
+        cx.hide();
+    } else {
+        visible.store(true, Ordering::SeqCst);
+        cx.activate(true);
+    }
+}
+
+fn open_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableService>) {
+    if cx.windows().is_empty() {
+        if let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
+            eprintln!("Worktable: failed to reopen window: {error:#}");
+            return;
+        }
+    }
+    visible.store(true, Ordering::SeqCst);
+    cx.activate(true);
+}
+
+fn open_main_window(
+    cx: &mut App,
+    service: Arc<WorktableService>,
+    visible: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    visible.store(true, Ordering::SeqCst);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1080.), px(720.)),
+                cx,
+            ))),
+            ..WindowOptions::default()
+        },
+        move |window, cx| {
+            let visible_for_close = visible.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                visible_for_close.store(false, Ordering::SeqCst);
+                // Keep the process, menu-bar item, and global capture monitor
+                // alive. Dock activation or Open Window can show it again.
+                cx.hide();
+                false
+            });
+
+            let view = cx.new(|cx| WorktableView::new(service.clone(), window, cx));
+            cx.set_global(MainView(view.clone()));
+            cx.new(|cx| Root::new(view, window, cx))
+        },
+    )?;
+    Ok(())
+}
+
+/// Run a closure against the main `WorktableView` (if the window exists).
+fn dispatch_main_view<R>(
+    cx: &mut App,
+    f: impl FnOnce(&mut WorktableView, &mut gpui::Window, &mut Context<WorktableView>) -> R,
+) -> Option<R> {
+    let view = cx.try_global::<MainView>()?.0.clone();
+    let window = cx.active_window()?;
+    let window = window.downcast::<Root>()?;
+    window
+        .update(cx, |_root, window, cx| {
+            view.update(cx, |this, cx| f(this, window, cx))
+        })
+        .ok()
 }
