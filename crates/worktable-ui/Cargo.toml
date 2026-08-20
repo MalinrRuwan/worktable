@@ -1,0 +1,10 @@
+[package]
+name = "worktable-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Worktable UI kit — motion catalog and interaction helpers over gpui"
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true

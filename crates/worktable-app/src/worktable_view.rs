@@ -4,11 +4,13 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Size,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px, size,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px, relative, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -25,6 +27,10 @@ use gpui_component::{
 use worktable_ai::WorktableEntry;
 use worktable_events::{
     AuthNotifyKind, AuthPromptKind, ProviderInfo, ProvidersSnapshot, WorktableEvent,
+};
+use worktable_ui::{
+    GRADIENT_SPIN, ZERON_PULSE, dialog_in, fade_in, fade_quick, hover_blend, hover_fades_active,
+    hover_listener, menu_in, pulse_delta, splash_out,
 };
 
 use crate::assistant::{ChatMessage, Role, render_message, welcome_panel};
@@ -106,6 +112,7 @@ pub struct WorktableView {
     pub(crate) dark_mode: bool,
     settings_scroll: VirtualListScrollHandle,
     provider_row_sizes: Rc<Vec<Size<Pixels>>>,
+    splash_start: Option<Instant>,
 
     pub(crate) _subscriptions: Vec<Subscription>,
 }
@@ -168,6 +175,7 @@ impl WorktableView {
             dark_mode: false,
             settings_scroll: VirtualListScrollHandle::new(),
             provider_row_sizes: Rc::new(Vec::new()),
+            splash_start: Some(Instant::now()),
 
             _subscriptions: Vec::new(),
         };
@@ -986,7 +994,16 @@ impl Focusable for WorktableView {
 
 impl Render for WorktableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if hover_fades_active() {
+            window.refresh();
+        }
+        if let Some(start) = self.splash_start {
+            if start.elapsed() > Duration::from_millis(650) {
+                self.splash_start = None;
+            }
+        }
         let theme = cx.theme().clone();
+        let is_splash = self.splash_start.is_some();
 
         div()
             .id("worktable-root")
@@ -1062,8 +1079,47 @@ impl Render for WorktableView {
                     this.cancel_composer(cx)
                 }),
             )
-            .child(render_sidebar(self, cx))
-            .child(render_main(self, window, cx))
+            .child(fade_in(
+                "worktable-sidebar-anim",
+                div().child(render_sidebar(self, cx)),
+            ))
+            .child(fade_in(
+                "worktable-main-anim",
+                div().child(render_main(self, window, cx)),
+            ))
+            .when(is_splash, |this| {
+                this.child(splash_out(
+                    "worktable-splash",
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.tokens.background.clone())
+                        .child(
+                            v_flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    Icon::new(IconName::GalleryVerticalEnd)
+                                        .size(px(32.))
+                                        .text_color(theme.primary),
+                                )
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("Worktable"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Your notes — pure Rust"),
+                                ),
+                        ),
+                ))
+            })
     }
 }
 
@@ -1278,11 +1334,14 @@ fn new_menu_button(cx: &mut Context<WorktableView>) -> impl IntoElement {
                 Box::new(crate::actions::NewNote),
                 move |_, cx| {
                     let _ = entity.update(cx, |_, _| {});
-                    div().child("New Note").child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("⌘N"),
+                    menu_in(
+                        "new-note-menu",
+                        div().child("New Note").child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("⌘N"),
+                        ),
                     )
                 },
             )
@@ -1306,11 +1365,24 @@ fn render_settings(
             .settings_status
             .clone()
             .unwrap_or_else(|| "Loading providers…".to_owned());
+        let loader = if this.providers_loading {
+            let phase = pulse_delta(&ZERON_PULSE, cx.entity_id(), cx);
+            let opacity = worktable_ui::pulse_opacity(phase);
+            div()
+                .size(px(12.))
+                .rounded_full()
+                .bg(theme.primary)
+                .opacity(opacity)
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         return v_flex()
             .flex_1()
             .items_center()
             .justify_center()
             .gap_3()
+            .child(loader)
             .child(
                 div()
                     .text_sm()
@@ -1906,7 +1978,7 @@ fn render_active_login(
 
 fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let Some(_kind) = this.composer else {
+    let Some(kind) = this.composer else {
         return div().into_any_element();
     };
 
@@ -1915,33 +1987,40 @@ fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> im
         .gap_2()
         .child(Input::new(&this.composer_body).h(px(34.)));
 
-    h_flex()
-        .items_end()
-        .gap_2()
-        .px_4()
-        .py_3()
-        .border_t_1()
-        .border_color(theme.border)
-        .bg(theme.popover)
-        .child(fields)
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("cancel-composer")
-                        .label("Cancel")
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_composer(cx))),
-                )
-                .child(
-                    Button::new("submit-composer")
-                        .label("Save")
-                        .primary()
-                        .icon(app_icon(IconName::Check))
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_composer(cx))),
-                ),
-        )
-        .into_any_element()
+    let composer_id = match kind {
+        ComposerKind::Note => "composer-note",
+        ComposerKind::Link => "composer-link",
+    };
+    dialog_in(
+        composer_id,
+        h_flex()
+            .items_end()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .child(fields)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("cancel-composer")
+                            .label("Cancel")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_composer(cx))),
+                    )
+                    .child(
+                        Button::new("submit-composer")
+                            .label("Save")
+                            .primary()
+                            .icon(app_icon(IconName::Check))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_composer(cx))),
+                    ),
+            ),
+    )
+    .into_any_element()
 }
 
 fn render_entries(
@@ -2056,7 +2135,21 @@ fn render_entry_card(
         row = row.bg(theme.tokens.list_active);
     }
 
-    row
+    // Hover wash + entrance
+    let hover_key = format!("entry-hover:{}", entry.id);
+    row = row
+        .on_hover(hover_listener(hover_key.clone()))
+        .bg(hover_blend(
+            &hover_key,
+            if is_selected {
+                *theme.tokens.list_active
+            } else {
+                gpui::transparent_black()
+            },
+            *theme.tokens.list_hover,
+        ));
+
+    fade_in(entry.id.clone(), row)
 }
 
 fn entry_kind(kind: &str) -> &'static str {
@@ -2103,10 +2196,39 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
         .p_4();
 
     if this.messages.is_empty() {
-        messages = messages.child(welcome_panel(&theme, configured));
+        messages = messages.child(fade_in(
+            "assistant-welcome",
+            div().child(welcome_panel(&theme, configured)),
+        ));
     } else {
-        for message in &this.messages {
-            messages = messages.child(render_message(&theme, message));
+        for (idx, message) in this.messages.iter().enumerate() {
+            let id = SharedString::from(format!("msg-{}-{}", idx, message.text.len()));
+            let bubble = render_message(&theme, message);
+            let animated = if message.streaming {
+                fade_quick(id, div().child(bubble))
+            } else {
+                fade_in(id, div().child(bubble))
+            };
+            messages = messages.child(animated);
+        }
+        if this.assistant_busy {
+            // WebGPU-style gradient spin loader driven by the shared pulse clock
+            let phase = pulse_delta(&GRADIENT_SPIN, cx.entity_id(), cx);
+            let opacity = worktable_ui::gspin_opacity(phase, 0.08);
+            messages = messages.child(
+                div()
+                    .h(px(3.))
+                    .w_full()
+                    .rounded(px(2.))
+                    .bg(theme.tokens.background)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(opacity.clamp(0.12, 1.0)))
+                            .bg(theme.primary)
+                            .rounded(px(2.)),
+                    ),
+            );
         }
     }
 

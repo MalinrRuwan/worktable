@@ -12,6 +12,7 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 worktable-ai = { path = "../worktable-ai" }
 worktable-events = { path = "../worktable-events" }
+worktable-ui = { path = "../worktable-ui" }
 uuid = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

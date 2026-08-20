@@ -4,6 +4,7 @@ members = [
   "crates/worktable-app",
   "crates/worktable-db",
   "crates/worktable-events",
+  "crates/worktable-ui",
   "crates/worktable-web",
 ]
 resolver = "3"

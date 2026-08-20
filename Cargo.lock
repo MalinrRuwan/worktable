@@ -13345,6 +13345,7 @@ dependencies = [
  "uuid",
  "worktable-ai",
  "worktable-events",
+ "worktable-ui",
 ]
 
 [[package]]
@@ -13368,6 +13369,14 @@ dependencies = [
  "serde",
  "tokio",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "worktable-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
 ]
 
 [[package]]
