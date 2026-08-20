@@ -2,8 +2,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+use rusqlite::{Connection, OptionalExtension, params};
 
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -92,7 +94,7 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
     pub kind: String,
@@ -109,18 +111,17 @@ pub struct ProviderCredential {
     pub key: String,
 }
 
-/// Local SQLite store shared with the in-process Pi agent runtime.
-///
-/// The AI agent runs in-process (`pi_agent_rust`) and reads/writes the same
-/// database file through this `SqliteStore`, so the connection is opened in WAL
-/// mode with a busy timeout — plain SQLite's locking keeps concurrent reads
-/// reliable, and no separate database engine is involved.
+// ---------------------------------------------------------------------------
+// Native (non-wasm) SQLite store — rusqlite + WAL
+// ---------------------------------------------------------------------------
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
     database_path: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SqliteStore {
     /// Open (or create) the local SQLite datafile.
     pub fn connect(path: &str) -> anyhow::Result<Self> {
@@ -542,6 +543,311 @@ impl SqliteStore {
             .context("failed to update AI session state")?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WASM store — in-memory + localStorage fallback
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct SqliteStore {
+    inner: Arc<Mutex<WasmInner>>,
+    database_path: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct WasmInner {
+    entries: Vec<Entry>,
+    credentials: std::collections::HashMap<String, ProviderCredential>,
+    config: std::collections::HashMap<String, String>,
+    sessions: std::collections::HashMap<String, (String, i64)>, // session_id -> (state, updated_at)
+    runs: std::collections::HashMap<String, String>,            // run_id -> state
+    leases: std::collections::HashMap<String, (String, String, i64)>, // session_id -> (owner_id, run_id, lease_until)
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SqliteStore {
+    pub fn connect(path: &str) -> anyhow::Result<Self> {
+        let store = Self {
+            inner: Arc::new(Mutex::new(WasmInner::default())),
+            database_path: path.to_owned(),
+        };
+        // Try to hydrate from localStorage (best-effort, ignore errors)
+        store.load_from_storage();
+        Ok(store)
+    }
+
+    pub fn database_path(&self) -> &str {
+        &self.database_path
+    }
+
+    pub fn migrate(&self) -> anyhow::Result<()> {
+        // No-op for in-memory; ensure storage key exists
+        Ok(())
+    }
+
+    pub fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<Entry>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        let mut entries = inner.entries.clone();
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        entries.truncate(limit.clamp(1, 500));
+        Ok(entries)
+    }
+
+    pub fn insert_entry(&self, entry: &Entry) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        // Upsert by id
+        if let Some(pos) = inner.entries.iter().position(|e| e.id == entry.id) {
+            inner.entries[pos] = entry.clone();
+        } else {
+            inner.entries.push(entry.clone());
+        }
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.entries.retain(|e| e.id != id);
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn ensure_session(
+        &self,
+        session_id: &str,
+        _title: Option<&str>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner
+            .sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| ("idle".to_owned(), now_ms));
+        Ok(())
+    }
+
+    pub fn begin_run(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        _request_id: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        if inner.runs.contains_key(run_id) {
+            return Ok(false);
+        }
+        inner.runs.insert(run_id.to_owned(), "running".to_owned());
+        if let Some(entry) = inner.sessions.get_mut(session_id) {
+            entry.0 = "running".to_owned();
+            entry.1 = now_ms;
+        }
+        Ok(true)
+    }
+
+    pub fn claim_session_lease(
+        &self,
+        session_id: &str,
+        owner_id: &str,
+        run_id: &str,
+        now_ms: i64,
+        lease_until_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        let should_claim = match inner.leases.get(session_id) {
+            None => true,
+            Some((_, _, until)) => *until <= now_ms,
+        };
+        if should_claim {
+            inner.leases.insert(
+                session_id.to_owned(),
+                (owner_id.to_owned(), run_id.to_owned(), lease_until_ms),
+            );
+            Ok(true)
+        } else {
+            // Check if same owner/run can renew
+            if let Some((oid, rid, _)) = inner.leases.get(session_id) {
+                if oid == owner_id && rid == run_id {
+                    inner.leases.insert(
+                        session_id.to_owned(),
+                        (owner_id.to_owned(), run_id.to_owned(), lease_until_ms),
+                    );
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    pub fn release_session_lease(
+        &self,
+        session_id: &str,
+        owner_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        if let Some((oid, rid, _)) = inner.leases.get(session_id) {
+            if oid == owner_id && rid == run_id {
+                inner.leases.remove(session_id);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn renew_session_lease(
+        &self,
+        session_id: &str,
+        owner_id: &str,
+        run_id: &str,
+        _now_ms: i64,
+        lease_until_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        if let Some((oid, rid, _)) = inner.leases.get_mut(session_id) {
+            if oid == owner_id && rid == run_id {
+                *inner.leases.get_mut(session_id).unwrap() =
+                    (owner_id.to_owned(), run_id.to_owned(), lease_until_ms);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn record_event(
+        &self,
+        _event_id: &str,
+        _run_id: &str,
+        _event_type: &str,
+        _payload_json: &str,
+        _now_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub fn finish_run(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        state: &str,
+        _error: Option<&str>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.runs.insert(run_id.to_owned(), state.to_owned());
+        if let Some(entry) = inner.sessions.get_mut(session_id) {
+            entry.0 = "idle".to_owned();
+            entry.1 = now_ms;
+        }
+        Ok(())
+    }
+
+    pub fn read_provider_credential(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Option<ProviderCredential>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        Ok(inner.credentials.get(provider_id).cloned())
+    }
+
+    pub fn list_provider_credentials(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, ProviderCredential>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        Ok(inner.credentials.clone())
+    }
+
+    pub fn write_provider_credential(
+        &self,
+        provider_id: &str,
+        credential: &ProviderCredential,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner
+            .credentials
+            .insert(provider_id.to_owned(), credential.clone());
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn delete_provider_credential(&self, provider_id: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.credentials.remove(provider_id);
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        Ok(inner.config.get(key).cloned())
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.config.insert(key.to_owned(), value.to_owned());
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    fn load_from_storage(&self) {
+        // Best-effort hydrate from localStorage (key: "worktable-db")
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    if let Ok(Some(json)) = storage.get_item("worktable-db") {
+                        if let Ok(saved) = serde_json::from_str::<serde_json::Value>(&json) {
+                            let mut inner = self.inner.lock().expect("wasm lock poisoned");
+                            if let Some(entries) = saved
+                                .get("entries")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.entries = entries;
+                            }
+                            if let Some(creds) = saved
+                                .get("credentials")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.credentials = creds;
+                            }
+                            if let Some(cfg) = saved
+                                .get("config")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.config = cfg;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_to_storage(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(window) = web_sys::window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    let inner = self.inner.lock().expect("wasm lock poisoned");
+                    let payload = serde_json::json!({
+                        "entries": inner.entries,
+                        "credentials": inner.credentials,
+                        "config": inner.config,
+                    });
+                    if let Ok(json) = serde_json::to_string(&payload) {
+                        let _ = storage.set_item("worktable-db", &json);
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -5,4 +5,10 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["sync"] }
+wasm-bindgen = "0.2"

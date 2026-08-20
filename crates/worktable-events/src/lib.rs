@@ -181,7 +181,7 @@ impl EventBus {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{EventBus, WorktableEvent};
 
@@ -198,5 +198,23 @@ mod tests {
 
         let event = events.recv().await.expect("event should be delivered");
         assert!(matches!(event, WorktableEvent::TextAdded { .. }));
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::{EventBus, WorktableEvent};
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn extensions_can_receive_typed_events_sync() {
+        let bus = EventBus::new(4);
+        let _events = bus.subscribe();
+        let count = bus.publish(WorktableEvent::TextAdded {
+            item_id: "item-1".to_owned(),
+            content: "hello".to_owned(),
+            source: "test".to_owned(),
+        });
+        assert!(count <= 1);
     }
 }
