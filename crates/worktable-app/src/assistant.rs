@@ -1,9 +1,8 @@
 //! The AI assistant pane: a chat interface backed by the embedded Pi agent.
 
-use gpui::{ParentElement as _, Styled, div, prelude::FluentBuilder, px, relative};
+use gpui::{IntoElement as _, ParentElement as _, Styled, div, prelude::FluentBuilder, px, relative};
 use gpui_component::theme::Theme;
 use gpui_component::{Icon, IconName, h_flex, v_flex};
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
@@ -40,14 +39,10 @@ impl ChatMessage {
         }
     }
 
-    /// Convenience for a streaming assistant message that is still thinking.
-    pub fn assistant_thinking(thinking: impl Into<String>) -> Self {
-        Self {
-            role: Role::Assistant,
-            text: String::new(),
-            thinking: thinking.into(),
-            streaming: true,
-        }
+    /// True while the model is emitting reasoning and no answer text yet —
+    /// the state that renders the animated "Thinking" dots.
+    pub fn is_thinking_only(&self) -> bool {
+        self.streaming && self.text.is_empty() && !self.thinking.is_empty()
     }
 }
 
@@ -87,6 +82,7 @@ pub fn welcome_panel(theme: &Theme, configured: bool) -> impl gpui::IntoElement 
 pub fn render_message<'a>(
     theme: &'a Theme,
     message: &'a ChatMessage,
+    dots_delta: f32,
 ) -> impl gpui::IntoElement + 'a {
     let is_user = message.role == Role::User;
     let (background, foreground) = if is_user {
@@ -96,7 +92,7 @@ pub fn render_message<'a>(
     };
 
     // Build the bubble's inner vertical stack.
-    let mut bubble = v_flex().gap_2();
+    let mut bubble = v_flex().gap_2().w_full().min_w_0().max_w_full();
 
     // Thinking block — show when the assistant emitted reasoning. The block
     // is visually de-emphasized (muted, italic) and collapsible in spirit:
@@ -104,28 +100,39 @@ pub fn render_message<'a>(
     // still inspect it. Unicode emojis inside thinking are preserved via
     // markdown rendering.
     if !message.thinking.is_empty() {
-        let thinking_label = if message.streaming && message.text.is_empty() {
-            "Thinking…"
+        let thinking_label: gpui::AnyElement = if message.is_thinking_only() {
+            // Actively reasoning: animated trailing dots (the TextDots loader).
+            worktable_ui::text_dots("Thinking", dots_delta, theme.muted_foreground)
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .into_any_element()
         } else {
-            "Thought"
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child("Thought")
+                .into_any_element()
         };
         bubble = bubble.child(
             v_flex()
                 .gap_1()
+                .w_full()
+                .min_w_0()
+                .max_w_full()
+                .overflow_hidden()
                 .p_2()
                 .rounded(theme.radius)
                 .bg(theme.muted.opacity(0.4))
                 .border_1()
                 .border_color(theme.border.opacity(0.5))
+                .child(thinking_label)
                 .child(
                     div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.muted_foreground)
-                        .child(thinking_label.to_owned()),
-                )
-                .child(
-                    div()
+                        .w_full()
+                        .min_w_0()
+                        .max_w_full()
+                        .overflow_hidden()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .italic()
@@ -146,7 +153,7 @@ pub fn render_message<'a>(
         } else {
             crate::markdown::render_markdown(&message.text, theme)
         };
-        bubble = bubble.child(div().text_sm().child(body));
+        bubble = bubble.child(div().w_full().min_w_0().text_sm().child(body));
     } else if message.streaming {
         // Empty while streaming — show a subtle placeholder so the bubble has
         // height.
@@ -171,11 +178,14 @@ pub fn render_message<'a>(
 
     h_flex()
         .w_full()
+        .min_w_0()
         .when(is_user, |this| this.justify_end())
         .when(!is_user, |this| this.justify_start())
         .child(
             div()
                 .max_w(relative(0.85))
+                .min_w_0()
+                .overflow_hidden()
                 .rounded(theme.radius_lg)
                 .bg(background)
                 .text_color(foreground)

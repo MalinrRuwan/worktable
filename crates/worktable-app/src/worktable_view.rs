@@ -8,21 +8,18 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
-    SharedString, Size, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
-    relative, size,
+    AnimationExt as _, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    Pixels, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Subscription,
+    Window, div, px, relative, size,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
-use gpui_component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
-    SidebarMenuItem, SidebarToggleButton,
-};
+use gpui_component::switch::Switch;
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, TitleBar, VirtualListScrollHandle, h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, VirtualListScrollHandle, h_flex, v_flex,
     v_virtual_list,
 };
 use worktable_ai::WorktableEntry;
@@ -30,12 +27,11 @@ use worktable_events::{
     AuthNotifyKind, AuthPromptKind, ProviderInfo, ProvidersSnapshot, WorktableEvent,
 };
 use worktable_ui::{
-    GRADIENT_SPIN, ZERON_PULSE, dialog_in, fade_in, fade_quick, hover_blend, hover_fades_active,
-    hover_listener, menu_in, pulse_delta, splash_out,
+    BOBBING_DOTS, TEXT_DOTS, ZERON_PULSE, fade_in, fade_quick, hover_blend, hover_fades_active,
+    hover_listener, pulse_delta, splash_out,
 };
 
 use crate::assistant::{ChatMessage, Role, render_message, welcome_panel};
-use crate::format::relative_time;
 use crate::service::WorktableService;
 
 #[cfg(test)]
@@ -48,6 +44,7 @@ pub enum AppMode {
     Assistant,
     Settings,
     ProviderConfig,
+    GithubStars,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,16 +54,49 @@ pub(crate) enum SettingsTab {
     Providers,
 }
 
-const PROVIDER_ROW_HEIGHT: f32 = 56.0;
+/// Provider rows are two lines (name + badges, then controls); they grow
+/// when the API-key field is expanded.
+const PROVIDER_ROW_HEIGHT: f32 = 92.0;
+const PROVIDER_ROW_EXPANDED_HEIGHT: f32 = 148.0;
+/// At or above this window width the app uses the desktop layout (navigation
+/// sidebar); below it the phone-style sliding panes are used.
+const WIDE_LAYOUT_MIN_WIDTH: f32 = 720.0;
+/// Reading-column cap so content stays comfortable on very wide windows.
+const CONTENT_MAX_WIDTH: f32 = 720.0;
+
+/// Corner-radius scale (macOS Tahoe / Liquid Glass): rounder, consistent
+/// corners across every surface. One scale, referenced everywhere — a radius
+/// change is a one-line edit per tier.
+const RADIUS_CHIP: f32 = 6.0;
+const RADIUS_ROW: f32 = 8.0;
+const RADIUS_CONTROL: f32 = 10.0;
+const RADIUS_CARD: f32 = 12.0;
+const RADIUS_MENU: f32 = 14.0;
+
+/// Fixed heights for the virtualized entries list: every card occupies the
+/// same row height (content is line-clamped to fit), headers are slimmer.
+const ENTRY_CARD_HEIGHT: f32 = 108.0;
+const SECTION_HEADER_HEIGHT: f32 = 30.0;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
+pub(crate) enum SortMode {
+    #[default]
+    Time,
+    Alpha,
+    Topic,
+}
+
 
 fn app_icon(name: IconName) -> Icon {
     Icon::new(name).size(px(16.))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ComposerKind {
     Note,
     Link,
+    Image,
 }
 
 /// An interactive prompt the worker is waiting on during OAuth login.
@@ -84,7 +114,7 @@ struct AuthNotice {
 }
 
 pub struct WorktableView {
-    service: Arc<WorktableService>,
+    pub(crate) service: Arc<WorktableService>,
     pub(crate) focus_handle: FocusHandle,
 
     pub(crate) mode: AppMode,
@@ -132,23 +162,24 @@ pub struct WorktableView {
     helix_building: bool,
     helix_status: Option<String>,
 
+    /// Set when a stored provider was found to be stale and auto-cleared;
+    /// drives the assistant's "provider was removed — pick a new one" note.
+    stale_provider_cleared: bool,
+
     // UI state
-    pub(crate) sidebar_collapsed: bool,
-    // Dwell-open state: hover for 300ms opens, leave for 400ms re-collapses.
-    // `sidebar_dwell_opened` tracks whether the current expansion was caused
-    // by dwell so a leave only collapses dwell-opened sidebars, not a manual
-    // `cmd-shift-s` expansion.
-    sidebar_dwell_hovered: bool,
-    sidebar_dwell_seq: u64,
-    sidebar_dwell_opened: bool,
+    pub(crate) library_menu_open: bool,
+    pub(crate) sort_mode: SortMode,
     pub(crate) dark_mode: bool,
     settings_tab: SettingsTab,
-    // UI settings (exposed in Settings → UI, persisted via wt_ai_config)
-    dwell_enabled: bool,
-    dwell_open_ms: u64,
-    dwell_close_ms: u64,
     settings_scroll: VirtualListScrollHandle,
     provider_row_sizes: Rc<Vec<Size<Pixels>>>,
+    entries_scroll: VirtualListScrollHandle,
+    /// When the entries list last gained a new top entry — drives the
+    /// "existing list glides down while the new card fades in" entrance.
+    list_insert_at: Option<Instant>,
+    recent_entry_id: Option<String>,
+    github_importing: bool,
+    github_import_status: Option<String>,
     splash_start: Option<Instant>,
 
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -163,10 +194,12 @@ impl WorktableView {
         let focus_handle = cx.focus_handle();
         let search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search entries…")
+                .placeholder("Search")
                 .clean_on_escape()
         });
-        let composer_body = cx.new(|cx| InputState::new(window, cx).placeholder("Content…"));
+        let composer_body = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Add a note or a prompt (development)")
+        });
         let assistant_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Ask your notes…")
@@ -221,18 +254,19 @@ impl WorktableView {
             github_loading: false,
             github_error: None,
             helix_building: false,
+            stale_provider_cleared: false,
             helix_status: None,
-            sidebar_collapsed: false,
-            sidebar_dwell_hovered: false,
-            sidebar_dwell_seq: 0,
-            sidebar_dwell_opened: false,
+            library_menu_open: false,
+            sort_mode: SortMode::Time,
             dark_mode: false,
             settings_tab: SettingsTab::Ui,
-            dwell_enabled: true,
-            dwell_open_ms: 300,
-            dwell_close_ms: 400,
             settings_scroll: VirtualListScrollHandle::new(),
             provider_row_sizes: Rc::new(Vec::new()),
+            entries_scroll: VirtualListScrollHandle::new(),
+            list_insert_at: None,
+            recent_entry_id: None,
+            github_importing: false,
+            github_import_status: None,
             splash_start: Some(Instant::now()),
 
             _subscriptions: Vec::new(),
@@ -242,44 +276,7 @@ impl WorktableView {
         view.load_entries(cx);
         view.refresh_providers(cx);
         view.load_github_username(cx);
-        view.load_ui_settings(cx);
         view
-    }
-
-    fn load_ui_settings(&mut self, cx: &mut Context<Self>) {
-        let service = Arc::clone(&self.service);
-        cx.spawn(async move |view, cx| {
-            let dwell_enabled = service
-                .get_config("ui_dwell_enabled")
-                .await
-                .ok()
-                .flatten()
-                .map(|v| v != "0" && v != "false")
-                .unwrap_or(true);
-            let dwell_open = service
-                .get_config("ui_dwell_open_ms")
-                .await
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(300)
-                .clamp(100, 800);
-            let dwell_close = service
-                .get_config("ui_dwell_close_ms")
-                .await
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(400)
-                .clamp(100, 800);
-            let _ = view.update(cx, |this, cx| {
-                this.dwell_enabled = dwell_enabled;
-                this.dwell_open_ms = dwell_open;
-                this.dwell_close_ms = dwell_close;
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn save_ui_setting(&self, key: &str, value: &str, cx: &mut Context<Self>) {
@@ -314,7 +311,8 @@ impl WorktableView {
 
         // Pressing Enter in the composer submits it.
         let composer_body = self.composer_body.clone();
-        for field in [composer_body] {
+        {
+            let field = composer_body;
             let subscription = cx.subscribe(&field, move |this, _emitter, event, cx| {
                 if matches!(
                     event,
@@ -406,6 +404,14 @@ impl WorktableView {
             .detach();
         }
 
+        // Re-render whenever the window is resized. Layout-dependent styles
+        // (the phone slide's pane widths, the wide/narrow sidebar switch) are
+        // captured in `render()` from `viewport_size()`; without this the
+        // stale styles persist through live resizes and the hidden pane peeks
+        // out beside the active one.
+        let subscription = cx.observe_window_bounds(window, |_, _, cx| cx.notify());
+        self._subscriptions.push(subscription);
+
         // Focus the search field when the user opts in via Cmd+F.
         let _ = window;
     }
@@ -448,7 +454,9 @@ impl WorktableView {
 
     fn load_github_username(&mut self, cx: &mut Context<Self>) {
         let service = Arc::clone(&self.service);
-        let input = self.github_input.clone();
+        // Do not capture the github_input entity here: this detached task can
+        // still be pending at App teardown (e.g. in tests), and the strong
+        // entity handle kept alive past that trips GPUI's leak detection.
         cx.spawn(async move |view, cx| {
             let result = service.get_github_username().await;
             let _ = view.update(cx, |this, cx| {
@@ -456,6 +464,7 @@ impl WorktableView {
                     Ok(Some(username)) if !username.trim().is_empty() => {
                         let username = username.trim().to_owned();
                         this.github_username = Some(username.clone());
+                        let input = this.github_input.clone();
                         this.set_input(&input, &username, cx);
                         // Auto-fetch stars for the stored username (non-blocking, updates UI when done).
                         this.fetch_github_stars(cx);
@@ -464,6 +473,7 @@ impl WorktableView {
                         let username = username.trim().to_owned();
                         if !username.is_empty() {
                             this.github_username = Some(username.clone());
+                            let input = this.github_input.clone();
                             this.set_input(&input, &username, cx);
                         }
                     }
@@ -512,6 +522,70 @@ impl WorktableView {
         })
         .detach();
     }
+
+    /// Record that `id` was just added so the entries list plays its
+    /// "existing rows glide down" entrance on the next renders.
+    fn mark_entry_inserted(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.recent_entry_id = Some(id.to_owned());
+        self.list_insert_at = Some(Instant::now());
+        cx.notify();
+    }
+
+    pub fn show_github_stars(&mut self, cx: &mut Context<Self>) {
+        self.mode = AppMode::GithubStars;
+        self.library_menu_open = false;
+        if self.github_username.is_none() {
+            self.load_github_username(cx);
+        }
+        cx.notify();
+    }
+
+    /// Import the starred repositories of the saved username as entries:
+    /// one link entry per star, `created_at` = the star timestamp, content =
+    /// the repo description (falling back to its URL). Already-imported
+    /// stars are skipped.
+    pub fn import_github_stars(&mut self, cx: &mut Context<Self>) {
+        let Some(username) = self.github_username.clone().filter(|u| !u.is_empty()) else {
+            self.github_import_status = Some("Save a GitHub username first.".to_owned());
+            cx.notify();
+            return;
+        };
+        if self.github_importing {
+            return;
+        }
+        self.github_importing = true;
+        self.github_import_status = None;
+        cx.notify();
+
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.import_starred_repos(&username, None).await;
+            let _ = view.update(cx, |this, cx| {
+                this.github_importing = false;
+                match result {
+                    Ok((imported, skipped)) => {
+                        this.github_import_status = Some(if skipped > 0 {
+                            format!("Imported {imported} stars ({skipped} already present).")
+                        } else {
+                            format!("Imported {imported} stars.")
+                        });
+                        if imported > 0 {
+                            // Trigger the list entrance: the new stars land at
+                            // their starred dates, so a plain refresh suffices.
+                            this.load_entries(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.github_import_status =
+                            Some(format!("Import failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
 
     pub fn fetch_github_stars(&mut self, cx: &mut Context<Self>) {
         // Prefer the text currently in the input; fall back to the stored username.
@@ -567,12 +641,16 @@ impl WorktableView {
         let db_path = self.service.database_path().to_owned();
         let helix_path = worktable_helix::helix_path_for_sqlite(&db_path);
         cx.spawn(async move |view, cx| {
-            // Run the blocking build on a background thread
-            let result = tokio::task::spawn_blocking(move || {
+            // Run the blocking build on a dedicated thread. `tokio::task::spawn_blocking`
+            // cannot be used here: this spawn runs on GPUI's executor, which has no Tokio
+            // reactor, and calling it from there panics with "no reactor running".
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
                 let client = worktable_helix::HelixClient::open_embedded(helix_path);
-                client.build_from_sqlite_blocking(&db_path)
-            })
-            .await;
+                let result = client.build_from_sqlite_blocking(&db_path);
+                let _ = tx.send(result);
+            });
+            let result = rx.await;
             let _ = view.update(cx, |this, cx| {
                 this.helix_building = false;
                 match result {
@@ -581,8 +659,9 @@ impl WorktableView {
                             this.helix_status =
                                 Some("Helix up to date — no new entries to sync.".to_owned());
                         } else {
-                            this.helix_status =
-                                Some(format!("Helix synced {synced} new entries. Topics + relations ready."));
+                            this.helix_status = Some(format!(
+                                "Helix synced {synced} new entries. Topics + relations ready."
+                            ));
                         }
                     }
                     Ok(Err(e)) => {
@@ -598,9 +677,10 @@ impl WorktableView {
         .detach();
     }
 
-    fn visible_entries(&self) -> Vec<&WorktableEntry> {
+    pub(crate) fn visible_entries(&self) -> Vec<&WorktableEntry> {
         let query = self.query.trim().to_lowercase();
-        self.entries
+        let mut filtered: Vec<&WorktableEntry> = self
+            .entries
             .iter()
             .filter(|entry| {
                 if query.is_empty() {
@@ -615,14 +695,50 @@ impl WorktableView {
                     || entry.content.to_lowercase().contains(&query)
                     || entry.source.to_lowercase().contains(&query)
             })
-            .collect()
+            .collect();
+        match self.sort_mode {
+            SortMode::Time => {
+                filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            }
+            SortMode::Alpha => {
+                filtered.sort_by(|a, b| {
+                    let a_key = a
+                        .title
+                        .as_deref()
+                        .unwrap_or(&a.content)
+                        .to_lowercase();
+                    let b_key = b
+                        .title
+                        .as_deref()
+                        .unwrap_or(&b.content)
+                        .to_lowercase();
+                    a_key.cmp(&b_key)
+                });
+            }
+            SortMode::Topic => {
+                // Grouped view still needs a deterministic order: topics alphabetically,
+                // then time within each topic. For the flat visible list used for selection,
+                // sort by primary topic then time.
+                filtered.sort_by(|a, b| {
+                    let ta = helix_primary_topic(a);
+                    let tb = helix_primary_topic(b);
+                    ta.cmp(&tb).then_with(|| b.created_at.cmp(&a.created_at))
+                });
+            }
+        }
+        filtered
     }
 
-    fn visible_entry_ids(&self) -> Vec<String> {
+    pub(crate) fn visible_entry_ids(&self) -> Vec<String> {
         self.visible_entries()
             .into_iter()
             .map(|entry| entry.id.clone())
             .collect()
+    }
+
+    pub(crate) fn set_sort_mode(&mut self, mode: SortMode, cx: &mut Context<Self>) {
+        self.sort_mode = mode;
+        cx.notify();
     }
 
     fn selected_entry(&self) -> Option<&WorktableEntry> {
@@ -631,12 +747,6 @@ impl WorktableView {
             .as_ref()
             .or_else(|| self.selected.iter().next())?;
         self.entries.iter().find(|entry| &entry.id == anchor)
-    }
-
-    fn focus(&mut self, window: &mut Window, cx: &mut App) {
-        let _ = self;
-        let _ = window;
-        let _ = cx;
     }
 
     // ---- Public action methods (called from app-level handlers) ------------
@@ -649,6 +759,10 @@ impl WorktableView {
         self.open_composer(ComposerKind::Link, window, cx);
     }
 
+    pub fn open_composer_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_composer(ComposerKind::Image, window, cx);
+    }
+
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.search_input.read(cx).focus_handle(cx);
         handle.focus(window, cx);
@@ -656,16 +770,19 @@ impl WorktableView {
 
     pub fn show_entries(&mut self, cx: &mut Context<Self>) {
         self.mode = AppMode::Entries;
+        self.library_menu_open = false;
         cx.notify();
     }
 
     pub fn show_assistant(&mut self, cx: &mut Context<Self>) {
         self.mode = AppMode::Assistant;
+        self.library_menu_open = false;
         cx.notify();
     }
 
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.mode = AppMode::Settings;
+        self.library_menu_open = false;
         if self.providers.is_empty() {
             self.refresh_providers(cx);
         }
@@ -674,6 +791,7 @@ impl WorktableView {
 
     pub fn show_provider_config(&mut self, cx: &mut Context<Self>) {
         self.mode = AppMode::ProviderConfig;
+        self.library_menu_open = false;
         if self.providers.is_empty() {
             self.refresh_providers(cx);
         }
@@ -700,86 +818,14 @@ impl WorktableView {
             self.api_key_provider = None;
             self.settings_status = Some(format!("{provider_id} uses OAuth configuration below."));
         }
+        self.update_provider_row_sizes();
         self.mode = AppMode::ProviderConfig;
         cx.notify();
     }
 
-    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
-        // Manual toggle cancels any pending dwell timer and clears the
-        // dwell-opened flag so a subsequent hover-leave does not collapse a
-        // user-intended expansion.
-        self.sidebar_dwell_opened = false;
-        self.sidebar_dwell_seq = self.sidebar_dwell_seq.wrapping_add(1);
+    pub fn toggle_library_menu(&mut self, cx: &mut Context<Self>) {
+        self.library_menu_open = !self.library_menu_open;
         cx.notify();
-    }
-
-    /// Handle hover changes for the sidebar dwell-open behavior.
-    ///
-    /// When the sidebar is collapsed and the mouse dwells over its 52px icon
-    /// strip for 300ms, the sidebar expands. When the mouse leaves the expanded
-    /// sidebar for 400ms, it re-collapses — but only if the expansion was
-    /// caused by dwell, so a `cmd-shift-s` expansion is sticky until the user
-    /// toggles again. On phone-sized windows (<600px wide) dwell is disabled
-    /// so the sidebar never pops up and covers content.
-    fn handle_sidebar_hover(
-        &mut self,
-        hovered: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.dwell_enabled {
-            return;
-        }
-        // Phone size — never dwell-popup, let the toggle button be the only way
-        if window.bounds().size.width < px(600.) {
-            return;
-        }
-        self.sidebar_dwell_hovered = hovered;
-        self.sidebar_dwell_seq = self.sidebar_dwell_seq.wrapping_add(1);
-        let seq = self.sidebar_dwell_seq;
-
-        if hovered {
-            if self.sidebar_collapsed {
-                let delay = Duration::from_millis(self.dwell_open_ms);
-                cx.spawn(async move |view, cx| {
-                    cx.background_executor().timer(delay).await;
-                    let _ = view.update(cx, |this, cx| {
-                        if this.sidebar_dwell_seq != seq {
-                            return;
-                        }
-                        if !this.sidebar_dwell_hovered {
-                            return;
-                        }
-                        if this.sidebar_collapsed {
-                            this.sidebar_collapsed = false;
-                            this.sidebar_dwell_opened = true;
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-            }
-        } else if !self.sidebar_collapsed && self.sidebar_dwell_opened {
-            let delay = Duration::from_millis(self.dwell_close_ms);
-            cx.spawn(async move |view, cx| {
-                cx.background_executor().timer(delay).await;
-                let _ = view.update(cx, |this, cx| {
-                    if this.sidebar_dwell_seq != seq {
-                        return;
-                    }
-                    if this.sidebar_dwell_hovered {
-                        return;
-                    }
-                    if !this.sidebar_collapsed && this.sidebar_dwell_opened {
-                        this.sidebar_collapsed = true;
-                        this.sidebar_dwell_opened = false;
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
     }
 
     pub fn cancel_composer(&mut self, cx: &mut Context<Self>) {
@@ -868,19 +914,17 @@ impl WorktableView {
     }
 
     pub fn copy_selected_link(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected_entry() {
-            if entry.kind == "link" {
+        if let Some(entry) = self.selected_entry()
+            && entry.kind == "link" {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.content.clone()));
             }
-        }
     }
 
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected_entry() {
-            if entry.kind == "link" {
+        if let Some(entry) = self.selected_entry()
+            && entry.kind == "link" {
                 cx.open_url(&entry.content);
             }
-        }
     }
 
     pub fn select_at(&mut self, id: String, extend: bool) {
@@ -892,7 +936,10 @@ impl WorktableView {
                 }
             } else {
                 self.selected.insert(id.clone());
-                self.selected_anchor = Some(id);
+                // Keep existing anchor for shift-contiguous (cmd should not move anchor)
+                if self.selected_anchor.is_none() {
+                    self.selected_anchor = Some(id);
+                }
             }
         } else {
             self.selected.clear();
@@ -901,8 +948,27 @@ impl WorktableView {
         }
     }
 
-    fn is_selected(&self, id: &str) -> bool {
-        self.selected.contains(id)
+    pub fn select_range(&mut self, id: String, _cx: &mut Context<Self>) {
+        let visible_ids = self.visible_entry_ids();
+        let anchor = self
+            .selected_anchor
+            .clone()
+            .unwrap_or_else(|| id.clone());
+        let anchor_idx = visible_ids.iter().position(|x| x == &anchor);
+        let target_idx = visible_ids.iter().position(|x| x == &id);
+        if let (Some(a), Some(b)) = (anchor_idx, target_idx) {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            self.selected.clear();
+            for idx in start..=end {
+                self.selected.insert(visible_ids[idx].clone());
+            }
+            // Keep the original anchor for subsequent shifts; update UI anchor to target
+            self.selected_anchor = Some(anchor.clone());
+            // Also ensure the target is considered last selected for next cmd ops
+            // but keep anchor stable — do not overwrite anchor with id if we want sticky.
+        } else {
+            self.select_at(id, false);
+        }
     }
 
     pub fn on_event(&mut self, event: &WorktableEvent, cx: &mut Context<Self>) {
@@ -1053,25 +1119,68 @@ impl WorktableView {
                 (provider.id.clone(), Arc::new(models))
             })
             .collect();
-        self.provider_row_sizes = Rc::new(
-            (0..self.providers.len())
-                .map(|_| size(px(0.), px(PROVIDER_ROW_HEIGHT)))
-                .collect(),
-        );
         self.active_provider = snapshot.active_provider.clone();
         self.active_model = snapshot.active_model.clone();
         // Drop any api-key entry row that no longer exists.
-        if let Some(provider) = &self.api_key_provider {
-            if !self.providers.iter().any(|p| &p.id == provider) {
-                self.api_key_provider = None;
-            }
+        if let Some(provider) = &self.api_key_provider
+            && !self.providers.iter().any(|p| &p.id == provider) {
+            self.api_key_provider = None;
         }
+        // A stored active provider the catalog no longer knows (e.g. saved by
+        // an older build, then the provider was removed upstream) can never
+        // serve a prompt. Clear it and say so — the assistant shows its setup
+        // CTA until a valid provider is chosen again.
+        if let Some(provider) = self.active_provider.clone()
+            && !provider.is_empty()
+            && !self.providers.iter().any(|p| p.id == provider) {
+            self.active_provider = None;
+            self.active_model = None;
+            self.stale_provider_cleared = true;
+            self.settings_status = Some(format!(
+                "'{provider}' is no longer an available provider — pick a new one under Providers."
+            ));
+        }
+        self.update_provider_row_sizes();
+    }
+
+    /// Rebuild the virtual list's row sizes: every provider row uses the
+    /// compact height except the one whose API-key field is expanded.
+    fn update_provider_row_sizes(&mut self) {
+        self.provider_row_sizes = Rc::new(
+            self.providers
+                .iter()
+                .map(|provider| {
+                    let height = if self.api_key_provider.as_deref() == Some(provider.id.as_str()) {
+                        PROVIDER_ROW_EXPANDED_HEIGHT
+                    } else {
+                        PROVIDER_ROW_HEIGHT
+                    };
+                    size(px(0.), px(height))
+                })
+                .collect(),
+        );
+    }
+
+    /// The agent can serve prompts only when the worker runs AND a provider
+    /// from the current catalog is active with a model selected. Anything
+    /// less and the composer turns into a setup call-to-action instead of a
+    /// dead input.
+    fn agent_ready(&self) -> bool {
+        self.service.has_ai_worker()
+            && self
+                .active_provider
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && self.providers.iter().any(|p| p.id == id))
+            && self
+                .active_model
+                .as_deref()
+                .is_some_and(|model| !model.is_empty())
     }
 
     pub fn send_assistant(&mut self, cx: &mut Context<Self>) {
-        if !self.service.has_ai_worker() {
+        if !self.agent_ready() {
             self.messages.push(ChatMessage::assistant(
-                "The AI assistant isn't configured yet. Open Settings to pick a provider.",
+                "The AI assistant isn't configured yet — pick a provider, add an API key, and choose a model in Settings.",
             ));
             cx.notify();
             return;
@@ -1096,15 +1205,30 @@ impl WorktableView {
             let result = service
                 .submit_prompt(&request_id, "wt-session", &text)
                 .await;
-            if let Err(error) = result {
-                let _ = view.update(cx, |this, cx| {
-                    this.assistant_busy = false;
-                    if !this.messages.iter().any(|m| m.text.contains(&error)) {
-                        this.messages
-                            .push(ChatMessage::assistant(format!("⚠ {error}")));
-                    }
-                    cx.notify();
-                });
+            match result {
+                Err(error) => {
+                    let _ = view.update(cx, |this, cx| {
+                        this.assistant_busy = false;
+                        if !this.messages.iter().any(|m| m.text.contains(&error)) {
+                            this.messages
+                                .push(ChatMessage::assistant(format!("⚠ {error}")));
+                        }
+                        cx.notify();
+                    });
+                }
+                // `None` = the session lease was not granted (another run is
+                // still active). Without this arm the composer stays busy
+                // forever with no feedback — the prompt silently vanishes.
+                Ok(None) => {
+                    let _ = view.update(cx, |this, cx| {
+                        this.assistant_busy = false;
+                        this.messages.push(ChatMessage::assistant(
+                            "⚠ Another prompt is still running for this session. Please wait for it to finish and try again.",
+                        ));
+                        cx.notify();
+                    });
+                }
+                Ok(Some(_)) => {}
             }
         })
         .detach();
@@ -1272,7 +1396,7 @@ impl WorktableView {
         let Some(kind) = self.composer else {
             return;
         };
-        let body = trim_opt(&self.composer_body.read(cx).value().to_string());
+        let body = trim_opt(self.composer_body.read(cx).value().as_ref());
 
         let (valid, content, entry_kind) = match kind {
             ComposerKind::Note => match body {
@@ -1282,6 +1406,10 @@ impl WorktableView {
             ComposerKind::Link => match body {
                 Some(url) => (true, url, "link"),
                 None => (false, String::new(), "link"),
+            },
+            ComposerKind::Image => match body {
+                Some(path) => (true, path, "image"),
+                None => (false, String::new(), "image"),
             },
         };
         if !valid {
@@ -1301,6 +1429,7 @@ impl WorktableView {
         cx.notify();
 
         let service = Arc::clone(&self.service);
+        let entry_id_for_anim = entry.id.clone();
         cx.spawn(async move |view, cx| {
             let result = service.insert_entry(entry.clone()).await;
             let _ = view.update(cx, |this, cx| {
@@ -1310,6 +1439,7 @@ impl WorktableView {
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
                     this.mode = AppMode::Entries;
+                    this.mark_entry_inserted(&entry_id_for_anim, cx);
                 }
                 cx.notify();
             });
@@ -1321,10 +1451,12 @@ impl WorktableView {
         self.composer = Some(kind);
         self.composer_body.update(cx, |state, cx| {
             state.set_value("", window, cx);
-            if kind == ComposerKind::Note {
-                state.set_placeholder("Write your note…", window, cx);
-            } else {
-                state.set_placeholder("https://…  (or a plain link)", window, cx);
+            match kind {
+                ComposerKind::Note => state.set_placeholder("Write your note…", window, cx),
+                ComposerKind::Link => {
+                    state.set_placeholder("https://…  (or a plain link)", window, cx)
+                }
+                ComposerKind::Image => state.set_placeholder("Image path or URL…", window, cx),
             }
         });
         cx.notify();
@@ -1354,6 +1486,7 @@ impl WorktableView {
             created_at: crate::service::unix_time_ms(),
         };
         let service = Arc::clone(&self.service);
+        let entry_id_for_anim = entry.id.clone();
         cx.spawn(async move |view, cx| {
             let result = service.insert_entry(entry.clone()).await;
             let _ = view.update(cx, |this, cx| {
@@ -1363,6 +1496,7 @@ impl WorktableView {
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
                     this.mode = AppMode::Entries;
+                    this.mark_entry_inserted(&entry_id_for_anim, cx);
                 }
                 cx.notify();
             });
@@ -1387,6 +1521,7 @@ impl WorktableView {
             created_at: crate::service::unix_time_ms(),
         };
         let service = Arc::clone(&self.service);
+        let entry_id_for_anim = entry.id.clone();
         cx.spawn(async move |view, cx| {
             let result = service.insert_entry(entry.clone()).await;
             let _ = view.update(cx, |this, cx| {
@@ -1396,6 +1531,7 @@ impl WorktableView {
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
                     this.mode = AppMode::Entries;
+                    this.mark_entry_inserted(&entry_id_for_anim, cx);
                 }
                 cx.notify();
             });
@@ -1458,11 +1594,10 @@ impl Render for WorktableView {
         if hover_fades_active() {
             window.refresh();
         }
-        if let Some(start) = self.splash_start {
-            if start.elapsed() > Duration::from_millis(650) {
+        if let Some(start) = self.splash_start
+            && start.elapsed() > Duration::from_millis(650) {
                 self.splash_start = None;
             }
-        }
         let theme = cx.theme().clone();
         let is_splash = self.splash_start.is_some();
 
@@ -1471,6 +1606,7 @@ impl Render for WorktableView {
             .size_full()
             .flex()
             .relative()
+            .track_focus(&self.focus_handle)
             .bg(theme.tokens.background)
             .text_color(theme.foreground)
             .text_size(theme.font_size)
@@ -1526,11 +1662,6 @@ impl Render for WorktableView {
                 cx.listener(|this, _: &crate::actions::ShowSettings, _, cx| this.show_settings(cx)),
             )
             .on_action(
-                cx.listener(|this, _: &crate::actions::ToggleSidebar, _, cx| {
-                    this.toggle_sidebar(cx)
-                }),
-            )
-            .on_action(
                 cx.listener(|this, _: &crate::actions::ToggleTheme, _, cx| this.toggle_theme(cx)),
             )
             .on_action(
@@ -1542,19 +1673,17 @@ impl Render for WorktableView {
                 }),
             )
             .child(
-                div()
-                    .id("worktable-sidebar-dwell")
-                    .flex_shrink_0()
-                    .h_full()
-                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                        this.handle_sidebar_hover(*hovered, window, cx);
-                    }))
-                    .child(render_sidebar(self, cx)),
-            )
-            .child(
-                div()
+                h_flex()
+                    .relative()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
+                    // The transparent macOS titlebar lets the app background
+                    // paint through it; leave room for the traffic lights.
+                    .pt(px(30.))
+                    // Cap the reading column on very wide windows so content
+                    // stays comfortable; centered.
+                    .justify_center()
                     .child(render_main(self, window, cx)),
             )
             .when(is_splash, |this| {
@@ -1566,7 +1695,7 @@ impl Render for WorktableView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(theme.tokens.background.clone())
+                        .bg(theme.tokens.background)
                         .child(
                             v_flex()
                                 .items_center()
@@ -1593,243 +1722,339 @@ impl Render for WorktableView {
     }
 }
 
-fn render_sidebar(this: &WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
-    let theme = cx.theme();
-
-    let brand = div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size_7()
-        .flex_shrink_0()
-        .rounded(theme.radius)
-        .bg(theme.sidebar_primary)
-        .text_color(theme.sidebar_primary_foreground)
-        .child(app_icon(IconName::GalleryVerticalEnd));
-
-    let header = if this.sidebar_collapsed {
-        h_flex().justify_center().child(brand).into_any_element()
-    } else {
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(brand)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Worktable"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Your notes"),
-                    ),
-            )
-            .into_any_element()
-    };
-
-    let footer = h_flex()
-        .justify_center()
-        .child(app_icon(IconName::CircleUser))
-        .into_any_element();
-
-    Sidebar::new("worktable-sidebar")
-        .collapsible(SidebarCollapsible::Icon)
-        .collapsed(this.sidebar_collapsed)
-        .w(px(220.))
-        .header(SidebarHeader::new().child(header))
-        .child(
-            SidebarGroup::new("Workspace").child(SidebarMenu::new().children([
-                menu_item(
-                    "Entries",
-                    IconName::Inbox,
-                    AppMode::Entries,
-                    this.mode,
-                    cx.listener(|this, _, _, cx| this.show_entries(cx)),
-                ),
-                menu_item(
-                    "AI Assistant",
-                    IconName::Bot,
-                    AppMode::Assistant,
-                    this.mode,
-                    cx.listener(|this, _, _, cx| this.show_assistant(cx)),
-                ),
-                menu_item(
-                    "Settings",
-                    IconName::Settings,
-                    AppMode::Settings,
-                    this.mode,
-                    cx.listener(|this, _, _, cx| this.show_settings(cx)),
-                ),
-            ])),
-        )
-        .footer(SidebarFooter::new().child(footer))
-}
-
-fn menu_item(
-    label: &'static str,
-    icon: IconName,
-    mode: AppMode,
-    active: AppMode,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> SidebarMenuItem {
-    SidebarMenuItem::new(label)
-        .icon(app_icon(icon))
-        .active(active == mode || (mode == AppMode::Settings && active == AppMode::ProviderConfig))
-        .on_click(on_click)
-}
-
 fn render_main(
     this: &mut WorktableView,
     window: &mut Window,
     cx: &mut Context<WorktableView>,
 ) -> impl IntoElement {
+    // One column, three shells:
+    // - Entries/Assistant: header (search) + FIXED Entries|Agent button group,
+    //   with only the page content sliding between them — the button group
+    //   never moves.
+    // - Settings: back button + tab group on top, no search bar.
+    // - ProviderConfig / GithubStars: full-page replacements with a back
+    //   button, reached from Settings.
     let theme = cx.theme().clone();
-    let root_settings_breadcrumbs =
-        if this.mode == AppMode::Settings || this.mode == AppMode::ProviderConfig {
-            Some(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .child(
-                        div()
-                            .id("breadcrumb-home")
-                            .cursor_pointer()
-                            .text_color(theme.muted_foreground)
-                            .hover(|s| s.text_color(theme.foreground))
-                            .child("Home")
-                            .on_click(cx.listener(|this, _, _, cx| this.show_entries(cx))),
-                    )
-                    .child(
-                        Icon::new(IconName::ChevronRight)
-                            .size(px(14.))
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .id("breadcrumb-settings")
-                            .cursor_pointer()
-                            .text_color(if this.mode == AppMode::Settings {
-                                theme.foreground
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .hover(|s| s.text_color(theme.foreground))
-                            .child("Settings")
-                            .on_click(cx.listener(|this, _, _, cx| this.show_settings(cx))),
-                    )
-                    .when(this.mode == AppMode::ProviderConfig, |this| {
-                        this.child(
-                            Icon::new(IconName::ChevronRight)
-                                .size(px(14.))
-                                .text_color(theme.muted_foreground),
-                        )
-                        .child(div().text_color(theme.foreground).child("Providers"))
-                    }),
-            )
-        } else {
-            None
-        };
+    let viewport_width = window.viewport_size().width;
+    // Panes never exceed the content column, or the hidden pane would peek
+    // out beside the active one.
+    let pane_w = viewport_width.min(px(CONTENT_MAX_WIDTH));
 
-    let mut title_leading = h_flex().items_center().gap_2().child(
-        SidebarToggleButton::new()
-            .collapsed(this.sidebar_collapsed)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-    );
-    if let Some(breadcrumbs) = root_settings_breadcrumbs {
-        title_leading = title_leading.child(breadcrumbs);
-    }
-
-    let title_bar = TitleBar::new().child(title_leading).child(
-        h_flex()
-            .items_center()
-            .gap_1()
-            .child(
-                Button::new("title-search")
-                    .icon(app_icon(IconName::Search))
-                    .ghost()
-                    .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
-            )
-            .child(
-                Button::new("title-more")
-                    .icon(app_icon(IconName::Ellipsis))
-                    .ghost(),
-            ),
-    );
-
-    let entries_toolbar = if this.mode == AppMode::Entries {
-        h_flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div().flex_1().child(
-                    Input::new(&this.search_input)
-                        .prefix(Icon::new(IconName::Search).text_color(theme.muted_foreground))
-                        .cleanable(true),
-                ),
-            )
-            .child(new_menu_button(cx))
-            .into_any_element()
-    } else {
-        div().into_any_element()
+    let header: gpui::AnyElement = match this.mode {
+        AppMode::Entries | AppMode::Assistant => render_library_header(this, cx),
+        AppMode::Settings => settings_header(this, "Settings", SettingsTab::Ui, cx),
+        AppMode::ProviderConfig => settings_header(this, "AI providers", SettingsTab::Providers, cx),
+        AppMode::GithubStars => settings_header(this, "GitHub Stars", SettingsTab::Data, cx),
     };
 
-    let content = match this.mode {
-        AppMode::Entries => render_entries(this, window, cx).into_any_element(),
-        AppMode::Assistant => render_assistant(this, cx).into_any_element(),
+    let body: gpui::AnyElement = match this.mode {
+        AppMode::Entries | AppMode::Assistant => {
+            let is_assistant = this.mode == AppMode::Assistant;
+            // Build both panes sequentially (separate mutable borrows).
+            let entries_pane = render_entries_pane(this, window, cx).into_any_element();
+            let assistant_pane = render_assistant(this, cx).into_any_element();
+            v_flex()
+                .id("slide-shell")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                // The button group is fixed; only this block slides.
+                .child(library_tabs(this, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w(pane_w)
+                        .max_w_full()
+                        .overflow_hidden()
+                        .relative()
+                        .child(
+                            h_flex()
+                                .w(pane_w * 2.)
+                                .h_full()
+                                .relative()
+                                .with_animation(
+                                    if is_assistant {
+                                        "slide-to-assistant"
+                                    } else {
+                                        "slide-to-entries"
+                                    },
+                                    worktable_ui::RESIZE.animation(),
+                                    move |el, t| {
+                                        let (from, to) = if is_assistant {
+                                            (px(0.), -pane_w)
+                                        } else {
+                                            (-pane_w, px(0.))
+                                        };
+                                        el.left(from + (to - from) * t)
+                                    },
+                                )
+                                .child(
+                                    div()
+                                        .w(pane_w)
+                                        .h_full()
+                                        .flex()
+                                        .flex_col()
+                                        .child(entries_pane),
+                                )
+                                .child(
+                                    div()
+                                        .w(pane_w)
+                                        .h_full()
+                                        .flex()
+                                        .flex_col()
+                                        .child(assistant_pane),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        }
         AppMode::Settings => render_settings(this, window, cx).into_any_element(),
         AppMode::ProviderConfig => render_provider_config(this, window, cx).into_any_element(),
+        AppMode::GithubStars => render_github_stars_page(this, window, cx).into_any_element(),
     };
 
     v_flex()
+        .relative()
         .flex_1()
         .min_w_0()
         .size_full()
-        .child(title_bar)
-        .child(entries_toolbar)
-        .child(content)
-        .child(if this.mode == AppMode::Entries {
-            composer_bar(this, cx).into_any_element()
-        } else {
-            div().into_any_element()
+        .max_w(px(CONTENT_MAX_WIDTH))
+        .bg(theme.tokens.background)
+        .child(header)
+        .child(body)
+        .when(this.library_menu_open, |this| {
+            this.child(library_context_menu(cx))
         })
 }
 
-fn new_menu_button(cx: &mut Context<WorktableView>) -> impl IntoElement {
-    let view = cx.entity();
-    Button::new("new-entry")
-        .label("New")
-        .icon(app_icon(IconName::Plus))
-        .primary()
-        .dropdown_menu(move |menu, _, _| {
-            let entity = view.clone();
-            menu.menu_element_with_icon(
-                app_icon(IconName::File),
-                Box::new(crate::actions::NewNote),
-                move |_, cx| {
-                    let _ = entity.update(cx, |_, _| {});
-                    menu_in(
-                        "new-note-menu",
-                        div().child("New Note").child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("⌘N"),
+fn render_library_header(
+    this: &mut WorktableView,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+
+    // Search field + Ask Agent + hamburger as real flex siblings — the old
+    // absolutely-positioned button overlapped the field's text.
+    h_flex()
+        .id("library-header")
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .pt_2()
+        .pb_2()
+        .bg(theme.tokens.background)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(36.))
+                .child(
+                    Input::new(&this.search_input)
+                        .h(px(36.))
+                        .w_full()
+                        .appearance(true)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .bg(theme.muted)
+                        .text_color(theme.foreground)
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .size(px(18.))
+                                .text_color(theme.muted_foreground),
                         ),
-                    )
-                },
-            )
+                ),
+        )
+        .child(
+            Button::new("ask-agent")
+                .label("Ask Agent")
+                .primary()
+                .shadow_sm()
+                .h(px(32.))
+                .text_xs()
+                .on_click(cx.listener(|this, _, _, cx| this.show_assistant(cx))),
+        )
+        .child(
+            div()
+                .size(px(36.))
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .child(library_menu_button(this, cx)),
+        )
+        .into_any_element()
+}
+
+/// Shared header for the Settings-family pages: a back button at the left
+/// corner (returns to Settings on the given tab) and — on the Settings page
+/// itself — the UI/Data/Providers tab group.
+fn settings_header(
+    this: &mut WorktableView,
+    title: &str,
+    back_to: SettingsTab,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+    let is_settings = this.mode == AppMode::Settings;
+
+    h_flex()
+        .id("settings-header")
+        .w_full()
+        .items_center()
+        .gap_3()
+        .px_4()
+        .pt_2()
+        .pb_2()
+        .bg(theme.tokens.background)
+        .child(
+            Button::new("settings-back")
+                .icon(app_icon(IconName::ArrowLeft))
+                .label("Back")
+                .ghost()
+                .h(px(32.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_tab = back_to;
+                    this.show_settings(cx);
+                })),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title.to_owned()),
+        )
+        .child(div().flex_1())
+        .when(is_settings, |el| {
+            el.child(settings_tab_group(this, cx))
         })
+        .into_any_element()
+}
+
+/// The UI / Data / Providers segmented control.
+fn settings_tab_group(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+    let tabs = [
+        ("settings-tab-ui", "UI", SettingsTab::Ui),
+        ("settings-tab-data", "Data", SettingsTab::Data),
+        ("settings-tab-providers", "Providers", SettingsTab::Providers),
+    ];
+    let mut group = h_flex()
+        .gap_1()
+        .p_1()
+        .bg(theme.tokens.background)
+        .rounded(px(RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme.border.opacity(0.6));
+    for (id, label, tab) in tabs {
+        let active = this.settings_tab == tab;
+        let mut btn = Button::new(id)
+            .label(label)
+            .h(px(26.))
+            .text_xs()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings_tab = tab;
+                cx.notify();
+            }));
+        btn = if active { btn.primary() } else { btn.ghost() };
+        group = group.child(btn);
+    }
+    group.into_any_element()
+}
+
+fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+
+    Button::new("library-menu")
+        .icon(app_icon(IconName::Menu))
+        .ghost()
+        .size(px(40.))
+        .rounded(px(59.))
+        .bg(theme.muted)
+        .text_color(theme.muted_foreground)
+        .selected(this.library_menu_open)
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_library_menu(cx)))
+}
+
+fn library_context_menu(cx: &mut Context<WorktableView>) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+
+    fn menu_row(
+        id: &'static str,
+        label: &'static str,
+        icon: IconName,
+        tall: bool,
+        cx: &mut Context<WorktableView>,
+        on_click: impl Fn(&mut WorktableView, &mut Window, &mut Context<WorktableView>) + 'static,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        h_flex()
+            .id(id)
+            .w_full()
+            .h(px(if tall { 40.0 } else { 36.0 }))
+            .items_center()
+            .gap_3()
+            .px_4()
+            .rounded(px(RADIUS_ROW))
+            .cursor_pointer()
+            .hover(|this| this.bg(theme.muted))
+            .on_click(cx.listener(move |this, _event, window, cx| on_click(this, window, cx)))
+            .child(
+                Icon::new(icon)
+                    .size(px(16.))
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(label.to_owned()),
+            )
+            .into_any_element()
+    }
+
+    v_flex()
+        .id("library-context-menu")
+        .absolute()
+        .top(px(52.))
+        .right(px(8.))
+        .w(px(220.))
+        .p(px(4.))
+        .gap_1()
+        .rounded(px(RADIUS_MENU))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .shadow_lg()
+        .child(menu_row(
+            "library-menu-settings",
+            "Settings",
+            IconName::Settings,
+            true,
+            cx,
+            |this, _window, cx| this.show_settings(cx),
+        ))
+        .child(menu_row(
+            "library-menu-archive",
+            "Archive",
+            IconName::FolderOpen,
+            true,
+            cx,
+            |this, _window, cx| {
+                this.library_menu_open = false;
+                cx.notify();
+            },
+        ))
+        .child(div().mx(px(4.)).h(px(1.)).bg(theme.border))
+        .child(menu_row(
+            "library-menu-exit",
+            "Exit Worktable",
+            IconName::Close,
+            true,
+            cx,
+            |_this, _window, cx| cx.quit(),
+        ))
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -1878,7 +2103,7 @@ fn render_settings(
                     .label("Retry")
                     .ghost()
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.refresh_providers(cx));
+                        view.update(cx, |this, cx| this.refresh_providers(cx));
                     }),
             )
             .into_any_element();
@@ -1905,65 +2130,11 @@ fn render_settings(
         .primary()
         .on_click(cx.listener(|this, _, _, cx| this.show_provider_config(cx)));
 
-    let github = render_github_section(this, _window, cx);
+    // The tab group lives in the settings header (`settings_tab_group`); the
+    // body only switches on `this.settings_tab`.
+    let _ = &theme;
 
-    // Settings tab bar — UI / Data / Providers
-    let tab_bar = h_flex()
-        .gap_1()
-        .p_1()
-        .bg(theme.tokens.background)
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border.opacity(0.6))
-        .child({
-            let active = this.settings_tab == SettingsTab::Ui;
-            let mut btn = Button::new("settings-tab-ui")
-                .label("UI")
-                .icon(app_icon(IconName::Palette))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings_tab = SettingsTab::Ui;
-                    cx.notify();
-                }));
-            if active {
-                btn = btn.primary();
-            } else {
-                btn = btn.ghost();
-            }
-            btn
-        })
-        .child({
-            let active = this.settings_tab == SettingsTab::Data;
-            let mut btn = Button::new("settings-tab-data")
-                .label("Data")
-                .icon(app_icon(IconName::HardDrive))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings_tab = SettingsTab::Data;
-                    cx.notify();
-                }));
-            if active {
-                btn = btn.primary();
-            } else {
-                btn = btn.ghost();
-            }
-            btn
-        })
-        .child({
-            let active = this.settings_tab == SettingsTab::Providers;
-            let mut btn = Button::new("settings-tab-providers")
-                .label("Providers")
-                .icon(app_icon(IconName::Bot))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings_tab = SettingsTab::Providers;
-                    cx.notify();
-                }));
-            if active {
-                btn = btn.primary();
-            } else {
-                btn = btn.ghost();
-            }
-            btn
-        });
-
+    let _tab_bar = ();
     let ui_section = v_flex().gap_4().p_4().child(
         v_flex()
             .gap_2()
@@ -1972,114 +2143,90 @@ fn render_settings(
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("Sidebar, theme, and motion"),
+                    .child("Appearance"),
             )
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .text_sm()
-                            .child("Sidebar dwell (hover 300ms→open, 400ms→close)"),
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child("Dark theme"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Ayu Light / Ayu Dark"),
+                            ),
                     )
                     .child(
-                        Button::new("toggle-dwell")
-                            .label(if this.dwell_enabled { "On" } else { "Off" })
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dwell_enabled = !this.dwell_enabled;
-                                this.save_ui_setting(
-                                    "ui_dwell_enabled",
-                                    if this.dwell_enabled { "1" } else { "0" },
-                                    cx,
-                                );
-                                cx.notify();
+                        Switch::new("toggle-theme")
+                            .checked(this.dark_mode)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                if *checked != this.dark_mode {
+                                    this.toggle_theme(cx);
+                                }
                             })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "Open {}ms / Close {}ms",
-                                this.dwell_open_ms, this.dwell_close_ms
-                            )),
-                    )
-                    .child(
-                        Button::new("dwell-faster")
-                            .label("-50ms")
-                            .ghost()
-                            .h(px(24.))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dwell_open_ms = this.dwell_open_ms.saturating_sub(50).max(100);
-                                this.dwell_close_ms =
-                                    this.dwell_close_ms.saturating_sub(50).max(100);
-                                this.save_ui_setting(
-                                    "ui_dwell_open_ms",
-                                    &this.dwell_open_ms.to_string(),
-                                    cx,
-                                );
-                                this.save_ui_setting(
-                                    "ui_dwell_close_ms",
-                                    &this.dwell_close_ms.to_string(),
-                                    cx,
-                                );
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("dwell-slower")
-                            .label("+50ms")
-                            .ghost()
-                            .h(px(24.))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dwell_open_ms = (this.dwell_open_ms + 50).min(800);
-                                this.dwell_close_ms = (this.dwell_close_ms + 50).min(800);
-                                this.save_ui_setting(
-                                    "ui_dwell_open_ms",
-                                    &this.dwell_open_ms.to_string(),
-                                    cx,
-                                );
-                                this.save_ui_setting(
-                                    "ui_dwell_close_ms",
-                                    &this.dwell_close_ms.to_string(),
-                                    cx,
-                                );
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_sm().child("Theme"))
-                    .child(
-                        Button::new("toggle-theme")
-                            .label(if this.dark_mode { "Dark" } else { "Light" })
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
                     ),
             ),
     );
 
-    let data_section = v_flex().gap_4().p_4().child(
-        v_flex()
-            .gap_2()
-            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Data"))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("GitHub stars and local database"),
-            )
-            .child(github),
-    );
+    // Data tab: one row per data provider, with a Configure button that opens
+    // the provider's full-page setup.
+    let data_section = v_flex()
+        .gap_4()
+        .p_4()
+        .child(
+            v_flex()
+                .gap_2()
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Data"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Import data sources as entries"),
+                ),
+        )
+        .child(
+            h_flex()
+                .id("data-provider-github")
+                .w_full()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .rounded(px(RADIUS_CARD))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .shadow_2xs()
+                .child(
+                    Icon::new(IconName::Star)
+                        .size(px(18.))
+                        .text_color(theme.primary),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().text_sm().child("GitHub Stars"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Starred repositories, with the date you starred them"),
+                        ),
+                )
+                .child(
+                    Button::new("configure-github-stars")
+                        .label("Configure")
+                        .ghost()
+                        .h(px(28.))
+                        .on_click(cx.listener(|this, _, _, cx| this.show_github_stars(cx))),
+                ),
+        );
+
 
     let providers_section = v_flex().gap_4().items_center().child(
         v_flex()
@@ -2110,12 +2257,12 @@ fn render_settings(
         SettingsTab::Providers => providers_section.into_any_element(),
     };
 
+    let _ = _tab_bar;
     v_flex()
         .flex_1()
         .overflow_y_scrollbar()
         .p_4()
         .gap_4()
-        .child(v_flex().items_center().child(tab_bar))
         .child(content)
         .into_any_element()
 }
@@ -2150,7 +2297,7 @@ fn render_provider_config(
                     .label("Retry")
                     .ghost()
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.refresh_providers(cx));
+                        view.update(cx, |this, cx| this.refresh_providers(cx));
                     }),
             )
             .into_any_element();
@@ -2160,17 +2307,21 @@ fn render_provider_config(
     let back_button = Button::new("back-to-settings")
         .label("Back to Settings")
         .ghost()
+        .flex_shrink_0()
         .on_click(move |_, _, cx| {
-            let _ = view.update(cx, |this, cx| this.show_settings(cx));
+            view.update(cx, |this, cx| this.show_settings(cx));
         });
 
     let provider_heading = h_flex()
         .items_center()
         .justify_between()
+        .gap_2()
         .px_4()
         .pt_3()
         .child(
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_1()
                 .child(
                     div()
@@ -2230,8 +2381,6 @@ fn render_provider_config(
 
     let scrollbar = Scrollbar::vertical(&this.settings_scroll).axis(ScrollbarAxis::Vertical);
 
-    let github = render_github_section(this, _window, cx);
-
     let mut root = v_flex()
         .flex_1()
         .min_h_0()
@@ -2245,15 +2394,6 @@ fn render_provider_config(
                 .relative()
                 .child(list)
                 .child(scrollbar),
-        )
-        .child(
-            div()
-                .px_4()
-                .pt_3()
-                .pb_3()
-                .border_t_1()
-                .border_color(theme.border.opacity(0.5))
-                .child(github),
         );
     if let Some(panel) = login_panel {
         root = root.child(div().px_4().pt_3().child(panel));
@@ -2299,9 +2439,10 @@ fn render_provider_row(
     }
     let badge_text = badges.join(" · ");
 
-    let mut left = h_flex().gap_2().items_center();
+    let mut left = h_flex().gap_2().items_center().flex_1().min_w_0();
     left = left.child(
         div()
+            .flex_shrink_0()
             .text_sm()
             .font_weight(gpui::FontWeight::BOLD)
             .child(name),
@@ -2309,8 +2450,11 @@ fn render_provider_row(
     if !badge_text.is_empty() {
         left = left.child(
             div()
+                .flex_1()
+                .min_w_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .line_clamp(1)
                 .child(badge_text),
         );
     }
@@ -2370,7 +2514,7 @@ fn render_provider_field(
             .ghost()
             .h(px(28.))
             .on_click(move |_, _, cx| {
-                let _ = configure_view.update(cx, |this, cx| {
+                configure_view.update(cx, |this, cx| {
                     this.configure_provider(&configure_provider_id, cx)
                 });
             }),
@@ -2399,7 +2543,7 @@ fn render_provider_field(
                         .on_click({
                             let view = view.clone();
                             move |_, _, cx| {
-                                let _ = view.update(cx, |this, cx| this.save_api_key(cx));
+                                view.update(cx, |this, cx| this.save_api_key(cx));
                             }
                         }),
                 );
@@ -2417,7 +2561,7 @@ fn render_provider_field(
                     .ghost()
                     .h(px(28.))
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
+                        view.update(cx, |this, cx| {
                             this.api_key_provider = Some(provider_id.clone());
                             let input = this.api_key_input.clone();
                             this.set_input(&input, "", cx);
@@ -2438,7 +2582,7 @@ fn render_provider_field(
                     .ghost()
                     .h(px(28.))
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.logout_provider(&provider_id, cx));
+                        view.update(cx, |this, cx| this.logout_provider(&provider_id, cx));
                     }),
             );
         } else if logging_in {
@@ -2450,7 +2594,7 @@ fn render_provider_field(
                     .ghost()
                     .h(px(28.))
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.cancel_login(&provider_id, cx));
+                        view.update(cx, |this, cx| this.cancel_login(&provider_id, cx));
                     }),
             );
         } else {
@@ -2462,7 +2606,7 @@ fn render_provider_field(
                     .icon(app_icon(IconName::ExternalLink))
                     .h(px(28.))
                     .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.login_oauth(&provider_id, cx));
+                        view.update(cx, |this, cx| this.login_oauth(&provider_id, cx));
                     }),
             );
         }
@@ -2502,7 +2646,7 @@ fn model_picker_button(
                 let provider_id = provider_id.clone();
                 menu = menu.item(PopupMenuItem::new(model_name).checked(is_active).on_click(
                     move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
+                        view.update(cx, |this, cx| {
                             this.select_model(&provider_id, &model_id, cx)
                         });
                     },
@@ -2525,8 +2669,8 @@ fn render_active_login(
     let mut column = v_flex().gap_2();
 
     let mut has_content = false;
-    if let Some(notice) = &this.auth_notice {
-        if notice.provider_id == provider_id {
+    if let Some(notice) = &this.auth_notice
+        && notice.provider_id == provider_id {
             has_content = true;
             match &notice.notify {
                 AuthNotifyKind::AuthUrl { url, instructions } => {
@@ -2552,8 +2696,7 @@ fn render_active_login(
                                 .label("Open in browser")
                                 .icon(app_icon(IconName::ExternalLink))
                                 .on_click(move |_, _, cx| {
-                                    let _ =
-                                        view.update(cx, |this, cx| this.open_auth_url(&url, cx));
+                                    view.update(cx, |this, cx| this.open_auth_url(&url, cx));
                                 }),
                         );
                 }
@@ -2583,7 +2726,7 @@ fn render_active_login(
                                 .label("Open verification page")
                                 .icon(app_icon(IconName::ExternalLink))
                                 .on_click(move |_, _, cx| {
-                                    let _ = view.update(cx, |this, cx| {
+                                    view.update(cx, |this, cx| {
                                         this.open_auth_url(&verification_uri, cx)
                                     });
                                 }),
@@ -2592,10 +2735,9 @@ fn render_active_login(
                 _ => {}
             }
         }
-    }
 
-    if let Some(pending) = &this.pending_prompt {
-        if pending.provider_id == provider_id {
+    if let Some(pending) = &this.pending_prompt
+        && pending.provider_id == provider_id {
             has_content = true;
             match &pending.prompt {
                 AuthPromptKind::Text { message, .. }
@@ -2612,7 +2754,7 @@ fn render_active_login(
                                     .label("Submit")
                                     .primary()
                                     .on_click(move |_, _, cx| {
-                                        let _ = view.update(cx, |this, cx| this.answer_prompt(cx));
+                                        view.update(cx, |this, cx| this.answer_prompt(cx));
                                     }),
                             ),
                     );
@@ -2631,7 +2773,7 @@ fn render_active_login(
                                 .on_click({
                                     let view = view.clone();
                                     move |_, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
+                                        view.update(cx, |this, cx| {
                                             this.answer_prompt_option(&option_id, cx)
                                         });
                                     }
@@ -2644,7 +2786,6 @@ fn render_active_login(
                 }
             }
         }
-    }
 
     if !has_content {
         return None;
@@ -2663,8 +2804,8 @@ fn render_active_login(
     )
 }
 
-fn render_github_section(
-    this: &WorktableView,
+fn render_github_stars_page(
+    this: &mut WorktableView,
     _window: &mut Window,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
@@ -2699,11 +2840,14 @@ fn render_github_section(
                 .gap_2()
                 .child(
                     div()
+                        .flex_shrink_0()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .child("GitHub Stars"),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child("Total stars + per-repo breakdown"),
@@ -2713,44 +2857,92 @@ fn render_github_section(
             "Stored in wt_ai_config (github_username). Uses GITHUB_TOKEN if set for 5000 req/h.",
         ));
 
-    // Input + Save + Fetch row
+    // Input + Save + Fetch: input on its own row so the buttons never
+    // overflow the 390pt column; Save + Fetch share a second row.
     let save_view = view.clone();
     let fetch_view = view.clone();
-    let input_row = h_flex()
+    let input_row = v_flex()
         .gap_2()
-        .items_center()
+        .w_full()
         .child(
             div()
-                .flex_1()
-                .max_w(px(220.))
-                .child(Input::new(&this.github_input).h(px(32.))),
+                .w_full()
+                .child(Input::new(&this.github_input).h(px(32.)).w_full()),
         )
         .child(
-            Button::new("github-save")
-                .label("Save")
-                .icon(app_icon(IconName::Check))
-                .h(px(28.))
-                .on_click(move |_, _, cx| {
-                    let _ = save_view.update(cx, |this, cx| this.save_github_username(cx));
-                }),
-        )
-        .child(
-            Button::new("github-fetch")
-                .label(if this.github_loading {
-                    "Fetching…"
-                } else {
-                    "Fetch Stars"
-                })
-                .icon(app_icon(IconName::ExternalLink))
-                .primary()
-                .h(px(28.))
-                .disabled(this.github_loading)
-                .on_click(move |_, _, cx| {
-                    let _ = fetch_view.update(cx, |this, cx| this.fetch_github_stars(cx));
-                }),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("github-save")
+                        .label("Save")
+                        .icon(app_icon(IconName::Check))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .on_click(move |_, _, cx| {
+                            save_view.update(cx, |this, cx| this.save_github_username(cx));
+                        }),
+                )
+                .child(
+                    Button::new("github-fetch")
+                        .label(if this.github_loading {
+                            "Fetching…"
+                        } else {
+                            "Fetch Stars"
+                        })
+                        .icon(app_icon(IconName::ExternalLink))
+                        .primary()
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .disabled(this.github_loading)
+                        .on_click(move |_, _, cx| {
+                            fetch_view.update(cx, |this, cx| this.fetch_github_stars(cx));
+                        }),
+                ),
         );
 
     column = column.child(input_row);
+
+    // Import starred repositories (with starred-at timestamps and
+    // descriptions) as entries.
+    let import_view = view.clone();
+    column = column.child(
+        v_flex()
+            .gap_1()
+            .w_full()
+            .items_start()
+            .child(
+                Button::new("github-import-stars")
+                    .label(if this.github_importing {
+                        "Importing…"
+                    } else {
+                        "Import stars to entries"
+                    })
+                    .icon(app_icon(IconName::ArrowDown))
+                    .primary()
+                    .shadow_sm()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .disabled(this.github_importing || this.github_loading)
+                    .on_click(move |_, _, cx| {
+                        import_view.update(cx, |this, cx| this.import_github_stars(cx));
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Each star becomes a link entry with its date and description"),
+            ),
+    );
+    if let Some(status) = &this.github_import_status {
+        column = column.child(
+            div()
+                .text_sm()
+                .text_color(theme.primary)
+                .child(status.clone()),
+        );
+    }
 
     if !total_text.is_empty() {
         let color = if this.github_loading {
@@ -2822,7 +3014,7 @@ fn render_github_section(
                     .cursor_pointer()
                     .on_click(move |_, _, cx| {
                         if !url_for_click.is_empty() {
-                            let _ = view_for_click.update(cx, |this, cx| {
+                            view_for_click.update(cx, |this, cx| {
                                 cx.open_url(&url_for_click);
                                 let _ = this;
                             });
@@ -2859,47 +3051,91 @@ fn render_github_section(
         );
     }
 
-    // Outer wrapper ensures a sensible max width in Settings (centered).
+    // Outer wrapper ensures a sensible max width in Settings (centered),
+    // with page padding so the card never touches the window edges.
     div()
         .w_full()
         .max_w(px(520.))
+        .mx_auto()
+        .p_4()
         .child(column)
         .into_any_element()
 }
 
 fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let Some(kind) = this.composer else {
-        return div().into_any_element();
-    };
-
-    let fields = v_flex()
-        .flex_1()
-        .gap_2()
-        .child(Input::new(&this.composer_body).h(px(34.)));
-
-    let composer_id = match kind {
-        ComposerKind::Note => "composer-note",
-        ComposerKind::Link => "composer-link",
-    };
-    dialog_in(
-        composer_id,
-        h_flex()
-            .items_end()
+    let bar = if this.composer.is_some() {
+        let is_note = this.composer == Some(ComposerKind::Note);
+        let is_link = this.composer == Some(ComposerKind::Link);
+        let is_image = this.composer == Some(ComposerKind::Image);
+        v_flex()
+            .id("composer-active")
+            .w_full()
             .gap_2()
-            .px_4()
-            .py_3()
-            .border_t_1()
+            .px_3()
+            .py_2()
+            .rounded(px(16.))
+            .border_1()
             .border_color(theme.border)
             .bg(theme.popover)
-            .child(fields)
+            .shadow_lg()
             .child(
                 h_flex()
-                    .gap_1()
+                    .w_full()
+                    .justify_center()
+                    .child(
+                        ButtonGroup::new("composer-kind")
+                            .compact()
+                            .outline()
+                            .child(
+                                Button::new("composer-note")
+                                    .label("Note")
+                                    .icon(Icon::new(IconName::File))
+                                    .selected(is_note),
+                            )
+                            .child(
+                                Button::new("composer-link")
+                                    .label("Link")
+                                    .icon(Icon::new(IconName::ExternalLink))
+                                    .selected(is_link),
+                            )
+                            .child(
+                                Button::new("composer-image")
+                                    .label("Image")
+                                    .icon(Icon::new(IconName::GalleryVerticalEnd))
+                                    .selected(is_image),
+                            )
+                            .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
+                                if selected.contains(&0) {
+                                    this.open_composer_note(window, cx);
+                                } else if selected.contains(&1) {
+                                    this.open_composer_link(window, cx);
+                                } else if selected.contains(&2) {
+                                    this.open_composer_image(window, cx);
+                                }
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Input::new(&this.composer_body)
+                            .h(px(36.))
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         Button::new("cancel-composer")
                             .label("Cancel")
                             .ghost()
+                            .text_xs()
+                            .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_composer(cx))),
                     )
                     .child(
@@ -2907,35 +3143,80 @@ fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> im
                             .label("Save")
                             .primary()
                             .icon(app_icon(IconName::Check))
+                            .text_xs()
+                            .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| this.submit_composer(cx))),
                     ),
-            ),
-    )
-    .into_any_element()
+            )
+            .into_any_element()
+    } else {
+        h_flex()
+            .id("composer-prompt")
+            .w_full()
+            .h(px(52.))
+            .items_center()
+            .gap_3()
+            .px_4()
+            .rounded(px(16.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .shadow_lg()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.tokens.list_hover))
+            .on_click(cx.listener(|this, _, window, cx| this.open_composer_note(window, cx)))
+            .child(
+                div()
+                    .size_6()
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(theme.primary.opacity(0.12))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Plus).size(px(16.)).text_color(theme.primary)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("Add a note"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("⌘N note  •  ⌘L link  •  drag image"),
+                    ),
+            )
+            .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(theme.muted_foreground))
+            .into_any_element()
+    };
+
+    div()
+        .absolute()
+        .left(px(16.))
+        .right(px(16.))
+        .bottom(px(16.))
+        .child(bar)
+        .into_any_element()
 }
 
-fn render_entries(
+/// The Entries pane: sort bar + virtualized card list + composer. Slides as
+/// a unit under the fixed Entries|Agent button group.
+fn render_entries_pane(
     this: &mut WorktableView,
     _window: &mut Window,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
     let theme = cx.theme().clone();
+    let view = cx.entity();
     let visible = this.visible_entries();
-
-    if visible.is_empty() {
-        let empty = if this.query.is_empty() {
-            "No entries yet — press ⌘N to create one."
-        } else {
-            "No entries match your search."
-        };
-        return v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .text_color(theme.muted_foreground)
-            .child(div().text_sm().child(empty))
-            .into_any_element();
-    }
 
     // Text for "Copy as list" — when multiple are selected, copy those; otherwise copy all visible.
     let selected_for_clipboard = this.selected.clone();
@@ -2947,7 +3228,7 @@ fn render_entries(
                 .copied()
                 .collect()
         } else {
-            visible.iter().copied().collect()
+            visible.to_vec()
         };
         entries_to_copy
             .iter()
@@ -2962,172 +3243,546 @@ fn render_entries(
             .join("\n\n---\n\n")
     };
 
-    let items = visible
-        .into_iter()
-        .map(|entry| {
-            let entry_id = entry.id.clone();
-            let entry_card = render_entry_card(
-                entry,
-                &this.selected,
-                &theme,
-                cx.listener({
-                    let entry_id = entry_id.clone();
-                    move |this, event: &ClickEvent, _window, cx| {
-                        let extend = event.modifiers().shift || is_shift_held();
-                        this.select_at(entry_id.clone(), extend);
-                        cx.notify();
-                    }
-                }),
-            );
-            // Shift+right-click context menu: copy visible entries as list.
-            // We wrap the card with a context menu that only materializes when Shift is held.
-            let text_for_menu = clipboard_text.clone();
-            // Also support direct Shift+right-click via mouse_down that copies without opening menu.
-            let text_for_direct = clipboard_text.clone();
-            let card_with_menu = div()
-                .child(entry_card)
-                .on_mouse_down(MouseButton::Right, move |_event, window, cx| {
-                    if is_shift_held() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text_for_direct.clone()));
-                        // Prevent propagation so the plain right-click doesn't also trigger other handlers.
-                        window.refresh();
+    // Flatten sections into virtual-list items with fixed row sizes.
+    let mut sections: Vec<(String, Vec<&WorktableEntry>)> = Vec::new();
+    for entry in visible.clone() {
+        let label = if this.sort_mode == SortMode::Topic {
+            helix_primary_topic(entry)
+        } else if this.sort_mode == SortMode::Time {
+            // Time sort groups by creation day: Today / Yesterday / weekday / date.
+            crate::format::day_bucket(entry.created_at)
+        } else {
+            library_section_name(entry)
+        };
+        if let Some((_, entries)) = sections.iter_mut().find(|(name, _)| *name == label) {
+            entries.push(entry);
+        } else {
+            sections.push((label, vec![entry]));
+        }
+    }
+    if this.sort_mode == SortMode::Topic {
+        sections.sort_by(|a, b| {
+            if a.0 == "OTHER" {
+                std::cmp::Ordering::Greater
+            } else if b.0 == "OTHER" {
+                std::cmp::Ordering::Less
+            } else {
+                a.0.cmp(&b.0)
+            }
+        });
+    }
+
+    enum Row {
+        Header(String),
+        Card(std::sync::Arc<WorktableEntry>),
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut sizes: Vec<Size<Pixels>> = Vec::new();
+    for (label, entries) in &sections {
+        rows.push(Row::Header(label.clone()));
+        sizes.push(size(px(0.), px(SECTION_HEADER_HEIGHT)));
+        for entry in entries {
+            rows.push(Row::Card(std::sync::Arc::new((*entry).clone())));
+            sizes.push(size(px(0.), px(ENTRY_CARD_HEIGHT)));
+        }
+    }
+    let rows = std::rc::Rc::new(rows);
+    let item_sizes = std::rc::Rc::new(sizes);
+
+    let list = v_virtual_list(
+        view.clone(),
+        "entries-virtual-list",
+        item_sizes.clone(),
+        move |this, range, window, cx| {
+            let clipboard_text = clipboard_text.clone();
+            let rows = rows.clone();
+            range
+                .into_iter()
+                .map(|index| {
+                    let row = &rows[index];
+                    match row {
+                        Row::Header(label) => {
+                            let theme = cx.theme().clone();
+                            library_section_heading(label, &theme).into_any_element()
+                        }
+                        Row::Card(entry) => render_entry_card(
+                            entry,
+                            &this.selected,
+                            &clipboard_text,
+                            cx,
+                        ),
                     }
                 })
-                .context_menu(move |menu, _window, _cx| {
-                    if !is_shift_held() {
-                        return menu;
-                    }
-                    let text = text_for_menu.clone();
-                    menu.item(PopupMenuItem::new("Copy as list").on_click(
-                        move |_event, _window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                        },
-                    ))
-                });
-            card_with_menu.into_any_element()
-        })
-        .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        },
+    )
+    .track_scroll(&this.entries_scroll)
+    .flex_1();
+
+    let scrollbar = Scrollbar::vertical(&this.entries_scroll).axis(ScrollbarAxis::Vertical);
+
+    // Empty state.
+    let empty = visible.is_empty();
+    let empty_el = {
+        let message = if this.query.is_empty() {
+            "No entries yet — press ⌘N to create one."
+        } else {
+            "No entries match your search."
+        };
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .text_color(theme.muted_foreground)
+            .child(div().text_sm().child(message))
+            .into_any_element()
+    };
+
+    // Entrance: when the list last gained a new entry, the whole list starts
+    // one card lower and glides up while the new card fades in — the existing
+    // items appear to be pushed smoothly down by the newcomer.
+    let inserting = this
+        .list_insert_at
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(350));
+    if !inserting && this.list_insert_at.is_some() {
+        this.list_insert_at = None;
+    }
+
+    let sort = sort_bar(this, cx);
+
+    let body = if empty {
+        empty_el
+    } else {
+        let list_container = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .px_4()
+            .pb(px(84.))
+            .child(list)
+            .child(scrollbar);
+        let container = if inserting {
+            let recent = this.recent_entry_id.clone();
+            list_container
+                .with_animation(
+                    "entries-insert",
+                    worktable_ui::RESIZE.animation(),
+                    move |el, t| el.relative().top(px(ENTRY_CARD_HEIGHT * (1.0 - t))),
+                )
+                .into_any_element()
+        } else {
+            list_container.into_any_element()
+        };
+        v_flex().flex_1().min_h_0().size_full().child(container).into_any_element()
+    };
 
     v_flex()
-        .id("entries-scroll")
-        .p_4()
-        .gap_2()
-        .overflow_y_scroll()
-        .children(items)
+        .id("entries-pane")
+        .flex_1()
+        .min_h_0()
+        .size_full()
+        .child(
+            v_flex()
+                .pt_2()
+                .pb_1()
+                .px_4()
+                .gap_2()
+                .child(sort)
+                .when(inserting, |el| {
+                    // The new card fades in at the top while the list glides.
+                    let _ = &el;
+                    el
+                }),
+        )
+        .child(body)
+        .child(composer_bar(this, cx).into_any_element())
         .into_any_element()
 }
 
+
+fn library_tabs(this: &WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
+    let is_entries = this.mode == AppMode::Entries;
+    h_flex()
+        .id("library-tabs")
+        .w_full()
+        .justify_center()
+        .py_2()
+        .child(
+            ButtonGroup::new("library-tabs-group")
+                .child(
+                    Button::new("entries-tab")
+                        .label("Entries")
+                        .selected(is_entries),
+                )
+                .child(
+                    Button::new("agent-tab")
+                        .label("Agent")
+                        .selected(!is_entries && this.mode == AppMode::Assistant),
+                )
+                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                    if selected.contains(&0) {
+                        this.show_entries(cx);
+                    } else if selected.contains(&1) {
+                        this.show_assistant(cx);
+                    }
+                })),
+        )
+        .into_any_element()
+}
+
+fn sort_bar(this: &WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
+    let is_time = this.sort_mode == SortMode::Time;
+    let is_alpha = this.sort_mode == SortMode::Alpha;
+    let is_topic = this.sort_mode == SortMode::Topic;
+    h_flex()
+        .id("sort-bar")
+        .w_full()
+        .justify_center()
+        .pb_2()
+        .child(
+            ButtonGroup::new("sort-mode-group")
+                .compact()
+                .outline()
+                .child(
+                    Button::new("sort-time")
+                        .label("Time")
+                        .icon(Icon::new(IconName::SortDescending))
+                        .selected(is_time),
+                )
+                .child(
+                    Button::new("sort-alpha")
+                        .label("A–Z")
+                        .icon(Icon::new(IconName::ALargeSmall))
+                        .selected(is_alpha),
+                )
+                .child(
+                    Button::new("sort-topic")
+                        .label("Topic")
+                        .icon(Icon::new(IconName::BookOpen))
+                        .selected(is_topic),
+                )
+                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                    if selected.contains(&0) {
+                        this.set_sort_mode(SortMode::Time, cx);
+                    } else if selected.contains(&1) {
+                        this.set_sort_mode(SortMode::Alpha, cx);
+                    } else if selected.contains(&2) {
+                        this.set_sort_mode(SortMode::Topic, cx);
+                    }
+                })),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn helix_primary_topic(entry: &WorktableEntry) -> String {
+    // HelixDB topic extraction — mirrors worktable_helix::topic_for_entry.
+    // We compute on the fly so the UI stays in sync even before the graph is built.
+    let db_entry = worktable_db::Entry {
+        id: entry.id.clone(),
+        kind: entry.kind.clone(),
+        content: entry.content.clone(),
+        title: entry.title.clone(),
+        source: entry.source.clone(),
+        created_at: entry.created_at,
+    };
+    worktable_helix::topic_for_entry(&db_entry)
+        .into_iter()
+        .next()
+        .map(|t| t.to_uppercase())
+        .unwrap_or_else(|| "OTHER".to_owned())
+}
+
+fn library_section_name(entry: &WorktableEntry) -> String {
+    let source = entry.source.trim();
+    if !source.is_empty()
+        && !source.eq_ignore_ascii_case("worktable")
+        && !source.eq_ignore_ascii_case("selection")
+    {
+        return source.to_uppercase();
+    }
+
+    match entry.kind.as_str() {
+        "link" => "CONFIGURATION FORMATS".to_owned(),
+        "image" => "REFERENCES".to_owned(),
+        _ => "RESEARCH".to_owned(),
+    }
+}
+
+fn library_section_heading(label: &str, theme: &gpui_component::Theme) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .h(px(16.))
+        .px_4()
+        .items_center()
+        .child(
+            div()
+                .flex_shrink_0()
+                .pr_3()
+                .bg(theme.tokens.background)
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(label.to_owned()),
+        )
+        .child(div().flex_1().h(px(1.)).bg(theme.border))
+}
+
+/// One entry card: fixed-height row for the virtual list. Selection circle's
+/// tick is centered; the whole card carries the click/context-menu wiring.
 fn render_entry_card(
     entry: &WorktableEntry,
     selected: &HashSet<String>,
-    theme: &gpui_component::Theme,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let kind = entry_kind(&entry.kind);
+    clipboard_text: &str,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let theme = cx.theme().clone();
+    let view = cx.entity();
     let is_selected = selected.contains(&entry.id);
+    let topic = helix_primary_topic(entry);
+    let is_image = entry.kind == "image";
 
-    let mut row = div()
-        .id(format!("entry:{}", entry.id))
+    let selection = div()
+        .size_5()
         .flex()
-        .flex_col()
-        .gap_2()
-        .rounded(px(6.))
-        .px_3()
-        .py_3()
-        .on_click(listener)
-        .cursor_pointer()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.primary.opacity(0.55))
+        .when(is_selected, |this| {
+            this.bg(theme.primary).child(
+                Icon::new(IconName::Check)
+                    .size(px(12.))
+                    .text_color(theme.primary_foreground),
+            )
+        });
+
+    let mut content = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .text_sm()
+        .text_color(theme.foreground)
         .child(
-            div()
-                .flex()
+            h_flex()
+                .gap_2()
                 .items_center()
-                .justify_between()
                 .child(
                     div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(RADIUS_CHIP))
+                        .bg(theme.muted)
                         .text_xs()
-                        .text_color(entry_kind_color(kind, theme))
-                        .child(kind),
+                        .text_color(theme.muted_foreground)
+                        .child(topic),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(if is_selected {
-                            theme.primary
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(relative_time(entry.created_at)),
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(entry_kind(&entry.kind).to_owned()),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(crate::format::relative_time(entry.created_at)),
                 ),
         );
-
-    // Markdown rendering: `text` entries are stored as raw markdown in the DB
-    // (the composer Input accepts markdown). `link`/`image` entries keep their
-    // previous plain rendering so URLs and file paths are not mis-parsed.
-    if entry.kind == "text" {
-        if let Some(title) = &entry.title {
-            // Title is a single-line heading — render inline markdown (bold,
-            // italic, inline code, emojis) at `text_lg`. Body is full markdown.
-            row = row
+    if let Some(title) = &entry.title {
+        content = content.child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .line_clamp(1)
+                .child(title.clone()),
+        );
+    }
+    if is_image {
+        // Compact photo row: icon + filename (kept whole) + path (truncates).
+        let filename = entry
+            .content
+            .split('/')
+            .next_back()
+            .unwrap_or(&entry.content)
+            .to_owned();
+        content = content.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .p_1()
+                .rounded(px(RADIUS_CHIP))
+                .bg(theme.muted.opacity(0.5))
+                .border_1()
+                .border_color(theme.border.opacity(0.6))
                 .child(
-                    div()
-                        .text_lg()
-                        .text_color(theme.foreground)
-                        .child(crate::markdown::render_markdown_inline(title, theme)),
+                    Icon::new(IconName::GalleryVerticalEnd)
+                        .size(px(14.))
+                        .text_color(theme.muted_foreground),
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(filename),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(crate::markdown::render_markdown(&entry.content, theme)),
-                );
-        } else {
-            // No separate title — the content itself is the heading/body.
-            // Render the whole markdown block so headings, lists, code fences
-            // and emojis appear correctly.
-            row = row.child(
-                div()
-                    .text_color(theme.foreground)
-                    .child(crate::markdown::render_markdown(&entry.content, theme)),
-            );
-        }
-    } else {
-        // Non-text entries (link / image) — preserve the previous plain layout
-        // but still support markdown for titles if present.
-        let heading = entry.title.as_deref().unwrap_or(&entry.content);
-        row = row.child(
-            div()
-                .text_lg()
-                .text_color(theme.foreground)
-                .child(heading.to_owned()),
+                        .line_clamp(1)
+                        .child(entry.content.clone()),
+                ),
         );
-        if entry.title.is_some() {
-            row = row.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(entry.content.clone()),
-            );
-        }
+    } else {
+        // Card preview: collapse hard line breaks so the body is one flowing
+        // paragraph. `line_clamp` only clamps wrapped lines — raw `\n`s render
+        // full-height, overflow the fixed 108px row, and paint over the
+        // neighboring cards. Full content is still used for copy/open.
+        let preview = entry.content.split_whitespace().collect::<Vec<_>>().join(" ");
+        content = content.child(
+            div()
+                .line_clamp(if entry.title.is_some() { 2 } else { 3 })
+                .text_color(if entry.title.is_some() {
+                    theme.muted_foreground
+                } else {
+                    theme.foreground
+                })
+                .child(preview),
+        );
     }
 
-    if is_selected {
-        row = row.bg(theme.tokens.list_active);
-    }
+    let entry_id = entry.id.clone();
+    let card = h_flex()
+        .id(format!("entry:{}", entry.id))
+        .w_full()
+        .h(px(ENTRY_CARD_HEIGHT))
+        .overflow_hidden()
+        .items_center()
+        .gap_4()
+        .px(px(16.))
+        .rounded(px(RADIUS_CARD))
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_2xs()
+        .on_click(cx.listener({
+            let entry_id = entry_id.clone();
+            move |this, event: &ClickEvent, _window, cx| {
+                let mods = event.modifiers();
+                let shift = mods.shift;
+                let cmd = mods.platform || mods.control;
+                if shift {
+                    this.select_range(entry_id.clone(), cx);
+                } else if cmd {
+                    this.select_at(entry_id.clone(), true);
+                } else {
+                    this.select_at(entry_id.clone(), false);
+                }
+                cx.notify();
+            }
+        }))
+        .cursor_pointer()
+        .child(selection)
+        .child(content);
 
-    // Hover wash + entrance
+    let card = if is_selected {
+        card.bg(theme.tokens.list_active)
+    } else {
+        card
+    };
+
     let hover_key = format!("entry-hover:{}", entry.id);
-    row = row
+    let card = card
         .on_hover(hover_listener(hover_key.clone()))
         .bg(hover_blend(
             &hover_key,
             if is_selected {
                 *theme.tokens.list_active
             } else {
-                gpui::transparent_black()
+                theme.popover
             },
             *theme.tokens.list_hover,
         ));
 
-    fade_in(entry.id.clone(), row)
+    // Right-click selects the row (if not already selected); the menu offers
+    // copy / open-link / delete like before.
+    let id_for_right = entry.id.clone();
+    let card = card.on_mouse_down(MouseButton::Right, {
+        let view = view.clone();
+        move |_event, _window, cx| {
+            view.update(cx, |this, cx| {
+                if !this.selected.contains(&id_for_right) {
+                    this.select_at(id_for_right.clone(), false);
+                    cx.notify();
+                }
+            });
+        }
+    });
+
+    let entry_kind_menu = entry.kind.clone();
+    let content_for_menu = entry.content.clone();
+    let text_for_menu = clipboard_text.to_owned();
+    let id_for_copy = entry.id.clone();
+    let id_del = entry.id.clone();
+    let card = card.context_menu(move |menu, _window, _cx| {
+        let content_copy = content_for_menu.clone();
+        let url_open = content_for_menu.clone();
+        let is_link_menu = entry_kind_menu == "link";
+        let text = text_for_menu.clone();
+        let id_copy2 = id_for_copy.clone();
+        let id_del2 = id_del.clone();
+        let view_del = view.clone();
+        menu.item(
+            PopupMenuItem::new("Copy")
+                .icon(Icon::new(IconName::Copy))
+                .on_click(move |_event, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(content_copy.clone()));
+                    let _ = id_copy2;
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Copy as list")
+                .icon(Icon::new(IconName::Copy))
+                .on_click(move |_event, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }),
+        )
+        .when(is_link_menu, |m| {
+            m.item(
+                PopupMenuItem::new("Open link")
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .on_click(move |_event, _window, cx| {
+                        cx.open_url(&url_open);
+                    }),
+            )
+        })
+        .separator()
+        .item(
+            PopupMenuItem::new("Delete")
+                .icon(Icon::new(IconName::Delete))
+                .on_click(move |_event, _window, cx| {
+                    view_del.update(cx, |this, cx| {
+                        this.selected.clear();
+                        this.selected.insert(id_del2.clone());
+                        this.selected_anchor = Some(id_del2.clone());
+                        this.delete_selected(cx);
+                    });
+                }),
+        )
+    });
+
+    card.into_any_element()
 }
+
 
 fn entry_kind(kind: &str) -> &'static str {
     match kind {
@@ -3135,15 +3790,6 @@ fn entry_kind(kind: &str) -> &'static str {
         "link" => "LINK",
         "image" => "IMAGE",
         _ => "ENTRY",
-    }
-}
-
-fn entry_kind_color(kind: &str, theme: &gpui_component::Theme) -> gpui::Hsla {
-    match kind {
-        "text" => theme.success,
-        "link" => theme.link,
-        "image" => theme.warning,
-        _ => theme.muted_foreground,
     }
 }
 
@@ -3157,23 +3803,13 @@ fn trim_opt(value: &str) -> Option<String> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn is_shift_held() -> bool {
-    crate::status_item::is_shift_held()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_shift_held() -> bool {
-    false
-}
-
 // ---------------------------------------------------------------------------
 // AI Assistant pane
 // ---------------------------------------------------------------------------
 
 fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let configured = this.service.has_ai_worker();
+    let configured = this.agent_ready();
 
     let mut messages = v_flex()
         .id("assistant-messages")
@@ -3182,15 +3818,32 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
         .overflow_y_scroll()
         .p_4();
 
+    // One shared pulse-clock phase for every animated loader in this render.
+    let dots_delta = if this.assistant_busy || this.messages.iter().any(|m| m.is_thinking_only())
+    {
+        pulse_delta(&TEXT_DOTS, cx.entity_id(), cx)
+    } else {
+        0.0
+    };
+
     if this.messages.is_empty() {
         messages = messages.child(fade_in(
             "assistant-welcome",
-            div().child(welcome_panel(&theme, configured)),
+            div().child(welcome_panel(&theme, configured)).when(!configured, |el| {
+                el.mt_2().child(
+                    Button::new("assistant-setup-cta")
+                        .label("Configure provider")
+                        .icon(app_icon(IconName::Settings))
+                        .primary()
+                        .shadow_sm()
+                        .on_click(cx.listener(|this, _, _, cx| this.show_provider_config(cx))),
+                )
+            }),
         ));
     } else {
         for (idx, message) in this.messages.iter().enumerate() {
             let id = SharedString::from(format!("msg-{}-{}", idx, message.text.len()));
-            let bubble = render_message(&theme, message);
+            let bubble = render_message(&theme, message, dots_delta);
             let animated = if message.streaming {
                 fade_quick(id, div().child(bubble))
             } else {
@@ -3199,23 +3852,26 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
             messages = messages.child(animated);
         }
         if this.assistant_busy {
-            // WebGPU-style gradient spin loader driven by the shared pulse clock
-            let phase = pulse_delta(&GRADIENT_SPIN, cx.entity_id(), cx);
-            let opacity = worktable_ui::gspin_opacity(phase, 0.08);
-            messages = messages.child(
-                div()
-                    .h(px(3.))
-                    .w_full()
-                    .rounded(px(2.))
-                    .bg(theme.tokens.background)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(opacity.clamp(0.12, 1.0)))
-                            .bg(theme.primary)
-                            .rounded(px(2.)),
-                    ),
-            );
+            // Waiting for the LLM: bobbing dots while no answer bubble is
+            // streaming yet (the thinking block carries its own "Thinking" dots).
+            let waiting = this
+                .messages
+                .last()
+                .map(|m| m.is_thinking_only() || !m.streaming)
+                .unwrap_or(true);
+            if waiting {
+                let bob_delta = pulse_delta(&BOBBING_DOTS, cx.entity_id(), cx);
+                messages = messages.child(
+                    h_flex()
+                        .id("assistant-waiting")
+                        .px_3()
+                        .child(worktable_ui::bobbing_dots(
+                            bob_delta,
+                            theme.muted_foreground,
+                            px(7.),
+                        )),
+                );
+            }
         }
     }
 
@@ -3252,10 +3908,18 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 .child(
                     h_flex()
                         .gap_2()
+                        .w_full()
+                        .items_center()
                         .child(
-                            Input::new(&this.assistant_input)
-                                .disabled(!configured)
-                                .h(px(36.)),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    Input::new(&this.assistant_input)
+                                        .disabled(!configured)
+                                        .h(px(36.))
+                                        .w_full(),
+                                ),
                         )
                         .child(helix_button)
                         .child(
@@ -3263,6 +3927,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                                 .label(if this.assistant_busy { "…" } else { "Send" })
                                 .primary()
                                 .icon(app_icon(IconName::ArrowRight))
+                                .flex_shrink_0()
                                 .disabled(!configured || this.assistant_busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.send_assistant(cx))),
                         ),

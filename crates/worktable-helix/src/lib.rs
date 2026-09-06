@@ -47,27 +47,71 @@ pub fn default_helix_path() -> PathBuf {
     Path::new(&home).join(".worktable").join("helix.json")
 }
 
+/// Common English + markdown/URL stopwords that make useless topics.
+const TOPIC_STOPWORDS: &[&str] = &[
+    // Worktable domain
+    "this", "that", "with", "from", "have", "will", "your", "about", "hello", "world",
+    "item", "link", "text", "worktable", "entry", "note", "image", "photo", "file",
+    // Common English
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
+    "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "its",
+    "may", "new", "now", "old", "see", "two", "way", "who", "did", "let", "put",
+    "say", "she", "too", "use", "they", "them", "then", "than", "when", "what",
+    "where", "which", "while", "there", "their", "been", "being", "some", "such",
+    "only", "over", "also", "into", "just", "like", "make", "made", "more", "most",
+    "much", "many", "very", "each", "even", "here", "these", "those", "through",
+    "should", "would", "could", "shall", "must", "need", "needs", "someone",
+    "something", "anything", "everything", "because", "before", "after", "between",
+    "without", "within", "against", "under", "above", "below", "same", "other",
+    "another", "every", "both", "few", "own", "once", "using", "used", "uses",
+    // Markdown / URL / path noise
+    "http", "https", "www", "com", "org", "net", "html", "htm", "php", "aspx",
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "tmp", "var", "users", "home",
+    "desktop", "documents", "downloads", "untitled", "screenshot", "screen", "shot",
+];
+
 pub fn topic_for_entry(entry: &Entry) -> Vec<String> {
-    // Very small keyword extractor: split markdown into words, filter stopwords, take top 5
-    let text = format!("{} {}", entry.title.clone().unwrap_or_default(), entry.content);
-    let lower = text.to_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 3)
-        .collect();
-    let stop: std::collections::HashSet<&str> = [
-        "this", "that", "with", "from", "have", "will", "your", "about", "hello", "world",
-        "item", "link", "text", "worktable", "entry", "note",
-    ]
-    .into_iter()
-    .collect();
+    // Small keyword extractor: split into words, drop stopwords, rank by
+    // frequency (title words count triple — the title is the summary), and
+    // break ties by first occurrence so the *leading* subject of the note
+    // wins over an arbitrary alphabetical word.
+    let title = entry.title.clone().unwrap_or_default();
+    let lower_title = title.to_lowercase();
+    let lower_content = entry.content.to_lowercase();
+
+    let stop: std::collections::HashSet<&str> = TOPIC_STOPWORDS.iter().copied().collect();
+    let tokenize = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 3)
+            // Pure numbers and version-ish tokens ("2024", "3d1f") are noise.
+            .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+            .filter(|w| !stop.contains(w))
+            .map(|w| w.to_string())
+            .collect()
+    };
+
+    let title_words = tokenize(&lower_title);
+    let content_words = tokenize(&lower_content);
+
+    // freq + first-occurrence index across title-then-content order.
     let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for w in words {
-        if stop.contains(w) { continue; }
-        *freq.entry(w.to_string()).or_insert(0) += 1;
+    let mut first_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut position = 0usize;
+    for word in title_words.iter().chain(content_words.iter()) {
+        let weight = if position < title_words.len() { 3 } else { 1 };
+        *freq.entry(word.clone()).or_insert(0) += weight;
+        first_seen.entry(word.clone()).or_insert(position);
+        position += 1;
     }
+
     let mut sorted: Vec<(String, usize)> = freq.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            let ia = first_seen.get(&a.0).copied().unwrap_or(usize::MAX);
+            let ib = first_seen.get(&b.0).copied().unwrap_or(usize::MAX);
+            ia.cmp(&ib).then_with(|| a.0.cmp(&b.0))
+        })
+    });
     sorted.into_iter().take(5).map(|(k, _)| k).collect()
 }
 
@@ -77,7 +121,6 @@ pub fn topic_for_entry(entry: &Entry) -> Vec<String> {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::*;
-    use anyhow::Context;
     use helix_db::dsl::prelude::*;
     use serde_json::Value as JsonValue;
 
@@ -87,8 +130,8 @@ mod native {
     fn add_entry_query(id: String, kind: String, content: String, title: String, source: String, created_at: i64) -> WriteBatch {
         write_batch().var_as("entry", g().add_n("Entry", vec![("id", id), ("kind", kind), ("content", content), ("title", title), ("source", source), ("created_at", created_at)]).value_map(None::<Vec<String>>)).returning(["entry"])
     }
-    #[query] fn get_entry_query(id: String) -> ReadBatch { read_batch().var_as("entry", g().n_where(SourcePredicate::eq("id", id))).returning(["entry"]) }
-    #[query] fn list_entries_query(limit: i64) -> ReadBatch { read_batch().var_as("entries", g().n_with_label("Entry").order_by("created_at", Order::Desc).limit(limit)).returning(["entries"]) }
+    #[query] #[allow(unused_braces)] fn get_entry_query(id: String) -> ReadBatch { read_batch().var_as("entry", g().n_where(SourcePredicate::eq("id", id))).returning(["entry"]) }
+    #[query] #[allow(unused_braces)] fn list_entries_query(limit: i64) -> ReadBatch { read_batch().var_as("entries", g().n_with_label("Entry").order_by("created_at", Order::Desc).limit(limit)).returning(["entries"]) }
     #[query] fn search_entries_query(query: String, limit: i64) -> ReadBatch {
         let _ = &query;
         read_batch().var_as("entries", g().n_with_label("Entry").where_(Predicate::or(vec![Predicate::contains_param("content", "query"), Predicate::contains_param("title", "query")])).limit(limit)).returning(["entries"])
@@ -140,7 +183,6 @@ mod native {
         path: PathBuf,
         graph: Arc<Mutex<Graph>>,
         http_url: String,
-        http_client: Option<helix_db::Client>,
     }
 
     impl HelixClient {
@@ -168,7 +210,6 @@ mod native {
                 path: path.clone(),
                 graph: graph.clone(),
                 http_url: HELIX_DEFAULT_URL.to_string(),
-                http_client: helix_db::Client::new(Some(HELIX_DEFAULT_URL)).ok(),
             };
             // Load existing file if present
             if path.exists() {
@@ -263,13 +304,15 @@ mod native {
             for entry in g.entries.values() {
                 let hay = format!("{} {} {}", entry.title.clone().unwrap_or_default(), entry.content, entry.source).to_lowercase();
                 let mut score = 0.0;
+                // Direct substring hit against title/content/source.
                 if hay.contains(&q) { score += 10.0; }
-                // topic boost
+                // Topic boost: only when the *query* relates to one of the
+                // entry's topics. (Boosting for `hay.contains(topic)` would
+                // score every entry on every query, since an entry's own
+                // topics always appear in its text.)
                 for t in g.topics_for(&entry.id) {
                     if q.contains(&t) || t.contains(&q) { score += 5.0; }
-                    if hay.contains(&t) { score += 1.0; }
                 }
-                // relation boost: if query matches a topic that this entry shares with others, boost
                 if score > 0.0 {
                     scored.push((score, entry));
                 }
@@ -358,5 +401,160 @@ mod wasm_stub {
         pub fn search_best_effort_blocking(&self, _q: &str, _l: usize) -> Vec<serde_json::Value> { vec![] }
         pub async fn build_from_sqlite(&self, _path: &str) -> anyhow::Result<usize> { Ok(0) }
         pub fn build_from_sqlite_blocking(&self, _path: &str) -> anyhow::Result<usize> { Ok(0) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(title: Option<&str>, content: &str) -> Entry {
+        Entry {
+            id: "t".to_owned(),
+            kind: "text".to_owned(),
+            content: content.to_owned(),
+            title: title.map(|t| t.to_owned()),
+            source: "Worktable".to_owned(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn topic_extractor_leading_subject_wins_on_ties() {
+        // All words appear once — the *first* meaningful word is the subject.
+        let topics = topic_for_entry(&entry(
+            None,
+            "Use TOML as the default declarative format, backed by a published schema",
+        ));
+        assert_eq!(topics.first().map(String::as_str), Some("toml"));
+
+        let topics = topic_for_entry(&entry(
+            None,
+            "gitignore — universal ignore rules for versioned files",
+        ));
+        assert_eq!(topics.first().map(String::as_str), Some("gitignore"));
+
+        let topics = topic_for_entry(&entry(
+            None,
+            "Negation in inherited configs. The moment a config can extend a base or preset, someone needs to remove an extension",
+        ));
+        assert_eq!(topics.first().map(String::as_str), Some("negation"));
+    }
+
+    #[test]
+    fn topic_extractor_prefers_frequent_words() {
+        let topics = topic_for_entry(&entry(None, "alpha alpha alpha beta beta gamma"));
+        assert_eq!(topics.first().map(String::as_str), Some("alpha"));
+        assert!(topics.contains(&"beta".to_owned()));
+    }
+
+    #[test]
+    fn topic_extractor_weights_title_over_content() {
+        // "schema" appears once in the title; "parser" twice in the body.
+        // Title weight (×3) should win.
+        let topics = topic_for_entry(&entry(
+            Some("Schema design"),
+            "parser internals and the parser pipeline",
+        ));
+        assert_eq!(topics.first().map(String::as_str), Some("schema"));
+    }
+
+    #[test]
+    fn topic_extractor_drops_stopwords_numbers_and_paths() {
+        let topics = topic_for_entry(&entry(
+            None,
+            "this that with from 2024 2025 /tmp/photo.png https://example.com/page.html",
+        ));
+        for junk in [
+            "this", "that", "with", "from", "2024", "2025", "tmp", "photo", "png", "https",
+            "com", "html",
+        ] {
+            assert!(
+                !topics.contains(&junk.to_owned()),
+                "{junk} should never be a topic"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_extractor_returns_empty_for_pure_stopword_text() {
+        let topics = topic_for_entry(&entry(None, "this that with from"));
+        assert!(topics.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn graph_sync_search_and_delete_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("helix-test-{}", uuid_v4()));
+        let path = dir.join("helix.json");
+        let client = HelixClient::open_embedded(path.clone());
+
+        let mut e1 = entry(None, "The sunset over the mountains was breathtaking");
+        e1.id = "e1".to_owned();
+        let mut e2 = entry(Some("Vision Transformer"), "/tmp/vision_transformer.png");
+        e2.id = "e2".to_owned();
+        e2.kind = "image".to_owned();
+
+        client.sync_entry_blocking(&e1).unwrap();
+        client.sync_entry_blocking(&e2).unwrap();
+        assert!(path.exists(), "graph should persist to disk");
+
+        let hits = client.search_blocking("sunset", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], "e1");
+
+        // Title is searchable too.
+        let hits = client.search_blocking("vision", 10).unwrap();
+        assert!(hits.iter().any(|h| h["id"] == "e2"));
+
+        // Reload from disk in a fresh client — persistence check.
+        let reloaded = HelixClient::open_embedded(path.clone());
+        let hits = reloaded.search_blocking("sunset", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        client.delete_entry_blocking("e1").unwrap();
+        let hits = client.search_blocking("sunset", 10).unwrap();
+        assert!(hits.is_empty(), "deleted entry must not be searchable");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn graph_search_ranks_substring_matches_first() {
+        let dir = std::env::temp_dir().join(format!("helix-test-{}", uuid_v4()));
+        let client = HelixClient::open_embedded(dir.join("helix.json"));
+
+        let mut e1 = entry(None, "alpha beta gamma");
+        e1.id = "direct".to_owned();
+        let mut e2 = entry(None, "completely unrelated words delta");
+        e2.id = "indirect".to_owned();
+        client.sync_entry_blocking(&e1).unwrap();
+        client.sync_entry_blocking(&e2).unwrap();
+
+        let hits = client.search_blocking("alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], "direct");
+
+        // Empty-ish query matches nothing (no substring hit, no topic hit).
+        let hits = client.search_blocking("zzz-not-present", 10).unwrap();
+        assert!(hits.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tiny UUID stand-in so the helix crate doesn't need the uuid dependency.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn uuid_v4() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{}", std::process::id(), nanos)
     }
 }

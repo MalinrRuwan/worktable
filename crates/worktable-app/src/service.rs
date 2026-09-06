@@ -6,19 +6,17 @@
 
 use std::{
     collections::HashMap,
-    future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::anyhow;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 use worktable_ai::{WorktableEntry, WorktableRuntime};
 use worktable_events::WorktableEvent;
 
-pub type EntryResult = Result<WorktableEntry, String>;
 pub type ListResult = Result<Vec<WorktableEntry>, String>;
 pub type EmptyResult = Result<(), String>;
 
@@ -55,13 +53,12 @@ pub struct WorktableService {
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
     /// In-memory config fallback when the database is unavailable.
     memory_config: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
-    persistent: bool,
     command_tx: mpsc::UnboundedSender<AppCommand>,
     command_rx: Option<std::sync::Mutex<Option<mpsc::UnboundedReceiver<AppCommand>>>>,
 }
 
 impl WorktableService {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "visual-tests"))]
     pub fn new_for_test(db_path: &str) -> anyhow::Result<Self> {
         let tokio = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -83,7 +80,6 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(entries)),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            persistent: true,
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -100,14 +96,13 @@ impl WorktableService {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        let (runtime, persistent, seed) = bootstrap_runtime(&tokio);
+        let (runtime, _persistent, seed) = bootstrap_runtime(&tokio);
 
         let service = Self {
             tokio,
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            persistent,
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -132,10 +127,6 @@ impl WorktableService {
 
     pub fn take_command_receiver(&self) -> Option<mpsc::UnboundedReceiver<AppCommand>> {
         self.command_rx.as_ref()?.lock().ok()?.take()
-    }
-
-    pub fn is_persistent(&self) -> bool {
-        self.persistent
     }
 
     pub fn database_path(&self) -> String {
@@ -288,6 +279,87 @@ impl WorktableService {
     }
 
     // ---- Generic wt_ai_config access (github_username, github_token, etc.) ----
+
+    /// Import `username`'s starred repositories as entries. One link entry
+    /// per star: title = `owner/repo`, content = the repo description (or its
+    /// URL when there is none), `created_at` = GitHub's `starred_at`
+    /// timestamp. Stars already imported (matched by title + source) are
+    /// skipped. Returns `(imported, skipped)`.
+    pub async fn import_starred_repos(
+        &self,
+        username: &str,
+        token: Option<String>,
+    ) -> Result<(usize, usize), String> {
+        self.import_starred_repos_with_base(username, token, "https://api.github.com")
+            .await
+    }
+
+    /// Test seam for [`import_starred_repos`]: the API root is injectable.
+    ///
+    /// The HTTP fetch runs on the service's dedicated Tokio runtime — reqwest
+    /// needs a Tokio reactor, and this future is polled on GPUI's executor
+    /// (which has none). Awaiting it inline crashed the app with "there is no
+    /// reactor running".
+    pub async fn import_starred_repos_with_base(
+        &self,
+        username: &str,
+        token: Option<String>,
+        api_base: &str,
+    ) -> Result<(usize, usize), String> {
+        let username = username.to_owned();
+        let api_base = api_base.to_owned();
+        let tokio = self.tokio.clone();
+        let starred = tokio
+            .spawn(async move {
+                crate::github::fetch_starred_repos_with_base(&username, token, &api_base).await
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+
+        let existing: std::collections::HashSet<String> = self
+            .list_entries()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.source == "github-star")
+            .filter_map(|entry| entry.title)
+            .collect();
+
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for repo in starred {
+            if existing.contains(&repo.full_name) {
+                skipped += 1;
+                continue;
+            }
+            let content = repo
+                .description
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| repo.html_url.clone());
+            let entry = WorktableEntry {
+                id: new_entry_id(),
+                kind: "link".to_owned(),
+                content,
+                title: Some(repo.full_name),
+                source: "github-star".to_owned(),
+                created_at: if repo.starred_at_ms > 0 {
+                    repo.starred_at_ms
+                } else {
+                    unix_time_ms()
+                },
+            };
+            match self.insert_entry(entry).await {
+                Ok(()) => imported += 1,
+                Err(error) => {
+                    return Err(format!("imported {imported} before failing: {error}"));
+                }
+            }
+        }
+        Ok((imported, skipped))
+    }
+
 
     pub async fn get_config(&self, key: &str) -> Result<Option<String>, String> {
         if let Some(runtime) = self.runtime.clone() {
@@ -464,11 +536,10 @@ fn bootstrap_runtime(
 /// Resolve the local database file path: `WORKTABLE_DB_PATH` or
 /// `~/.worktable/worktable.db`.
 fn resolve_database_path() -> anyhow::Result<String> {
-    if let Ok(path) = std::env::var("WORKTABLE_DB_PATH") {
-        if !path.is_empty() {
+    if let Ok(path) = std::env::var("WORKTABLE_DB_PATH")
+        && !path.is_empty() {
             return Ok(path);
         }
-    }
 
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("neither WORKTABLE_DB_PATH nor HOME is set"))?;
@@ -496,15 +567,182 @@ pub fn new_entry_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Convenience helper: spawn a one-shot future on the service runtime.
-pub fn spawn_on_tokio<F, R>(tokio: &Arc<Runtime>, f: F) -> oneshot::Receiver<R>
-where
-    F: Future<Output = R> + Send + 'static,
-    R: Send + 'static,
-{
-    let (tx, rx) = oneshot::channel();
-    tokio.spawn(async move {
-        let _ = tx.send(f.await);
-    });
-    rx
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Block a future to completion WITHOUT a Tokio reactor — mirroring how
+    /// the view calls service methods from GPUI's executor. Awaiting reqwest
+    /// inline under this executor is exactly what crashed the app.
+    fn block_on_no_reactor<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop_raw_waker() -> RawWaker {
+            RawWaker::new(std::ptr::null(), &NOOP_VTABLE)
+        }
+        static NOOP_VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|_| noop_raw_waker(), |_| {}, |_| {}, |_| {});
+        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// A one-shot HTTP/1.1 server speaking enough of the GitHub starred-repos
+    /// API (star+json media type) for the import path to run against.
+    struct MockGithub {
+        addr: std::net::SocketAddr,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockGithub {
+        fn start(body: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = shutdown.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+                }
+            });
+            Self { addr, shutdown }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for MockGithub {
+        fn drop(&mut self) {
+            self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    const STARRED_BODY: &str = r#"[
+        {
+            "starred_at": "2026-08-01T10:00:00Z",
+            "repo": {
+                "name": "gpui",
+                "full_name": "zed-industries/gpui",
+                "description": "Fast, productive tooling for building native apps",
+                "stargazers_count": 12000,
+                "html_url": "https://github.com/zed-industries/gpui"
+            }
+        },
+        {
+            "starred_at": "2026-07-15T08:30:00Z",
+            "repo": {
+                "name": "no-desc-repo",
+                "full_name": "someone/no-desc-repo",
+                "stargazers_count": 5,
+                "html_url": "https://github.com/someone/no-desc-repo"
+            }
+        }
+    ]"#;
+
+    fn service_for_test() -> (Arc<WorktableService>, String) {
+        let dir = std::env::temp_dir().join(format!("wt-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("worktable.db").to_string_lossy().into_owned();
+        let service = Arc::new(WorktableService::new_for_test(&db).unwrap());
+        (service, db)
+    }
+
+    /// The end-to-end import test — run under a reactor-free executor, exactly
+    /// like the GPUI call site that crashed the app before the fix.
+    #[test]
+    fn import_starred_repos_creates_entries_with_starred_at_and_description() {
+        let (service, _db) = service_for_test();
+        let mock = MockGithub::start(STARRED_BODY);
+
+        let result = block_on_no_reactor(service.import_starred_repos_with_base(
+            "octocat",
+            None,
+            &mock.base_url(),
+        ));
+        let (imported, skipped) = result.expect("import succeeds without a Tokio reactor");
+        assert_eq!(imported, 2, "both stars import");
+        assert_eq!(skipped, 0);
+
+        let entries = block_on_no_reactor(service.list_entries()).expect("list");
+        assert_eq!(entries.len(), 2);
+
+        let by_title = |t: &str| entries.iter().find(|e| e.title.as_deref() == Some(t)).unwrap();
+        let gpui_entry = by_title("zed-industries/gpui");
+        assert_eq!(gpui_entry.kind, "link");
+        assert_eq!(gpui_entry.source, "github-star");
+        assert_eq!(
+            gpui_entry.content,
+            "Fast, productive tooling for building native apps",
+            "description becomes the entry content"
+        );
+        assert_eq!(
+            gpui_entry.created_at, 1_785_578_400_000,
+            "created_at is the starred_at timestamp"
+        );
+
+        // No description → content falls back to the repo URL.
+        let bare = by_title("someone/no-desc-repo");
+        assert_eq!(bare.content, "https://github.com/someone/no-desc-repo");
+        assert_eq!(bare.created_at, 1_784_104_200_000);
+    }
+
+    /// Re-running the import skips everything already present.
+    #[test]
+    fn import_starred_repos_is_idempotent() {
+        let (service, _db) = service_for_test();
+        let mock = MockGithub::start(STARRED_BODY);
+
+        let first = block_on_no_reactor(service.import_starred_repos_with_base(
+            "octocat",
+            None,
+            &mock.base_url(),
+        ))
+        .expect("first import");
+        assert_eq!(first, (2, 0));
+
+        let second = block_on_no_reactor(service.import_starred_repos_with_base(
+            "octocat",
+            None,
+            &mock.base_url(),
+        ))
+        .expect("second import");
+        assert_eq!(second.0, 0, "nothing re-imported");
+        assert_eq!(second.1, 2, "both recognized as already present");
+
+        let entries = block_on_no_reactor(service.list_entries()).expect("list");
+        assert_eq!(entries.len(), 2, "no duplicates created");
+    }
+
+    /// HTTP failures surface as errors, never panics.
+    #[test]
+    fn import_starred_repos_surfaces_http_errors() {
+        let (service, _db) = service_for_test();
+        // Nothing is listening on this port.
+        let result = block_on_no_reactor(service.import_starred_repos_with_base(
+            "octocat",
+            None,
+            "http://127.0.0.1:9",
+        ));
+        let error = result.expect_err("connection refused should be an error");
+        assert!(!error.is_empty());
+    }
 }

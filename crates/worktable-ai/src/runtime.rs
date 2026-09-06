@@ -78,8 +78,9 @@ impl WorktableRuntime {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let entry_owned = entry.clone();
+            let helix_path = worktable_helix::helix_path_for_sqlite(self.store.database_path());
             std::thread::spawn(move || {
-                let helix = worktable_helix::HelixClient::from_env();
+                let helix = worktable_helix::HelixClient::open_embedded(helix_path);
                 if let Err(err) = helix.sync_entry_blocking(&entry_owned) {
                     eprintln!("[worktable] Helix sync_entry failed (fallback to SQLite): {err}");
                 }
@@ -95,8 +96,9 @@ impl WorktableRuntime {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let id_owned = id.to_owned();
+            let helix_path = worktable_helix::helix_path_for_sqlite(self.store.database_path());
             std::thread::spawn(move || {
-                let helix = worktable_helix::HelixClient::from_env();
+                let helix = worktable_helix::HelixClient::open_embedded(helix_path);
                 if let Err(err) = helix.delete_entry_blocking(&id_owned) {
                     eprintln!("[worktable] Helix delete_entry failed (fallback to SQLite): {err}");
                 }
@@ -130,6 +132,11 @@ impl WorktableRuntime {
         if agent.is_some() {
             return Err(anyhow::anyhow!("AI worker is already running"));
         }
+
+        // Runs from a previous process lifetime can never finish — close them
+        // out so `wt_ai_runs` never accumulates permanent `running` rows and
+        // the session state machine starts clean.
+        let _ = self.store.fail_stale_runs(unix_time_ms()?);
 
         let worker = PiAgentRuntime::start(self.store.clone());
         *agent = Some(worker);
@@ -268,10 +275,11 @@ impl WorktableRuntime {
     async fn finish_prompt_request(&self, request_id: &str, state: &str, error: Option<&str>) {
         let run = self.active_runs.lock().await.remove(request_id);
         let Some(run) = run else {
-            // Unknown request: nothing to finalize, but still surface the event.
-            self.events.publish(WorktableEvent::AiWorkerError {
-                error: format!("worker finished unknown request {request_id}"),
-            });
+            // Unknown request: nothing to finalize. This is a benign race —
+            // e.g. a cancelled run emits a second failure after the cancel
+            // fast-path already finalized it — so log instead of surfacing a
+            // spurious user-facing error.
+            eprintln!("Worktable: worker finished unknown request {request_id} (state {state})");
             return;
         };
         if let Err(finish_error) = self.finish_prompt(&run, state, error).await {
@@ -571,4 +579,188 @@ fn publish_worker_event(events: &EventBus, event: &WorkerEvent) {
     };
 
     events.publish(event);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokio_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    }
+
+    async fn connect_memory() -> WorktableRuntime {
+        WorktableRuntime::connect(":memory:")
+            .await
+            .expect("connect in-memory")
+    }
+
+    /// Receive events until `pred` matches or the timeout elapses.
+    async fn recv_event_until(
+        events: &mut tokio::sync::broadcast::Receiver<WorktableEvent>,
+        timeout: Duration,
+        pred: impl Fn(&WorktableEvent) -> bool,
+    ) -> Option<WorktableEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(event)) => {
+                    if pred(&event) {
+                        return Some(event);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_without_provider_fails_and_releases_the_lease() {
+        tokio_runtime().block_on(async {
+            let runtime = connect_memory().await;
+            runtime.start_ai_worker().await.expect("worker starts");
+            let mut events = runtime.events().subscribe();
+
+            let run = runtime
+                .submit_prompt("req-1", "sess-1", "hello")
+                .await
+                .expect("submit succeeds")
+                .expect("run started");
+            assert_eq!(run.request_id, "req-1");
+
+            // AiRunStarted is published before the terminal failure.
+            let started = recv_event_until(&mut events, Duration::from_secs(5), |e| {
+                matches!(e, WorktableEvent::AiRunStarted { request_id, .. } if request_id == "req-1")
+            })
+            .await;
+            assert!(started.is_some(), "AiRunStarted should be published");
+
+            let failed = recv_event_until(&mut events, Duration::from_secs(10), |e| {
+                matches!(e, WorktableEvent::AiRunFailed { request_id, .. } if request_id == "req-1")
+            })
+            .await;
+            let Some(WorktableEvent::AiRunFailed { error, .. }) = failed else {
+                panic!("expected AiRunFailed for req-1");
+            };
+            assert!(
+                error.contains("no AI provider configured"),
+                "unexpected error: {error}"
+            );
+
+            // Regression: the lease must be released after a failed run so the
+            // session is not wedged — a second prompt gets a fresh run.
+            let run2 = runtime
+                .submit_prompt("req-2", "sess-1", "hello again")
+                .await
+                .expect("second submit succeeds")
+                .expect("second run started — lease was released");
+            assert_eq!(run2.request_id, "req-2");
+
+            let failed2 = recv_event_until(&mut events, Duration::from_secs(10), |e| {
+                matches!(e, WorktableEvent::AiRunFailed { request_id, .. } if request_id == "req-2")
+            })
+            .await;
+            assert!(failed2.is_some(), "second run should also terminate");
+
+            runtime.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn submit_prompt_without_worker_is_an_error_not_a_wedge() {
+        tokio_runtime().block_on(async {
+            let runtime = connect_memory().await;
+            // Never started the worker.
+            let result = runtime.submit_prompt("req-1", "sess-1", "hello").await;
+            assert!(result.is_err(), "submitting without a worker must fail");
+            // The failed send must still release the lease: starting the worker
+            // afterwards and submitting works.
+            runtime.start_ai_worker().await.expect("worker starts");
+            let run = runtime
+                .submit_prompt("req-2", "sess-1", "hello")
+                .await
+                .expect("submit succeeds")
+                .expect("run started");
+            assert_eq!(run.request_id, "req-2");
+            runtime.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        tokio_runtime().block_on(async {
+            let runtime = connect_memory().await;
+            runtime.start_ai_worker().await.expect("worker starts");
+            runtime.shutdown().await.expect("first shutdown");
+            runtime.shutdown().await.expect("second shutdown is a no-op");
+        });
+    }
+
+    /// Reproduces the user's wedged app against a copy of their real database:
+    /// a stale provider id, leftover `running` rows, and an old session lease.
+    /// A fresh prompt must produce a terminal event and finalize its run row —
+    /// runs must never pile up as `running` forever. Skipped when the user DB
+    /// is not present (CI / other machines).
+    #[test]
+    fn real_db_prompt_reaches_a_terminal_event_and_finalizes() {
+        let source = std::path::PathBuf::from(
+            std::env::var("HOME").expect("HOME").to_string() + "/.worktable/worktable.db",
+        );
+        if !source.exists() {
+            eprintln!("skipping: {} not found", source.display());
+            return;
+        }
+        let copy = std::env::temp_dir().join(format!("wt-real-{}.db", uuid::Uuid::new_v4()));
+        std::fs::copy(&source, &copy).expect("copy user db");
+
+        tokio_runtime().block_on(async {
+            let runtime = WorktableRuntime::connect(copy.to_str().unwrap())
+                .await
+                .expect("connect to the copied db");
+            runtime.start_ai_worker().await.expect("worker starts");
+            let mut events = runtime.events().subscribe();
+
+            let run = runtime
+                .submit_prompt("req-real-1", "wt-session", "Say hi in one word")
+                .await
+                .expect("submit succeeds")
+                .expect("run started (stale lease must not block a fresh claim)");
+
+            let terminal = recv_event_until(&mut events, Duration::from_secs(90), |e| {
+                matches!(
+                    e,
+                    WorktableEvent::AiRunFinished { .. } | WorktableEvent::AiRunFailed { .. }
+                )
+            })
+            .await;
+            let Some(event) = terminal else {
+                panic!("no terminal event within 90s — the app wedges exactly like the user reported");
+            };
+            if let WorktableEvent::AiRunFailed { error, .. } = &event {
+                eprintln!("terminal failure (expected with the user's stale provider): {error}");
+            }
+
+            // The run row must be finalized (completed/failed), not `running`.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let state = runtime.store.run_state(&run.run_id).expect("query run state").expect("run row exists");
+            assert!(
+                state != "running",
+                "run must be finalized; still '{state}' — leftover-running bug"
+            );
+            runtime.shutdown().await.expect("shutdown");
+        });
+    }
 }

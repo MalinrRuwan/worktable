@@ -35,12 +35,6 @@ use objc2_foundation::{NSData, NSSize, NSString};
 /// Used by `worktable_view` to detect Shift+right-click.
 static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
 
-/// Returns true if the Shift key is currently held down (as last observed by
-/// the global FlagsChanged monitor).
-pub fn is_shift_held() -> bool {
-    SHIFT_HELD.load(Ordering::SeqCst)
-}
-
 /// A small Objective-C object that forwards menu clicks to the command sender.
 struct MenuTargetIvars {
     sender: CommandSender,
@@ -232,58 +226,46 @@ fn capture_foreground_selection(sender: CommandSender) {
 fn try_capture_image_from_pasteboard(pasteboard: &NSPasteboard) -> Option<(String, String)> {
     // Order matters: prefer TIFF first (most general), then PNG, then JPEG variants.
     let tiff_type = unsafe { NSPasteboardTypeTIFF };
-    if let Some(data) = pasteboard.dataForType(tiff_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "tiff", "image/tiff") {
+    if let Some(data) = pasteboard.dataForType(tiff_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "tiff", "image/tiff") {
                 return Some(result);
             }
-        }
-    }
 
     let png_type = unsafe { NSPasteboardTypePNG };
-    if let Some(data) = pasteboard.dataForType(png_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "png", "image/png") {
+    if let Some(data) = pasteboard.dataForType(png_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "png", "image/png") {
                 return Some(result);
             }
-        }
-    }
 
     // JPEG via UTI string "public.jpeg" (no dedicated constant in objc2-app-kit).
     let jpeg_type = NSString::from_str("public.jpeg");
-    if let Some(data) = pasteboard.dataForType(&jpeg_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
+    if let Some(data) = pasteboard.dataForType(&jpeg_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
                 return Some(result);
             }
-        }
-    }
     // Alternate UTI "public.jpg" on some systems.
     let jpg_type = NSString::from_str("public.jpg");
-    if let Some(data) = pasteboard.dataForType(&jpg_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
+    if let Some(data) = pasteboard.dataForType(&jpg_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
                 return Some(result);
             }
-        }
-    }
     // HEIC / HEIF fallback
     let heic_type = NSString::from_str("public.heic");
-    if let Some(data) = pasteboard.dataForType(&heic_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "heic", "image/heic") {
+    if let Some(data) = pasteboard.dataForType(&heic_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "heic", "image/heic") {
                 return Some(result);
             }
-        }
-    }
     let heif_type = NSString::from_str("public.heif");
-    if let Some(data) = pasteboard.dataForType(&heif_type) {
-        if data.length() > 0 {
-            if let Some(result) = write_image_data(&data, "heif", "image/heif") {
+    if let Some(data) = pasteboard.dataForType(&heif_type)
+        && data.length() > 0
+            && let Some(result) = write_image_data(&data, "heif", "image/heif") {
                 return Some(result);
             }
-        }
-    }
 
     None
 }
@@ -307,11 +289,10 @@ fn write_image_data(data: &NSData, ext: &str, mime_type: &str) -> Option<(String
 }
 
 fn resolve_images_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("WORKTABLE_IMAGES_DIR") {
-        if !path.is_empty() {
+    if let Ok(path) = std::env::var("WORKTABLE_IMAGES_DIR")
+        && !path.is_empty() {
             return Some(PathBuf::from(path));
         }
-    }
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".worktable").join("images"))
 }

@@ -10,9 +10,31 @@ pub struct GithubRepo {
     pub html_url: String,
 }
 
+/// A repository the user starred, with the moment they starred it.
+#[derive(Debug, Clone)]
+pub struct StarredRepo {
+    pub full_name: String,
+    pub description: Option<String>,
+    pub stars: u64,
+    pub html_url: String,
+    /// Unix epoch milliseconds of GitHub's `starred_at`.
+    pub starred_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredResponse {
+    #[serde(default)]
+    starred_at: String,
+    repo: RepoResponse,
+}
+
 #[derive(Debug, Deserialize)]
 struct RepoResponse {
     name: String,
+    #[serde(default)]
+    full_name: String,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     stargazers_count: u64,
     #[serde(default)]
@@ -150,14 +172,13 @@ pub async fn fetch_github_stars(
         // which will then break on 0.
         if repos_len == 100 {
             // Check remaining header to avoid hammering when rate limited.
-            if let Some(rem) = remaining.as_deref().and_then(|s| s.parse::<i32>().ok()) {
-                if rem <= 1 {
+            if let Some(rem) = remaining.as_deref().and_then(|s| s.parse::<i32>().ok())
+                && rem <= 1 {
                     anyhow::bail!(
                         "GitHub rate limit nearly exhausted (remaining={}). Set GITHUB_TOKEN to increase limit.",
                         rem
                     );
                 }
-            }
             page += 1;
             if page > 20 {
                 break;
@@ -178,6 +199,102 @@ pub async fn fetch_github_stars(
     }
 
     Ok((total, all_repos))
+}
+
+/// Fetch the repositories `username` starred, newest star first, including
+/// the star timestamp (`Accept: application/vnd.github.star+json`) and each
+/// repo's description — everything an entry import needs.
+pub async fn fetch_starred_repos(
+    username: &str,
+    token: Option<String>,
+) -> anyhow::Result<Vec<StarredRepo>> {
+    fetch_starred_repos_with_base(username, token, "https://api.github.com").await
+}
+
+/// Test seam for [`fetch_starred_repos`]: the API root is injectable so the
+/// parsing/pagination path can be exercised against a local mock server.
+pub async fn fetch_starred_repos_with_base(
+    username: &str,
+    token: Option<String>,
+    api_base: &str,
+) -> anyhow::Result<Vec<StarredRepo>> {
+    let username = username.trim();
+    if username.is_empty() {
+        anyhow::bail!("GitHub username is empty");
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("Worktable/0.1.0")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let mut all: Vec<StarredRepo> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let url = format!(
+            "{}/users/{}/starred?per_page=100&page={}",
+            api_base.trim_end_matches('/'),
+            username,
+            page
+        );
+        let mut req = client
+            .get(&url)
+            .header("User-Agent", "Worktable/0.1.0")
+            // The star+json media type wraps each repo with its `starred_at`.
+            .header("Accept", "application/vnd.github.star+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(ref t) = token
+            && !t.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", t.trim()));
+        }
+
+        let resp = req.send().await.context("failed to send GitHub request")?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if status.as_u16() == 404 {
+            anyhow::bail!("GitHub user '{}' not found (404)", username);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub API error {}: {}", status, body);
+        }
+
+        let items: Vec<StarredResponse> = resp
+            .json()
+            .await
+            .context("failed to parse GitHub starred response")?;
+        let count = items.len();
+        for item in items {
+            let full_name = if item.repo.full_name.is_empty() {
+                item.repo.name.clone()
+            } else {
+                item.repo.full_name.clone()
+            };
+            all.push(StarredRepo {
+                full_name,
+                description: item.repo.description,
+                stars: item.repo.stargazers_count,
+                html_url: item.repo.html_url,
+                starred_at_ms: crate::format::iso8601_to_epoch_ms(&item.starred_at)
+                    .unwrap_or_default(),
+            });
+        }
+
+        let has_next = headers
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .map(|link| link.contains(r#"rel="next""#))
+            .unwrap_or(false);
+        if !has_next || count < 100 || page >= 20 {
+            break;
+        }
+        page += 1;
+    }
+
+    // Newest stars first.
+    all.sort_by(|a, b| b.starred_at_ms.cmp(&a.starred_at_ms));
+    Ok(all)
 }
 
 #[cfg(test)]

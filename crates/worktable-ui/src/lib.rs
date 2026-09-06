@@ -33,8 +33,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationElement, App, ElementId, EntityId, Global, Hsla, IntoElement, Rgba,
-    SharedString, Styled, Window, px,
+    Animation, AnimationElement, App, Div, ElementId, EntityId, Global, Hsla, IntoElement,
+    ParentElement, Pixels, Rgba, SharedString, Styled, Window, div, px, relative,
 };
 
 pub use gpui::AnimationExt;
@@ -43,16 +43,14 @@ pub use gpui::AnimationExt;
 // Pulse clock — throttled drive for the repeating loaders
 // ---------------------------------------------------------------------------
 
-/// Repeat-tick interval for the pulse/spinner loaders (~30fps).
+/// Repeat-tick interval for the pulse/spinner/dots loaders — 120fps.
 ///
-/// The loaders used to run as gpui `with_animation(...repeating...)` elements,
-/// which request a redraw every display frame for as long as they are mounted
-/// — one Working session row pinned the whole window at 120Hz (measured 36%
-/// CPU on an M-series laptop, with the always-hot Metal pipeline holding
-/// hundreds of MB of graphics buffers). A shared 30fps clock is visually
-/// equivalent for these chunky cell waves at a quarter of the redraws, and a
-/// window with no spinner mounted schedules nothing at all.
-const PULSE_TICK: Duration = Duration::from_millis(33);
+/// The clock only runs while at least one loader is mounted (see
+/// [`PULSE_LEASE`]): views register on paint and drop off ~300ms after their
+/// last loader unmounts, so a window with nothing animating schedules no
+/// frames at all. 120fps keeps the dot/bob motion perfectly fluid on
+/// ProMotion displays at double the old 30fps cost only while visible.
+const PULSE_TICK: Duration = Duration::from_millis(8);
 
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
@@ -317,6 +315,12 @@ pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
 pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
+/// Text-dots ("Thinking…") cycle: 1.4s opacity wave, one dot every 0.2s.
+pub const TEXT_DOTS: MotionSpec = MotionSpec::new(1400, EASE);
+/// Bobbing-dots (waiting-on-LLM) cycle: 1s bounce, one dot every 0.2s.
+pub const BOBBING_DOTS: MotionSpec = MotionSpec::new(1000, EASE_IN_OUT);
+/// Stagger between text/bobbing dots (fraction of period) — 0.2s at 1s period.
+pub const DOTS_STAGGER: f32 = 0.2;
 
 // ---------------------------------------------------------------------------
 // Element helpers (paint-layer entrances/exits)
@@ -444,6 +448,81 @@ pub fn gspin_opacity(delta: f32, dim: f32) -> f32 {
         let p = (t - 0.9) / 0.1;
         dim + (1.0 - dim) * p
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text dots + bobbing dots (LLM wait states)
+// ---------------------------------------------------------------------------
+
+/// Opacity of dot `index` (of `count`) at raw cycle position `delta` for the
+/// text-dots wave: each dot fades 0→1→0 (triangle) with a per-dot delay of
+/// `DOTS_STAGGER` — the CSS keyframe pair (0%/100% opacity 0, 50% opacity 1).
+pub fn text_dot_opacity(delta: f32, index: usize) -> f32 {
+    pulse_wave(staggered_phase(delta, index, DOTS_STAGGER))
+}
+
+/// Vertical bob factor (0..1) of dot `index` at raw cycle position `delta` for
+/// the bobbing-dots bounce. The triangle wave's two legs are each shaped with
+/// `EASE_IN_OUT` so the dot leaves and lands softly, like `motion`'s
+/// `animate: { y: [0, "0.625em", 0] }, ease: "easeInOut"`.
+pub fn bobbing_dot_lift(delta: f32, index: usize) -> f32 {
+    let phase = staggered_phase(delta, index, DOTS_STAGGER);
+    // 0..0.5 rises 0→1, 0.5..1 falls 1→0; each leg eased.
+    let leg = if phase < 0.5 {
+        EASE_IN_OUT.eval(phase * 2.0)
+    } else {
+        EASE_IN_OUT.eval((1.0 - phase) * 2.0)
+    };
+    leg.clamp(0.0, 1.0)
+}
+
+/// "Thinking" + animated trailing dots (the `TextDots` web component):
+/// a text label with three dots whose opacity waves in a 0.2s stagger.
+/// `delta` is the shared clock phase for [`TEXT_DOTS`].
+pub fn text_dots(label: &str, delta: f32, color: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .text_color(color)
+        .child(div().child(label.to_owned()))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .children((0..3).map(|index| {
+                    let opacity = text_dot_opacity(delta, index);
+                    div()
+                        .opacity(opacity)
+                        // Keep the label's baseline: collapsed line box.
+                        .line_height(relative(1.0))
+                        .child(".")
+                })),
+        )
+}
+
+/// Three round dots bobbing in sequence (the `BobbingDots` web component) —
+/// the "waiting for the LLM's first token" state. `delta` is the shared clock
+/// phase for [`BOBBING_DOTS`].
+pub fn bobbing_dots(delta: f32, color: Hsla, dot: Pixels) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_end()
+        // gap is 12% of the row, mirroring `gap-[12%]`.
+        .gap(dot * 0.5)
+        .pb(dot * 0.2)
+        .children((0..3).map(|index| {
+            let lift = bobbing_dot_lift(delta, index);
+            div()
+                .size(dot)
+                .rounded_full()
+                .bg(color)
+                // translateY via a relative `top` inset (see module docs):
+                // 0.625em at dot scale ≈ one dot height.
+                .relative()
+                .top(-dot * lift)
+        }))
 }
 
 /// Linear interpolation (layout tweens).
@@ -958,5 +1037,58 @@ mod tests {
         assert!(mid_fall > 0.1 && mid_fall < 1.0, "eases down");
         let mid_rise = gspin_opacity(0.96, 0.1);
         assert!(mid_rise > 0.1 && mid_rise < 1.0, "eases up");
+    }
+
+    #[test]
+    fn text_dots_wave_staggers_and_bounds() {
+        // Dot 0 starts dark, peaks a half-cycle in, returns to dark.
+        assert_close(text_dot_opacity(0.0, 0), 0.0, 1e-6, "dot 0 start");
+        // Peak at half the dot's own cycle (delta 0.5 → wave 1.0).
+        assert_close(text_dot_opacity(0.5, 0), 1.0, 1e-6, "dot 0 peak");
+        assert_close(text_dot_opacity(1.0, 0), 0.0, 1e-6, "dot 0 end");
+        // Dot 1 lags dot 0 by the stagger.
+        assert_close(
+            text_dot_opacity(DOTS_STAGGER, 1),
+            text_dot_opacity(0.0, 0),
+            1e-6,
+            "dot 1 lags",
+        );
+        // Opacity always lands in [0,1].
+        for i in 0..3 {
+            for step in 0..=100 {
+                let delta = step as f32 / 100.0;
+                let opacity = text_dot_opacity(delta, i);
+                assert!((0.0..=1.0).contains(&opacity), "dot {i} at {delta}: {opacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn bobbing_dots_lift_eases_and_bounds() {
+        assert_close(bobbing_dot_lift(0.0, 0), 0.0, 1e-6, "rest");
+        assert_close(bobbing_dot_lift(0.5, 0), 1.0, 1e-6, "apex");
+        assert_close(bobbing_dot_lift(1.0, 0), 0.0, 1e-6, "lands");
+        // Eased legs: a quarter into the rise is gentler than linear (the
+        // curve equals linear exactly at its midpoint, so probe off-center).
+        let early = bobbing_dot_lift(0.125, 0);
+        let linear_early = 0.25;
+        assert!(
+            early < linear_early,
+            "ease-in-out starts slower than linear: {early}"
+        );
+        // Stagger keeps later dots behind.
+        assert_close(
+            bobbing_dot_lift(DOTS_STAGGER, 1),
+            bobbing_dot_lift(0.0, 0),
+            1e-6,
+            "dot 1 lags",
+        );
+        for i in 0..3 {
+            for step in 0..=100 {
+                let delta = step as f32 / 100.0;
+                let lift = bobbing_dot_lift(delta, i);
+                assert!((0.0..=1.0).contains(&lift), "dot {i} at {delta}: {lift}");
+            }
+        }
     }
 }

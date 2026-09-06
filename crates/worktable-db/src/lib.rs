@@ -5,7 +5,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -290,7 +290,17 @@ impl SqliteStore {
             .context("failed to begin AI run")?;
 
         if affected == 1 {
-            self.set_session_state(session_id, "running", Some(run_id), now_ms)?;
+            // Update the session state with the lock we already hold — calling
+            // a helper that re-acquires `self.connection` would deadlock
+            // (std Mutex is not reentrant).
+            connection
+                .execute(
+                    "UPDATE wt_ai_sessions
+                     SET state = 'running', active_run_id = ?, updated_at = ?
+                     WHERE pi_session_id = ?",
+                    params![run_id, now_ms, session_id],
+                )
+                .context("failed to mark AI session running")?;
         }
 
         Ok(affected == 1)
@@ -383,6 +393,36 @@ impl SqliteStore {
             .context("failed to record AI event")?;
 
         Ok(())
+    }
+
+    /// Mark every `running` run as `failed` ("interrupted by restart").
+    ///
+    /// Runs whose app died mid-prompt (force-quit, crash) stay `running`
+    /// forever otherwise — they pile up row after row and misreport activity.
+    /// Called once at AI-worker startup: at that point no run can legitimately
+    /// be `running`, because runs only progress while this process lives.
+    pub fn fail_stale_runs(&self, now_ms: i64) -> anyhow::Result<usize> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let affected = connection
+            .execute(
+                "UPDATE wt_ai_runs
+                 SET state = 'failed', completed_at = ?, error = 'interrupted by restart'
+                 WHERE state = 'running'",
+                params![now_ms],
+            )
+            .context("failed to fail stale AI runs")?;
+        Ok(affected)
+    }
+
+    /// Current state of a run row (`running` / `completed` / `failed`), or
+    /// `None` when the run id is unknown.
+    pub fn run_state(&self, run_id: &str) -> anyhow::Result<Option<String>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let mut statement = connection
+            .prepare("SELECT state FROM wt_ai_runs WHERE id = ?")
+            .context("failed to query run state")?;
+        let mut rows = statement.query(params![run_id])?;
+        Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
     }
 
     pub fn finish_run(
@@ -531,26 +571,6 @@ impl SqliteStore {
         connection
             .execute("DELETE FROM wt_ai_config WHERE key = ?", [key])
             .context("failed to delete AI config")?;
-        Ok(())
-    }
-
-    fn set_session_state(
-        &self,
-        session_id: &str,
-        state: &str,
-        active_run_id: Option<&str>,
-        now_ms: i64,
-    ) -> anyhow::Result<()> {
-        let connection = self.connection.lock().expect("sqlite lock poisoned");
-        connection
-            .execute(
-                "UPDATE wt_ai_sessions
-                 SET state = ?, active_run_id = ?, updated_at = ?
-                 WHERE pi_session_id = ?",
-                params![state, active_run_id, now_ms, session_id],
-            )
-            .context("failed to update AI session state")?;
-
         Ok(())
     }
 }
@@ -873,4 +893,176 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh in-memory store (single shared connection, so `:memory:` works).
+    fn store() -> SqliteStore {
+        let store = SqliteStore::connect(":memory:").expect("connect in-memory");
+        store.migrate().expect("migrate");
+        store
+    }
+
+    fn entry(id: &str, created_at: i64) -> Entry {
+        Entry {
+            id: id.to_owned(),
+            kind: "text".to_owned(),
+            content: format!("content of {id}"),
+            title: None,
+            source: "Worktable".to_owned(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn entries_insert_list_delete() {
+        let store = store();
+        store.insert_entry(&entry("a", 100)).unwrap();
+        store.insert_entry(&entry("b", 300)).unwrap();
+        store.insert_entry(&entry("c", 200)).unwrap();
+
+        let listed = store.list_entries(10).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"], "entries list recency-desc");
+
+        store.delete_entry("b").unwrap();
+        let ids: Vec<String> = store
+            .list_entries(10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["c", "a"]);
+
+        let limited = store.list_entries(1).unwrap();
+        assert_eq!(limited.len(), 1, "limit is honored");
+    }
+
+    #[test]
+    fn session_lease_single_holder_until_release_or_expiry() {
+        let store = store();
+        store.ensure_session("s", None, 1_000).unwrap();
+
+        // First claim wins.
+        assert!(store
+            .claim_session_lease("s", "owner-1", "run-1", 1_000, 31_000)
+            .unwrap());
+        // A different owner/run cannot claim while the lease is live.
+        assert!(!store
+            .claim_session_lease("s", "owner-2", "run-2", 2_000, 32_000)
+            .unwrap());
+        // Even the same owner with a *different* run cannot steal it.
+        assert!(!store
+            .claim_session_lease("s", "owner-1", "run-9", 2_000, 32_000)
+            .unwrap());
+        // The holder can re-claim (idempotent renew-style claim).
+        assert!(store
+            .claim_session_lease("s", "owner-1", "run-1", 2_000, 32_000)
+            .unwrap());
+        // After expiry (lease_until 32_000 <= now 40_000), someone else can claim.
+        assert!(store
+            .claim_session_lease("s", "owner-2", "run-2", 40_000, 70_000)
+            .unwrap());
+        // Release requires the exact owner+run.
+        assert!(!store
+            .release_session_lease("s", "owner-1", "run-1")
+            .unwrap());
+        assert!(store
+            .release_session_lease("s", "owner-2", "run-2")
+            .unwrap());
+        // Freed: a fresh claim succeeds.
+        assert!(store
+            .claim_session_lease("s", "owner-3", "run-3", 50_000, 80_000)
+            .unwrap());
+    }
+
+    #[test]
+    fn lease_renewal_requires_holder_identity() {
+        let store = store();
+        store.ensure_session("s", None, 1_000).unwrap();
+        assert!(store
+            .claim_session_lease("s", "owner-1", "run-1", 1_000, 2_000)
+            .unwrap());
+
+        assert!(store
+            .renew_session_lease("s", "owner-1", "run-1", 1_500, 3_000)
+            .unwrap());
+        assert!(!store
+            .renew_session_lease("s", "owner-2", "run-1", 1_500, 3_000)
+            .unwrap());
+        assert!(!store
+            .renew_session_lease("s", "owner-1", "run-2", 1_500, 3_000)
+            .unwrap());
+    }
+
+    #[test]
+    fn run_lifecycle_begin_finish_is_idempotent_on_ids() {
+        let store = store();
+        store.ensure_session("s", None, 1_000).unwrap();
+
+        assert!(store.begin_run("run-1", "s", "req-1", 1_000).unwrap());
+        // Same run id cannot begin twice (INSERT OR IGNORE).
+        assert!(!store.begin_run("run-1", "s", "req-1", 1_100).unwrap());
+
+        store
+            .finish_run("run-1", "s", "completed", None, 2_000)
+            .unwrap();
+        // Finishing twice is a no-op, not an error.
+        store
+            .finish_run("run-1", "s", "completed", None, 3_000)
+            .unwrap();
+
+        // A new run on the same session works after the previous finished.
+        assert!(store.begin_run("run-2", "s", "req-2", 4_000).unwrap());
+        store
+            .finish_run("run-2", "s", "failed", Some("boom"), 5_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_credentials_roundtrip_and_delete() {
+        let store = store();
+        let credential = ProviderCredential {
+            kind: "api_key".to_owned(),
+            key: "sk-test".to_owned(),
+        };
+        store
+            .write_provider_credential("openai", &credential)
+            .unwrap();
+
+        let read = store.read_provider_credential("openai").unwrap().unwrap();
+        assert_eq!(read.key, "sk-test");
+        assert_eq!(read.kind, "api_key");
+
+        let listed = store.list_provider_credentials().unwrap();
+        assert!(listed.contains_key("openai"));
+
+        store.delete_provider_credential("openai").unwrap();
+        assert!(store.read_provider_credential("openai").unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_get_delete() {
+        let store = store();
+        assert_eq!(store.get_config("active_provider").unwrap(), None);
+        store.set_config("active_provider", "openai").unwrap();
+        assert_eq!(
+            store.get_config("active_provider").unwrap().as_deref(),
+            Some("openai")
+        );
+        store.set_config("active_provider", "deepseek").unwrap();
+        assert_eq!(
+            store.get_config("active_provider").unwrap().as_deref(),
+            Some("deepseek")
+        );
+        store.delete_config("active_provider").unwrap();
+        assert_eq!(store.get_config("active_provider").unwrap(), None);
+    }
 }

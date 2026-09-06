@@ -29,6 +29,10 @@ use crate::helix_tool::HelixToolFactory;
 
 const AUTH_FALLBACK_FILE: &str = ".worktable-pi-auth.json";
 
+/// Error string used when a run ends because the user cancelled it. The UI
+/// matches on this to avoid surfacing cancellations as failures.
+pub const ABORTED_BY_USER: &str = "aborted by user";
+
 /// In-process Pi Agent runtime.
 ///
 /// `send` spawns one blocking OS thread per request. The thread takes a
@@ -64,7 +68,23 @@ impl PiAgentRuntime {
     }
 
     /// Dispatch a request. Returns after the worker thread has been spawned.
+    ///
+    /// `Cancel` is handled synchronously on the caller's thread: queueing it
+    /// behind `request_lock` would block until the very run it is meant to
+    /// abort has finished, making cancellation a no-op.
     pub fn send(&self, request: WorkerRequest) -> anyhow::Result<()> {
+        if let WorkerRequest::Cancel { request_id, .. } = request {
+            if let Some(abort) = self.active_abort.lock().unwrap().take() {
+                abort.abort();
+                let _ = self.events_tx.send(WorkerEvent::RunFailed {
+                    request_id,
+                    session_id: String::new(),
+                    error: ABORTED_BY_USER.to_owned(),
+                });
+            }
+            return Ok(());
+        }
+
         let store = self.store.clone();
         let events_tx = self.events_tx.clone();
         let request_lock = Arc::clone(&self.request_lock);
@@ -111,15 +131,9 @@ fn handle_request(
             &session_id,
             &content,
         ),
-        WorkerRequest::Cancel { request_id, .. } => {
-            if let Some(abort) = active_abort.lock().unwrap().take() {
-                abort.abort();
-                let _ = events_tx.send(WorkerEvent::RunFailed {
-                    request_id,
-                    session_id: String::new(),
-                    error: "aborted by user".to_owned(),
-                });
-            }
+        WorkerRequest::Cancel { .. } => {
+            // Handled synchronously in `send` — a Cancel that lands here was
+            // queued before the fast path existed; treat as a no-op.
         }
         WorkerRequest::ListProviders => match build_snapshot(store) {
             Ok(snapshot) => {
@@ -353,10 +367,61 @@ fn set_api_key(
     }
 
     // Activate the provider if nothing is selected yet.
-    if store.get_config("active_provider").ok().flatten().is_none() {
-        let _ = store.set_config("active_provider", provider_id);
+    let active_provider = store.get_config("active_provider").ok().flatten();
+    match active_provider.as_deref() {
+        None | Some("") => {
+            let _ = store.set_config("active_provider", provider_id);
+        }
+        Some(current) if current == provider_id => {}
+        Some(_) => {}
     }
+
+    // A provider without a model can never serve a prompt ("no model
+    // configured"). Selecting a model is a separate, easy-to-miss UI step —
+    // so default to the provider's first model whenever none is set (or the
+    // stored one belongs to a different provider). The model picker can still
+    // refine the choice afterwards.
+    let active_model = store.get_config("active_model").ok().flatten();
+    let model_needed = match active_model.as_deref() {
+        None | Some("") => true,
+        Some(model) => {
+            !model_known_for_provider(provider_id, model)
+        }
+    };
+    if model_needed
+        && let Some(first) = first_model_for_provider(provider_id)
+    {
+        let _ = store.set_config("active_model", &first);
+    }
+
     emit_config_changed(store, events_tx);
+}
+
+/// Whether `model_id` exists in pi's registry under `provider_id`.
+fn model_known_for_provider(provider_id: &str, model_id: &str) -> bool {
+    let Ok(auth) = load_empty_auth() else {
+        return false;
+    };
+    let registry = pi::models::ModelRegistry::load(&auth, None);
+    registry.models().iter().any(|entry| {
+        entry.model.id == model_id
+            && pi::provider_metadata::canonical_provider_id(&entry.model.provider)
+                .is_some_and(|c| c == provider_id)
+    })
+}
+
+/// The registry's first model id for `provider_id` (registry order), if any.
+fn first_model_for_provider(provider_id: &str) -> Option<String> {
+    let auth = load_empty_auth().ok()?;
+    let registry = pi::models::ModelRegistry::load(&auth, None);
+    registry
+        .models()
+        .iter()
+        .find(|entry| {
+            pi::provider_metadata::canonical_provider_id(&entry.model.provider)
+                .is_some_and(|c| c == provider_id)
+        })
+        .map(|entry| entry.model.id.clone())
 }
 
 fn emit_config_changed(store: &SqliteStore, events_tx: &std::sync::mpsc::SyncSender<WorkerEvent>) {
@@ -456,4 +521,334 @@ fn load_empty_auth() -> anyhow::Result<pi::auth::AuthStorage> {
     std::fs::write(&auth_path, "{}")
         .with_context(|| format!("failed to write {}", auth_path.display()))?;
     pi::auth::AuthStorage::load(auth_path).map_err(|error| anyhow!("{error}"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn temp_store() -> SqliteStore {
+        let store = SqliteStore::connect(":memory:").expect("connect in-memory");
+        store.migrate().expect("migrate");
+        store
+    }
+
+    /// Poll the worker event channel until `pred` matches or `timeout` elapses.
+    /// Non-matching events are discarded (they are orthogonal traffic).
+    fn recv_until(
+        runtime: &PiAgentRuntime,
+        timeout: Duration,
+        pred: impl Fn(&WorkerEvent) -> bool,
+    ) -> Option<WorkerEvent> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(event) = runtime.try_recv() {
+                if pred(&event) {
+                    return Some(event);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn ready_is_emitted_on_start() {
+        let runtime = PiAgentRuntime::start(temp_store());
+        let event = recv_until(&runtime, Duration::from_secs(2), |e| {
+            matches!(e, WorkerEvent::Ready)
+        });
+        assert!(event.is_some(), "worker should announce Ready on start");
+    }
+
+    #[test]
+    fn list_providers_returns_catalog() {
+        let runtime = PiAgentRuntime::start(temp_store());
+        // Drain the Ready event first.
+        let _ = runtime.try_recv();
+
+        runtime.send(WorkerRequest::ListProviders).unwrap();
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ProvidersSnapshot { .. })
+        });
+        let Some(WorkerEvent::ProvidersSnapshot { snapshot }) = event else {
+            panic!("expected a ProvidersSnapshot, got none");
+        };
+        assert!(
+            !snapshot.providers.is_empty(),
+            "provider catalog should not be empty"
+        );
+        for provider in &snapshot.providers {
+            assert!(!provider.id.is_empty());
+            assert!(!provider.name.is_empty());
+        }
+        assert!(
+            snapshot.providers.iter().any(|p| p.id == "openai"),
+            "openai should be in the catalog"
+        );
+        // Nothing is configured yet.
+        assert!(snapshot.active_provider.is_none());
+        assert!(snapshot.active_model.is_none());
+    }
+
+    #[test]
+    fn set_api_key_activates_provider_and_reports_snapshot() {
+        let store = temp_store();
+        let runtime = PiAgentRuntime::start(store.clone());
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::SetApiKey {
+                provider_id: "openai".to_owned(),
+                api_key: "sk-test-key".to_owned(),
+            })
+            .unwrap();
+
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ProvidersSnapshot { .. })
+        });
+        let Some(WorkerEvent::ProvidersSnapshot { snapshot }) = event else {
+            panic!("expected a ProvidersSnapshot after SetApiKey");
+        };
+        // Setting the first key activates the provider.
+        assert_eq!(snapshot.active_provider.as_deref(), Some("openai"));
+        let openai = snapshot
+            .providers
+            .iter()
+            .find(|p| p.id == "openai")
+            .expect("openai in snapshot");
+        assert!(openai.api_key_set, "snapshot should report the stored key");
+
+        // The credential is in the store, not just the snapshot.
+        let credential = store
+            .read_provider_credential("openai")
+            .unwrap()
+            .expect("credential stored");
+        assert_eq!(credential.key, "sk-test-key");
+    }
+
+    #[test]
+    fn set_model_persists_selection() {
+        let store = temp_store();
+        let runtime = PiAgentRuntime::start(store.clone());
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::SetModel {
+                provider_id: "openai".to_owned(),
+                model_id: "gpt-4o".to_owned(),
+            })
+            .unwrap();
+
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ConfigChanged { .. })
+        });
+        let Some(WorkerEvent::ConfigChanged {
+            active_provider,
+            active_model,
+        }) = event
+        else {
+            panic!("expected ConfigChanged after SetModel");
+        };
+        assert_eq!(active_provider.as_deref(), Some("openai"));
+        assert_eq!(active_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            store.get_config("active_model").unwrap().as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn logout_clears_credential_and_active_selection() {
+        let store = temp_store();
+        let runtime = PiAgentRuntime::start(store.clone());
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::SetApiKey {
+                provider_id: "openai".to_owned(),
+                api_key: "sk-test-key".to_owned(),
+            })
+            .unwrap();
+        let _ = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ProvidersSnapshot { .. })
+        });
+
+        runtime
+            .send(WorkerRequest::Logout {
+                provider_id: "openai".to_owned(),
+            })
+            .unwrap();
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ConfigChanged { .. })
+        });
+        let Some(WorkerEvent::ConfigChanged {
+            active_provider,
+            active_model,
+        }) = event
+        else {
+            panic!("expected ConfigChanged after Logout");
+        };
+        assert!(active_provider.is_none(), "active provider should clear");
+        assert!(active_model.is_none(), "active model should clear");
+        assert!(store.read_provider_credential("openai").unwrap().is_none());
+    }
+
+    #[test]
+    fn prompt_without_provider_fails_fast_with_helpful_error() {
+        let runtime = PiAgentRuntime::start(temp_store());
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::Prompt {
+                request_id: "req-1".to_owned(),
+                session_id: "sess-1".to_owned(),
+                content: "hello".to_owned(),
+            })
+            .unwrap();
+
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::RunFailed { .. })
+        });
+        let Some(WorkerEvent::RunFailed {
+            request_id, error, ..
+        }) = event
+        else {
+            panic!("expected RunFailed for a prompt with no provider");
+        };
+        assert_eq!(request_id, "req-1");
+        assert!(
+            error.contains("no AI provider configured"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A stored provider id that the current pi catalog no longer knows (e.g.
+    /// saved by an older build, then the dependency upgraded) must surface a
+    /// prompt failure — never wedge the request lock forever.
+    #[test]
+    fn prompt_with_stale_provider_id_fails_instead_of_wedging() {
+        let store = temp_store();
+        store
+            .set_config("active_provider", "opencode-go")
+            .expect("set provider");
+        store
+            .set_config("active_model", "deepseek-v4-flash")
+            .expect("set model");
+        store
+            .write_provider_credential(
+                "opencode-go",
+                &ProviderCredential {
+                    kind: "api_key".to_owned(),
+                    key: "sk-test".to_owned(),
+                },
+            )
+            .expect("write credential");
+
+        let runtime = PiAgentRuntime::start(store);
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::Prompt {
+                request_id: "req-stale".to_owned(),
+                session_id: "sess-1".to_owned(),
+                content: "hello".to_owned(),
+            })
+            .unwrap();
+
+        // Generous timeout: this is the exact scenario that wedged the user's
+        // app — if pi hangs resolving the unknown provider, this test hangs
+        // with it and the timeout failure names the bug.
+        let event = recv_until(&runtime, Duration::from_secs(90), |e| {
+            matches!(e, WorkerEvent::RunFailed { .. })
+        });
+        let Some(WorkerEvent::RunFailed { error, .. }) = event else {
+            panic!("prompt with a stale provider id must RunFailed, not wedge");
+        };
+        assert!(
+            !error.contains("no AI provider configured"),
+            "a provider IS configured (stale id) — the error should name the model/provider problem: {error}"
+        );
+    }
+
+    /// Saving an API key must leave the agent ready to prompt: provider
+    /// active AND a model selected. Without the auto-selected model every
+    /// prompt died with "no model configured" — the "AI is not working" bug.
+    #[test]
+    fn set_api_key_activates_provider_and_selects_a_model() {
+        let store = temp_store();
+        let runtime = PiAgentRuntime::start(store);
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::SetApiKey {
+                provider_id: "openai".to_owned(),
+                api_key: "sk-test".to_owned(),
+            })
+            .unwrap();
+
+        let event = recv_until(&runtime, Duration::from_secs(10), |e| {
+            matches!(e, WorkerEvent::ConfigChanged { .. })
+        });
+        let Some(WorkerEvent::ConfigChanged {
+            active_provider,
+            active_model,
+        }) = event
+        else {
+            panic!("expected ConfigChanged after SetApiKey");
+        };
+        assert_eq!(active_provider.as_deref(), Some("openai"));
+        let model = active_model.expect("a model must be auto-selected");
+        assert!(!model.is_empty(), "auto-selected model must not be empty");
+    }
+
+    #[test]
+    fn cancel_without_active_run_is_quiet() {
+        let runtime = PiAgentRuntime::start(temp_store());
+        let _ = runtime.try_recv();
+
+        runtime
+            .send(WorkerRequest::Cancel {
+                request_id: "ghost".to_owned(),
+                session_id: String::new(),
+            })
+            .unwrap();
+
+        let event = recv_until(&runtime, Duration::from_millis(300), |e| {
+            matches!(e, WorkerEvent::RunFailed { .. })
+        });
+        assert!(
+            event.is_none(),
+            "cancel with no active run must not fabricate a failure"
+        );
+    }
+
+    #[test]
+    fn cancel_is_not_blocked_by_a_busy_worker() {
+        let runtime = PiAgentRuntime::start(temp_store());
+        let _ = runtime.try_recv();
+
+        // Simulate a long-running prompt holding the request lock.
+        let guard = runtime.request_lock.lock().unwrap();
+        let started = Instant::now();
+        runtime
+            .send(WorkerRequest::Cancel {
+                request_id: "req-busy".to_owned(),
+                session_id: String::new(),
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        drop(guard);
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel must not queue behind the request lock (took {elapsed:?})"
+        );
+    }
 }

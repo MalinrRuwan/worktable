@@ -52,6 +52,9 @@ fn main() -> anyhow::Result<()> {
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
         init_theme(cx);
+        // The Tahoe radii must be applied once at startup too — the theme
+        // watcher callback only fires when the theme files change on disk.
+        apply_tahoe_radius(cx);
 
         // Keep the quit hook alive for the lifetime of the app.
         let tokio_for_quit = tokio.clone();
@@ -61,7 +64,7 @@ fn main() -> anyhow::Result<()> {
             let service = service_for_quit.clone();
             let tokio = tokio_for_quit.clone();
             async move {
-                let _ = tokio.block_on(service.shutdown());
+                tokio.block_on(service.shutdown());
             }
         });
         std::mem::forget(quit_subscription);
@@ -99,7 +102,7 @@ fn main() -> anyhow::Result<()> {
                 while let Some(command) = command_rx.recv().await {
                     let visible = visible_for_commands.clone();
                     let service = service_for_commands.clone();
-                    let _ = cx.update(move |cx| handle_command(command, cx, &visible, &service));
+                    cx.update(move |cx| handle_command(command, cx, &visible, &service));
                 }
             }
         })
@@ -123,10 +126,20 @@ fn init_theme(cx: &mut App) {
             // `apply_config` updates the component theme. Calling `change`
             // also refreshes GPUI Base's semantic tokens and scrollbars.
             Theme::change(mode, None, cx);
+            apply_tahoe_radius(cx);
         }
     }) {
         eprintln!("Worktable: failed to watch themes directory: {error}");
     }
+}
+
+/// macOS Tahoe (Liquid Glass) radius scale for every component control:
+/// buttons/inputs/switches at 10px, dialogs/popovers at 14px. Applied after
+/// any theme config load, which resets radii to the theme's own defaults.
+pub(crate) fn apply_tahoe_radius(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    theme.radius = px(10.);
+    theme.radius_lg = px(14.);
 }
 
 fn resolve_themes_dir() -> PathBuf {
@@ -138,12 +151,11 @@ fn resolve_themes_dir() -> PathBuf {
     }
 
     let mut candidates = Vec::new();
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent() {
             candidates.push(directory.join("../Resources/themes"));
             candidates.push(directory.join("../../themes"));
         }
-    }
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("themes"));
     }
@@ -197,12 +209,12 @@ fn handle_command(
         }
         AppCommand::CaptureText(text) => {
             if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
-                let _ = view.update(cx, |this, cx| this.add_captured_text(text, cx));
+                view.update(cx, |this, cx| this.add_captured_text(text, cx));
             }
         }
         AppCommand::CaptureImage { path, mime_type } => {
             if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
-                let _ = view.update(cx, |this, cx| this.add_captured_image(path, mime_type, cx));
+                view.update(cx, |this, cx| this.add_captured_image(path, mime_type, cx));
             }
         }
         AppCommand::Quit => cx.quit(),
@@ -226,12 +238,11 @@ fn toggle_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<Worktabl
 }
 
 fn open_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableService>) {
-    if cx.windows().is_empty() {
-        if let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
+    if cx.windows().is_empty()
+        && let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
             eprintln!("Worktable: failed to reopen window: {error:#}");
             return;
         }
-    }
     visible.store(true, Ordering::SeqCst);
     cx.activate(true);
 }
@@ -246,10 +257,17 @@ fn open_main_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(1080.), px(720.)),
+                size(px(390.), px(884.)),
                 cx,
             ))),
-            window_min_size: Some(size(px(390.), px(800.))),
+            window_min_size: Some(size(px(390.), px(600.))),
+            // Transparent titlebar so the app background paints through it —
+            // no visible seam between the title bar and the content.
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Worktable".into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
             ..WindowOptions::default()
         },
         move |window, cx| {

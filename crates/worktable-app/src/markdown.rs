@@ -57,26 +57,6 @@ pub fn render_markdown(text: &str, theme: &Theme) -> AnyElement {
     render_markdown_inner(&text, theme, false)
 }
 
-/// Render markdown that is expected to be a single inline line (e.g. an entry
-/// title / heading fallback). The output is a wrapping horizontal flex of
-/// inline spans, styled at `text_lg` by the caller. The caller should apply
-/// `.text_lg()` to the container if desired; this helper returns the raw
-/// inline children without an extra block gap.
-pub fn render_markdown_inline(text: &str, theme: &Theme) -> AnyElement {
-    // For a single line we reuse the same parser but post-process: if the
-    // markdown yields exactly one paragraph we unwrap its inline children.
-    // Otherwise we fall back to the block renderer — a heading containing a
-    // hard break is still valid markdown.
-    let text = emojify(text);
-    let blocks = parse_blocks(&text, theme);
-    if blocks.len() == 1 {
-        // `parse_blocks` wraps paragraphs in a flex-wrap div. That div is
-        // already an inline container — return it directly.
-        return blocks.into_iter().next().unwrap();
-    }
-    // Multiple blocks (e.g. heading + paragraph) — render as a tight v_flex.
-    v_flex().gap_1().children(blocks).into_any_element()
-}
 
 // ---------------------------------------------------------------------------
 // Core parser → element conversion
@@ -207,7 +187,6 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
                     let start_num = start.unwrap_or(1);
                     list_stack.push(ListInfo {
                         ordered,
-                        start: start_num,
                         next_index: start_num,
                     });
                 }
@@ -652,7 +631,6 @@ fn parse_blocks(text: &str, theme: &Theme) -> Vec<AnyElement> {
 
 struct ListInfo {
     ordered: bool,
-    start: u64,
     next_index: u64,
 }
 
@@ -688,6 +666,9 @@ fn flush_paragraph(
         .flex()
         .flex_wrap()
         .gap_1()
+        .w_full()
+        .min_w_0()
+        .max_w_full()
         .text_sm()
         .children(inline)
         .into_any_element();
@@ -882,6 +863,7 @@ fn render_inline_code(code: &str, theme: &Theme, link_dest: Option<String>) -> A
         .border_1()
         .border_color(theme.border.opacity(0.5))
         .text_xs()
+        .max_w_full()
         .font_family(theme.mono_font_family.clone())
         .text_color(theme.foreground)
         .child(code.to_owned());
@@ -901,7 +883,7 @@ fn styled_inline(
     is_strike: bool,
     link_dest: Option<String>,
 ) -> AnyElement {
-    let mut span = div().child(text);
+    let mut span = div().min_w_0().max_w_full().child(text);
 
     if is_bold {
         span = span.font_weight(gpui::FontWeight::BOLD);
@@ -968,7 +950,7 @@ fn render_table(rows: &[Vec<String>], theme: &Theme, blockquote_depth: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn whitespace_helper_exists() {
