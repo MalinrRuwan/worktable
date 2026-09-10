@@ -17,6 +17,10 @@ use uuid::Uuid;
 use worktable_ai::{WorktableEntry, WorktableRuntime};
 use worktable_events::WorktableEvent;
 
+/// Config key holding the JSON array of GitHub `full_name`s that have ever
+/// been imported as entries, so re-imports stay idempotent across deletes.
+const IMPORTED_STARS_CONFIG_KEY: &str = "github_imported_repos";
+
 pub type ListResult = Result<Vec<WorktableEntry>, String>;
 pub type EmptyResult = Result<(), String>;
 
@@ -26,7 +30,6 @@ pub enum AppCommand {
     ToggleWindow,
     OpenWindow,
     NewNote,
-    NewLink,
     CaptureText(String),
     CaptureImage { path: String, mime_type: String },
     Quit,
@@ -59,6 +62,9 @@ pub struct WorktableService {
 
 impl WorktableService {
     #[cfg(any(test, feature = "visual-tests"))]
+    // The main binary also compiles under `visual-tests`; only the visual
+    // runner and the test harness call this hermetic constructor.
+    #[allow(dead_code)]
     pub fn new_for_test(db_path: &str) -> anyhow::Result<Self> {
         let tokio = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -72,8 +78,8 @@ impl WorktableService {
         let entries = tokio
             .block_on(runtime.list_entries(500))
             .unwrap_or_default();
-        // Start AI worker so `has_ai_worker` is true in tests (best-effort).
-        let _ = tokio.block_on(runtime.start_ai_worker());
+        // Start AI worker so the runtime is prompt-ready in tests (best-effort).
+        start_ai_worker(&tokio, &runtime);
         let runtime = Some(Arc::new(runtime));
         let service = Self {
             tokio: tokio.clone(),
@@ -96,7 +102,7 @@ impl WorktableService {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        let (runtime, _persistent, seed) = bootstrap_runtime(&tokio);
+        let (runtime, seed) = bootstrap_runtime(&tokio);
 
         let service = Self {
             tokio,
@@ -134,11 +140,19 @@ impl WorktableService {
             .as_ref()
             .map(|r| r.database_path().to_owned())
             .unwrap_or_else(|| {
-                resolve_database_path().unwrap_or_else(|_| "/tmp/worktable.db".to_string())
+                resolve_database_path().unwrap_or_else(|_| {
+                    std::env::temp_dir()
+                        .join("worktable.db")
+                        .to_string_lossy()
+                        .into_owned()
+                })
             })
     }
 
-    pub fn has_ai_worker(&self) -> bool {
+    /// True when the persistent runtime (and therefore the AI worker host)
+    /// was connected at startup. The worker itself is started best-effort;
+    /// prompt submission surfaces its own errors if it is unavailable.
+    pub fn has_ai_runtime(&self) -> bool {
         self.runtime.is_some()
     }
 
@@ -237,6 +251,43 @@ impl WorktableService {
         .await
     }
 
+    /// Extract AI topics for knowledge-graph entries with the active provider.
+    /// Returns `(entry_id, topics)` pairs; empty when no provider is set up.
+    pub async fn enrich_topics(
+        &self,
+        entries: Vec<worktable_ai::WorktableEntry>,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        self.run_on_tokio(move |runtime| async move { runtime.enrich_topics(entries).await })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replace an entry's content (the detail editor's Save).
+    pub async fn update_entry(&self, entry: worktable_ai::WorktableEntry) -> EmptyResult {
+        if let Some(runtime) = self.runtime.clone() {
+            runtime
+                .update_entry(&entry)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            // In-memory fallback: replace by id.
+            let mut memory = self.memory.lock().await;
+            if let Some(existing) = memory.iter_mut().find(|item| item.id == entry.id) {
+                *existing = entry;
+            }
+            Ok(())
+        }
+    }
+
+    /// Abort the in-flight assistant run for a session.
+    pub async fn cancel_prompt(&self, session_id: &str) -> EmptyResult {
+        let session_id = session_id.to_owned();
+        self.run_on_tokio(
+            move |runtime| async move { runtime.cancel_prompt("", &session_id).await },
+        )
+        .await
+    }
+
     /// Select the active provider + model.
     pub async fn set_model(&self, provider_id: &str, model_id: &str) -> EmptyResult {
         let provider_id = provider_id.to_owned();
@@ -317,19 +368,32 @@ impl WorktableService {
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
 
-        let existing: std::collections::HashSet<String> = self
-            .list_entries()
+        // Import is idempotent by a persistent ledger, not just by what is
+        // currently visible: deleting an imported entry must not let the next
+        // import resurrect it as a duplicate. Entries imported before the
+        // ledger existed are folded in from the store itself.
+        let mut imported_names: std::collections::HashSet<String> = self
+            .get_config(IMPORTED_STARS_CONFIG_KEY)
             .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| entry.source == "github-star")
-            .filter_map(|entry| entry.title)
             .collect();
+        imported_names.extend(
+            self.list_entries()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| entry.source == "github-star")
+                .filter_map(|entry| entry.title),
+        );
 
         let mut imported = 0usize;
         let mut skipped = 0usize;
         for repo in starred {
-            if existing.contains(&repo.full_name) {
+            if imported_names.contains(&repo.full_name) {
                 skipped += 1;
                 continue;
             }
@@ -340,9 +404,8 @@ impl WorktableService {
                 .unwrap_or_else(|| repo.html_url.clone());
             let entry = WorktableEntry {
                 id: new_entry_id(),
-                kind: "link".to_owned(),
                 content,
-                title: Some(repo.full_name),
+                title: Some(repo.full_name.clone()),
                 source: "github-star".to_owned(),
                 created_at: if repo.starred_at_ms > 0 {
                     repo.starred_at_ms
@@ -351,15 +414,23 @@ impl WorktableService {
                 },
             };
             match self.insert_entry(entry).await {
-                Ok(()) => imported += 1,
+                Ok(()) => {
+                    imported += 1;
+                    imported_names.insert(repo.full_name);
+                }
                 Err(error) => {
-                    return Err(format!("imported {imported} before failing: {error}"));
+                    return Err(format!("Imported {imported} before failing: {error}"));
                 }
             }
         }
+
+        let mut names: Vec<String> = imported_names.into_iter().collect();
+        names.sort();
+        if let Ok(raw) = serde_json::to_string(&names) {
+            let _ = self.set_config(IMPORTED_STARS_CONFIG_KEY, &raw).await;
+        }
         Ok((imported, skipped))
     }
-
 
     pub async fn get_config(&self, key: &str) -> Result<Option<String>, String> {
         if let Some(runtime) = self.runtime.clone() {
@@ -497,18 +568,16 @@ impl WorktableService {
 }
 
 /// Create (and start) the `WorktableRuntime` backed by a local database file.
+/// Returns the runtime (when the database could be opened) and the entries
+/// loaded for the in-memory fallback store.
 fn bootstrap_runtime(
     tokio: &Arc<Runtime>,
-) -> (
-    Option<Arc<WorktableRuntime>>,
-    bool,
-    Option<Vec<WorktableEntry>>,
-) {
+) -> (Option<Arc<WorktableRuntime>>, Option<Vec<WorktableEntry>>) {
     let database_path = match resolve_database_path() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("Worktable: {error}");
-            return (None, false, None);
+            return (None, None);
         }
     };
 
@@ -516,7 +585,7 @@ fn bootstrap_runtime(
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("Worktable: failed to open database at {database_path}: {error:#}");
-            return (None, false, None);
+            return (None, None);
         }
     };
 
@@ -530,16 +599,17 @@ fn bootstrap_runtime(
 
     start_ai_worker(tokio, &runtime);
 
-    (Some(Arc::new(runtime)), true, Some(entries))
+    (Some(Arc::new(runtime)), Some(entries))
 }
 
 /// Resolve the local database file path: `WORKTABLE_DB_PATH` or
 /// `~/.worktable/worktable.db`.
 fn resolve_database_path() -> anyhow::Result<String> {
     if let Ok(path) = std::env::var("WORKTABLE_DB_PATH")
-        && !path.is_empty() {
-            return Ok(path);
-        }
+        && !path.is_empty()
+    {
+        return Ok(path);
+    }
 
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("neither WORKTABLE_DB_PATH nor HOME is set"))?;
@@ -566,7 +636,6 @@ pub fn unix_time_ms() -> i64 {
 pub fn new_entry_id() -> String {
     Uuid::new_v4().to_string()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -632,7 +701,8 @@ mod tests {
 
     impl Drop for MockGithub {
         fn drop(&mut self) {
-            self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -685,13 +755,16 @@ mod tests {
         let entries = block_on_no_reactor(service.list_entries()).expect("list");
         assert_eq!(entries.len(), 2);
 
-        let by_title = |t: &str| entries.iter().find(|e| e.title.as_deref() == Some(t)).unwrap();
+        let by_title = |t: &str| {
+            entries
+                .iter()
+                .find(|e| e.title.as_deref() == Some(t))
+                .unwrap()
+        };
         let gpui_entry = by_title("zed-industries/gpui");
-        assert_eq!(gpui_entry.kind, "link");
         assert_eq!(gpui_entry.source, "github-star");
         assert_eq!(
-            gpui_entry.content,
-            "Fast, productive tooling for building native apps",
+            gpui_entry.content, "Fast, productive tooling for building native apps",
             "description becomes the entry content"
         );
         assert_eq!(
@@ -730,6 +803,29 @@ mod tests {
 
         let entries = block_on_no_reactor(service.list_entries()).expect("list");
         assert_eq!(entries.len(), 2, "no duplicates created");
+
+        // Deleting an imported entry must not resurrect it later: the ledger
+        // remembers every repo that was imported, not just what is visible.
+        for entry in entries {
+            block_on_no_reactor(service.delete_entry(&entry.id)).expect("delete");
+        }
+        assert!(
+            block_on_no_reactor(service.list_entries())
+                .expect("list")
+                .is_empty(),
+            "entries are deleted"
+        );
+        let third = block_on_no_reactor(service.import_starred_repos_with_base(
+            "octocat",
+            None,
+            &mock.base_url(),
+        ))
+        .expect("third import after delete");
+        assert_eq!(
+            third,
+            (0, 2),
+            "a deleted star stays imported (idempotent across deletes)"
+        );
     }
 
     /// HTTP failures surface as errors, never panics.

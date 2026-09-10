@@ -5,7 +5,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -69,7 +69,6 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS wt_entries (
         id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK (kind IN ('text', 'link', 'image')),
         content TEXT NOT NULL,
         title TEXT,
         source TEXT NOT NULL,
@@ -97,7 +96,6 @@ const MIGRATIONS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
-    pub kind: String,
     pub content: String,
     pub title: Option<String>,
     pub source: String,
@@ -187,6 +185,18 @@ impl SqliteStore {
                 .with_context(|| format!("failed to record migration {version}"))?;
         }
 
+        // The entry category was removed from the product; drop the legacy
+        // column so old databases match the new schema.
+        let has_kind = connection
+            .prepare("SELECT 1 FROM pragma_table_info('wt_entries') WHERE name = 'kind'")
+            .and_then(|mut statement| statement.exists([]))
+            .unwrap_or(false);
+        if has_kind {
+            connection
+                .execute("ALTER TABLE wt_entries DROP COLUMN kind", [])
+                .context("failed to drop the legacy entry kind column")?;
+        }
+
         Ok(())
     }
 
@@ -195,7 +205,7 @@ impl SqliteStore {
         let connection = self.connection.lock().expect("sqlite lock poisoned");
         let mut statement = connection
             .prepare(
-                "SELECT id, kind, content, title, source, created_at
+                "SELECT id, content, title, source, created_at
                  FROM wt_entries
                  ORDER BY created_at DESC
                  LIMIT ?",
@@ -209,11 +219,10 @@ impl SqliteStore {
         while let Some(row) = rows.next().context("failed to read a Worktable entry")? {
             entries.push(Entry {
                 id: row.get(0).context("invalid entry id")?,
-                kind: row.get(1).context("invalid entry kind")?,
-                content: row.get(2).context("invalid entry content")?,
-                title: row.get(3).context("invalid entry title")?,
-                source: row.get(4).context("invalid entry source")?,
-                created_at: row.get(5).context("invalid entry timestamp")?,
+                content: row.get(1).context("invalid entry content")?,
+                title: row.get(2).context("invalid entry title")?,
+                source: row.get(3).context("invalid entry source")?,
+                created_at: row.get(4).context("invalid entry timestamp")?,
             });
         }
 
@@ -225,11 +234,10 @@ impl SqliteStore {
         connection
             .execute(
                 "INSERT INTO wt_entries
-                    (id, kind, content, title, source, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                    (id, content, title, source, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
                 params![
                     entry.id.clone(),
-                    entry.kind.clone(),
                     entry.content.clone(),
                     entry.title.clone(),
                     entry.source.clone(),
@@ -246,6 +254,19 @@ impl SqliteStore {
         connection
             .execute("DELETE FROM wt_entries WHERE id = ?", [id])
             .context("failed to delete Worktable entry")?;
+
+        Ok(())
+    }
+
+    /// Replace an entry's content (the detail editor's Save).
+    pub fn update_entry_content(&self, id: &str, content: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection
+            .execute(
+                "UPDATE wt_entries SET content = ? WHERE id = ?",
+                params![content, id],
+            )
+            .context("failed to update Worktable entry")?;
 
         Ok(())
     }
@@ -646,6 +667,17 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Replace an entry's content (the detail editor's Save).
+    pub fn update_entry_content(&self, id: &str, content: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        if let Some(entry) = inner.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.content = content.to_owned();
+        }
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
     pub fn ensure_session(
         &self,
         session_id: &str,
@@ -913,7 +945,6 @@ mod tests {
     fn entry(id: &str, created_at: i64) -> Entry {
         Entry {
             id: id.to_owned(),
-            kind: "text".to_owned(),
             content: format!("content of {id}"),
             title: None,
             source: "Worktable".to_owned(),
@@ -951,55 +982,79 @@ mod tests {
         store.ensure_session("s", None, 1_000).unwrap();
 
         // First claim wins.
-        assert!(store
-            .claim_session_lease("s", "owner-1", "run-1", 1_000, 31_000)
-            .unwrap());
+        assert!(
+            store
+                .claim_session_lease("s", "owner-1", "run-1", 1_000, 31_000)
+                .unwrap()
+        );
         // A different owner/run cannot claim while the lease is live.
-        assert!(!store
-            .claim_session_lease("s", "owner-2", "run-2", 2_000, 32_000)
-            .unwrap());
+        assert!(
+            !store
+                .claim_session_lease("s", "owner-2", "run-2", 2_000, 32_000)
+                .unwrap()
+        );
         // Even the same owner with a *different* run cannot steal it.
-        assert!(!store
-            .claim_session_lease("s", "owner-1", "run-9", 2_000, 32_000)
-            .unwrap());
+        assert!(
+            !store
+                .claim_session_lease("s", "owner-1", "run-9", 2_000, 32_000)
+                .unwrap()
+        );
         // The holder can re-claim (idempotent renew-style claim).
-        assert!(store
-            .claim_session_lease("s", "owner-1", "run-1", 2_000, 32_000)
-            .unwrap());
+        assert!(
+            store
+                .claim_session_lease("s", "owner-1", "run-1", 2_000, 32_000)
+                .unwrap()
+        );
         // After expiry (lease_until 32_000 <= now 40_000), someone else can claim.
-        assert!(store
-            .claim_session_lease("s", "owner-2", "run-2", 40_000, 70_000)
-            .unwrap());
+        assert!(
+            store
+                .claim_session_lease("s", "owner-2", "run-2", 40_000, 70_000)
+                .unwrap()
+        );
         // Release requires the exact owner+run.
-        assert!(!store
-            .release_session_lease("s", "owner-1", "run-1")
-            .unwrap());
-        assert!(store
-            .release_session_lease("s", "owner-2", "run-2")
-            .unwrap());
+        assert!(
+            !store
+                .release_session_lease("s", "owner-1", "run-1")
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_session_lease("s", "owner-2", "run-2")
+                .unwrap()
+        );
         // Freed: a fresh claim succeeds.
-        assert!(store
-            .claim_session_lease("s", "owner-3", "run-3", 50_000, 80_000)
-            .unwrap());
+        assert!(
+            store
+                .claim_session_lease("s", "owner-3", "run-3", 50_000, 80_000)
+                .unwrap()
+        );
     }
 
     #[test]
     fn lease_renewal_requires_holder_identity() {
         let store = store();
         store.ensure_session("s", None, 1_000).unwrap();
-        assert!(store
-            .claim_session_lease("s", "owner-1", "run-1", 1_000, 2_000)
-            .unwrap());
+        assert!(
+            store
+                .claim_session_lease("s", "owner-1", "run-1", 1_000, 2_000)
+                .unwrap()
+        );
 
-        assert!(store
-            .renew_session_lease("s", "owner-1", "run-1", 1_500, 3_000)
-            .unwrap());
-        assert!(!store
-            .renew_session_lease("s", "owner-2", "run-1", 1_500, 3_000)
-            .unwrap());
-        assert!(!store
-            .renew_session_lease("s", "owner-1", "run-2", 1_500, 3_000)
-            .unwrap());
+        assert!(
+            store
+                .renew_session_lease("s", "owner-1", "run-1", 1_500, 3_000)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_session_lease("s", "owner-2", "run-1", 1_500, 3_000)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .renew_session_lease("s", "owner-1", "run-2", 1_500, 3_000)
+                .unwrap()
+        );
     }
 
     #[test]

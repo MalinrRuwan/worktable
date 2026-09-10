@@ -15,7 +15,6 @@ pub struct GithubRepo {
 pub struct StarredRepo {
     pub full_name: String,
     pub description: Option<String>,
-    pub stars: u64,
     pub html_url: String,
     /// Unix epoch milliseconds of GitHub's `starred_at`.
     pub starred_at_ms: i64,
@@ -26,6 +25,15 @@ struct StarredResponse {
     #[serde(default)]
     starred_at: String,
     repo: RepoResponse,
+}
+
+/// Log the raw response body for diagnostics while keeping it out of the
+/// user-facing error copy (`worktable_view` displays these errors directly).
+fn log_api_body(context: &str, body: &str) {
+    let body = body.trim();
+    if !body.is_empty() {
+        eprintln!("Worktable: {context}: {body}");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,13 +49,15 @@ struct RepoResponse {
     html_url: String,
 }
 
-/// Fetch all public repos for `username` and return total stars + per-repo breakdown.
+/// Fetch the repositories `username` **starred** and return their total stars
+/// plus a per-repo breakdown.
 ///
-/// - Uses `https://api.github.com/users/{username}/repos?per_page=100&page=N`
+/// - Uses `https://api.github.com/users/{username}/starred?per_page=100&page=N`
+///   with `application/vnd.github.star+json` so `starred_at` comes along.
 /// - Handles pagination via `Link` header (`rel="next"`) and via `len < 100` heuristic.
 /// - Sends `User-Agent: Worktable/0.1.0` (required by GitHub API).
 /// - If `token` is `Some`, sends `Authorization: Bearer <token>` (raises anon limit 60/h → 5000/h).
-/// - Returns `(total_stars, repos_sorted_by_stars_desc)`.
+/// - Returns `(total_stars, starred_repos_sorted_by_stars_desc)`.
 pub async fn fetch_github_stars(
     username: &str,
     token: Option<String>,
@@ -71,14 +81,14 @@ pub async fn fetch_github_stars(
 
     loop {
         let url = format!(
-            "https://api.github.com/users/{}/repos?per_page=100&page={}&type=owner&sort=updated",
+            "https://api.github.com/users/{}/starred?per_page=100&page={}",
             username, page
         );
 
         let mut req = client
             .get(&url)
             .header("User-Agent", "Worktable/0.1.0")
-            .header("Accept", "application/vnd.github+json")
+            .header("Accept", "application/vnd.github.star+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
 
         if let Some(ref t) = token {
@@ -95,18 +105,18 @@ pub async fn fetch_github_stars(
 
         if status.as_u16() == 404 {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub user '{}' not found (404). {}", username, body);
+            log_api_body("GitHub user lookup returned 404", &body);
+            anyhow::bail!("GitHub user '{username}' not found.");
         }
         if status.as_u16() == 401 {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "GitHub authentication failed (401). Check GITHUB_TOKEN. {}",
-                body
-            );
+            log_api_body("GitHub authentication returned 401", &body);
+            anyhow::bail!("GitHub authentication failed. Check GITHUB_TOKEN.");
         }
         if status.as_u16() == 403 {
             let body = resp.text().await.unwrap_or_default();
-            // 403 is most often rate limiting when anon (60/h). Surface rate-limit headers if present.
+            // 403 is most often rate limiting when anonymous (60/h). Log the
+            // rate-limit headers, but keep user copy actionable.
             let remaining = headers
                 .get("x-ratelimit-remaining")
                 .and_then(|v| v.to_str().ok())
@@ -115,16 +125,16 @@ pub async fn fetch_github_stars(
                 .get("x-ratelimit-reset")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("?");
-            anyhow::bail!(
-                "GitHub API forbidden (403). Rate limit remaining={} reset={}. Body: {} — try setting GITHUB_TOKEN for 5000/h.",
-                remaining,
-                reset,
-                body
+            log_api_body(
+                &format!("GitHub API returned 403 (remaining={remaining} reset={reset})"),
+                &body,
             );
+            anyhow::bail!("GitHub API rate limit reached. Set GITHUB_TOKEN to raise it.");
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error {}: {}", status, body);
+            log_api_body(&format!("GitHub API returned {status}"), &body);
+            anyhow::bail!("GitHub API error {status}.");
         }
 
         let remaining = headers
@@ -132,15 +142,20 @@ pub async fn fetch_github_stars(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let repos: Vec<RepoResponse> = resp
-            .json::<Vec<RepoResponse>>()
+        let repos: Vec<StarredResponse> = resp
+            .json::<Vec<StarredResponse>>()
             .await
             .context("failed to parse GitHub response")?;
 
         let repos_len = repos.len();
-        for r in repos {
+        for item in repos {
+            let r = item.repo;
             all_repos.push(GithubRepo {
-                name: r.name,
+                name: if r.full_name.is_empty() {
+                    r.name
+                } else {
+                    r.full_name
+                },
                 stars: r.stargazers_count,
                 html_url: r.html_url,
             });
@@ -173,12 +188,10 @@ pub async fn fetch_github_stars(
         if repos_len == 100 {
             // Check remaining header to avoid hammering when rate limited.
             if let Some(rem) = remaining.as_deref().and_then(|s| s.parse::<i32>().ok())
-                && rem <= 1 {
-                    anyhow::bail!(
-                        "GitHub rate limit nearly exhausted (remaining={}). Set GITHUB_TOKEN to increase limit.",
-                        rem
-                    );
-                }
+                && rem <= 1
+            {
+                anyhow::bail!("GitHub rate limit nearly exhausted. Set GITHUB_TOKEN to raise it.");
+            }
             page += 1;
             if page > 20 {
                 break;
@@ -193,25 +206,10 @@ pub async fn fetch_github_stars(
 
     let total: u64 = all_repos.iter().map(|r| r.stars).sum();
 
-    if all_repos.is_empty() {
-        // Could be a valid user with 0 public repos — not an error, just total 0.
-        // Caller will show "0 stars" and empty list.
-    }
-
     Ok((total, all_repos))
 }
 
-/// Fetch the repositories `username` starred, newest star first, including
-/// the star timestamp (`Accept: application/vnd.github.star+json`) and each
-/// repo's description — everything an entry import needs.
-pub async fn fetch_starred_repos(
-    username: &str,
-    token: Option<String>,
-) -> anyhow::Result<Vec<StarredRepo>> {
-    fetch_starred_repos_with_base(username, token, "https://api.github.com").await
-}
-
-/// Test seam for [`fetch_starred_repos`]: the API root is injectable so the
+/// Fetch the starred repositories with an injectable API root, so the
 /// parsing/pagination path can be exercised against a local mock server.
 pub async fn fetch_starred_repos_with_base(
     username: &str,
@@ -245,7 +243,8 @@ pub async fn fetch_starred_repos_with_base(
             .header("Accept", "application/vnd.github.star+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
         if let Some(ref t) = token
-            && !t.trim().is_empty() {
+            && !t.trim().is_empty()
+        {
             req = req.header("Authorization", format!("Bearer {}", t.trim()));
         }
 
@@ -253,11 +252,12 @@ pub async fn fetch_starred_repos_with_base(
         let status = resp.status();
         let headers = resp.headers().clone();
         if status.as_u16() == 404 {
-            anyhow::bail!("GitHub user '{}' not found (404)", username);
+            anyhow::bail!("GitHub user '{username}' not found.");
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error {}: {}", status, body);
+            log_api_body(&format!("GitHub starred API returned {status}"), &body);
+            anyhow::bail!("GitHub API error {status}.");
         }
 
         let items: Vec<StarredResponse> = resp
@@ -274,7 +274,6 @@ pub async fn fetch_starred_repos_with_base(
             all.push(StarredRepo {
                 full_name,
                 description: item.repo.description,
-                stars: item.repo.stargazers_count,
                 html_url: item.repo.html_url,
                 starred_at_ms: crate::format::iso8601_to_epoch_ms(&item.starred_at)
                     .unwrap_or_default(),
@@ -293,13 +292,22 @@ pub async fn fetch_starred_repos_with_base(
     }
 
     // Newest stars first.
-    all.sort_by(|a, b| b.starred_at_ms.cmp(&a.starred_at_ms));
+    all.sort_by_key(|repo| std::cmp::Reverse(repo.starred_at_ms));
     Ok(all)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starred_response_deser_keeps_full_name_and_stars() {
+        let json = r#"[{"starred_at":"2025-01-02T03:04:05Z","repo":{"name":"gpui","full_name":"zed-industries/gpui","description":null,"stargazers_count":1234,"html_url":"https://github.com/zed-industries/gpui"}}]"#;
+        let items: Vec<StarredResponse> = serde_json::from_str(json).unwrap();
+        assert_eq!(items[0].repo.full_name, "zed-industries/gpui");
+        assert_eq!(items[0].repo.stargazers_count, 1234);
+        assert!(!items[0].starred_at.is_empty());
+    }
 
     #[test]
     fn repo_response_deser() {

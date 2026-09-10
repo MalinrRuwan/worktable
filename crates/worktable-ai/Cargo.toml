@@ -5,16 +5,20 @@ edition = "2024"
 
 [dependencies]
 
-pi_agent_rust = "0.1.23"
-asupersync = "0.3.9"
+rig = "0.42"
 anyhow = "1"
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
-async-trait = "0.1"
 worktable-db = { path = "../worktable-db" }
 worktable-events = { path = "../worktable-events" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 worktable-helix = { path = "../worktable-helix" }
+
+[dev-dependencies]
+# `MockCompletionModel` / `MockStreamEvent`: scripted in-process turns for the
+# agent-loop tests. No provider is ever called.
+rig = { version = "0.42", features = ["test-utils"] }

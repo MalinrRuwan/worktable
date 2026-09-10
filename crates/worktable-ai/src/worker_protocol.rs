@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub use worktable_events::KnowledgeCitation;
 use worktable_events::{AuthNotifyKind, AuthPromptKind, ProvidersSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +68,20 @@ pub enum WorkerEvent {
         session_id: String,
         tool_call_id: String,
         name: String,
+    },
+    /// A tool call finished executing; the app clears its in-flight row.
+    ToolFinished {
+        request_id: String,
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+    },
+    /// Numbered `search_knowledge` hits for this run, emitted once the stream
+    /// ends. The app attaches them to the answer that carries `[n]` markers.
+    Citations {
+        request_id: String,
+        session_id: String,
+        citations: Vec<KnowledgeCitation>,
     },
     RunCompleted {
         request_id: String,

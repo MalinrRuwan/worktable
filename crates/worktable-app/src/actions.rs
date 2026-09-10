@@ -11,8 +11,6 @@ actions!(
     [
         /// Create a new text note (⌘N)
         NewNote,
-        /// Create a new link entry (⌘L)
-        NewLink,
         /// Focus the search field (⌘F)
         FocusSearch,
         /// Jump to the entries section (⌘1)
@@ -21,8 +19,6 @@ actions!(
         ShowAssistant,
         /// Open the AI provider settings panel (⌘,)
         ShowSettings,
-        /// Toggle the sidebar (⌘⇧S)
-        ToggleSidebar,
         /// Delete the selected entry (⌫)
         DeleteEntry,
         /// Open the selected entry (⏎ / ⌘O)
@@ -39,10 +35,24 @@ actions!(
         ToggleTheme,
         /// Toggle the main window visibility (menu-bar icon)
         ToggleWindow,
+        /// Show the standard About panel
+        About,
+        /// Hide the application
+        Hide,
+        /// Hide every other application
+        HideOthers,
+        /// Reveal all hidden applications
+        ShowAll,
+        /// Minimize the main window
+        MinimizeWindow,
+        /// Zoom the main window
+        ZoomWindow,
         /// Quit the application
         Quit,
         /// Clear the active search
         ClearSearch,
+        /// Close the fullscreen image viewer (⎋)
+        CloseImageViewer,
         /// Move the entry selection up
         SelectPrevious,
         /// Move the entry selection down

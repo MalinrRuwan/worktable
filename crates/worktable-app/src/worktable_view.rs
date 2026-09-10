@@ -1,6 +1,7 @@
 //! The main Worktable view: sidebar navigation, searchable entries list,
 //! inline composer, the AI assistant pane, and the AI provider settings panel.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -8,30 +9,43 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnimationExt as _, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
-    FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    Pixels, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Subscription,
-    Window, div, px, relative, size,
+    AnimationExt as _, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Entity,
+    ExternalPaths, FocusHandle, Focusable, ImageSource, InteractiveElement as _, IntoElement,
+    MouseButton, MouseMoveEvent, MousePressureEvent, ObjectFit, ParentElement as _, Pixels, Point,
+    PressureStage, Render, Role, ScrollHandle, SharedString, Size, StatefulInteractiveElement as _,
+    Styled, StyledImage as _, Subscription, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point,
+    rems, size,
 };
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::dialog::DialogFooter;
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::list::ListItem;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::switch::Switch;
+use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, VirtualListScrollHandle, h_flex, v_flex,
-    v_virtual_list,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, VirtualListScrollHandle,
+    WindowExt as _, h_flex, v_flex, v_virtual_list,
 };
+
+use crate::design;
 use worktable_ai::WorktableEntry;
 use worktable_events::{
-    AuthNotifyKind, AuthPromptKind, ProviderInfo, ProvidersSnapshot, WorktableEvent,
+    AuthNotifyKind, AuthPromptKind, KnowledgeCitation, ProviderInfo, ProvidersSnapshot,
+    WorktableEvent,
 };
+use worktable_ui::citations::CitationOpenHandler;
 use worktable_ui::{
-    BOBBING_DOTS, TEXT_DOTS, ZERON_PULSE, fade_in, fade_quick, hover_blend, hover_fades_active,
+    CitationRef, Orb, OrbVariant, TEXT_DOTS, fade_in, fade_quick, hover_blend, hover_fades_active,
     hover_listener, pulse_delta, splash_out,
 };
 
-use crate::assistant::{ChatMessage, Role, render_message, welcome_panel};
+use crate::assistant::{
+    ChatMessage, MessageOptions, Role as ChatRole, ThinkingToggle as ToggleThinking,
+    render_message, welcome_panel,
+};
 use crate::service::WorktableService;
 
 #[cfg(test)]
@@ -43,43 +57,75 @@ pub enum AppMode {
     Entries,
     Assistant,
     Settings,
-    ProviderConfig,
-    GithubStars,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SettingsTab {
-    Ui,
+    Appearance,
     Data,
     Providers,
 }
 
-/// Provider rows are two lines (name + badges, then controls); they grow
-/// when the API-key field is expanded.
-const PROVIDER_ROW_HEIGHT: f32 = 92.0;
-const PROVIDER_ROW_EXPANDED_HEIGHT: f32 = 148.0;
-/// At or above this window width the app uses the desktop layout (navigation
-/// sidebar); below it the phone-style sliding panes are used.
-const WIDE_LAYOUT_MIN_WIDTH: f32 = 720.0;
-/// Reading-column cap so content stays comfortable on very wide windows.
-const CONTENT_MAX_WIDTH: f32 = 720.0;
+impl SettingsTab {
+    fn title(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance => "Appearance",
+            SettingsTab::Data => "Data",
+            SettingsTab::Providers => "Providers",
+        }
+    }
 
-/// Corner-radius scale (macOS Tahoe / Liquid Glass): rounder, consistent
-/// corners across every surface. One scale, referenced everywhere — a radius
-/// change is a one-line edit per tier.
-const RADIUS_CHIP: f32 = 6.0;
-const RADIUS_ROW: f32 = 8.0;
-const RADIUS_CONTROL: f32 = 10.0;
-const RADIUS_CARD: f32 = 12.0;
-const RADIUS_MENU: f32 = 14.0;
+    fn description(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance => "Theme and assistant display",
+            SettingsTab::Data => "GitHub stars and imports",
+            SettingsTab::Providers => "AI providers, models, and API keys",
+        }
+    }
+}
 
-/// Fixed heights for the virtualized entries list: every card occupies the
-/// same row height (content is line-clamped to fit), headers are slimmer.
-const ENTRY_CARD_HEIGHT: f32 = 108.0;
-const SECTION_HEADER_HEIGHT: f32 = 30.0;
-
+/// Theme selection: light, dark, or follow the system appearance.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[derive(Default)]
+pub(crate) enum AppThemeMode {
+    Light,
+    Dark,
+    System,
+}
+
+impl AppThemeMode {
+    fn as_config(self) -> &'static str {
+        match self {
+            AppThemeMode::Light => "light",
+            AppThemeMode::Dark => "dark",
+            AppThemeMode::System => "system",
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "light" => Some(AppThemeMode::Light),
+            "dark" => Some(AppThemeMode::Dark),
+            "system" => Some(AppThemeMode::System),
+            _ => None,
+        }
+    }
+}
+
+/// Full-content entry view: a morph from the card's rect to the middle of the
+/// UI (transitions.dev-style; GPUI has no scale, so it tweens the rect and
+/// fades the content in).
+pub(crate) struct EntryModalState {
+    pub(crate) entry_id: String,
+    pub(crate) origin: Bounds<Pixels>,
+    pub(crate) opened_at: Instant,
+    pub(crate) closing_at: Option<Instant>,
+}
+
+/// Fixed heights for the virtualized lists live in [`crate::design`] as rems
+/// so they zoom with the interface; [`crate::design::to_pixels`] resolves them
+/// at render time.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum SortMode {
     #[default]
     Time,
@@ -87,16 +133,20 @@ pub(crate) enum SortMode {
     Topic,
 }
 
-
-fn app_icon(name: IconName) -> Icon {
-    Icon::new(name).size(px(16.))
+impl SortMode {
+    /// The direction a mode starts in when the user switches to it: recency
+    /// reads newest first, while the alphabetical orders read A to Z. Clicking
+    /// the already-active mode flips from there.
+    pub(crate) const fn default_ascending(self) -> bool {
+        match self {
+            SortMode::Time => false,
+            SortMode::Alpha | SortMode::Topic => true,
+        }
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ComposerKind {
-    Note,
-    Link,
-    Image,
+fn app_icon(name: IconName) -> Icon {
+    Icon::new(name).size_4()
 }
 
 /// An interactive prompt the worker is waiting on during OAuth login.
@@ -125,23 +175,53 @@ pub struct WorktableView {
     selected_anchor: Option<String>,
     pub(crate) search_input: Entity<InputState>,
     pub(crate) query: String,
+    /// Set when Tab selects "Ask agent" from the search field; Enter then runs
+    /// the query as a prompt.
+    /// The full-content entry view, when open (or playing its close morph).
+    pub(crate) entry_modal: Option<EntryModalState>,
+    /// Draft editor for the entry view's Edit mode.
+    entry_edit_input: Entity<TextareaState>,
+    /// Whether the entry view is showing the markdown editor.
+    pub(crate) entry_editing: bool,
+    entry_edit_status: Option<String>,
+    /// Live prepainted bounds per entry card, keyed by entry id, in window
+    /// coordinates. The morph starts and ends on the actual card.
+    /// `Rc<RefCell<..>>` because prepaint writers must not mutate view state
+    /// (or notify) mid-render.
+    pub(crate) card_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    /// The content column's top-left in window coordinates. The column is
+    /// centered on wide windows, so card/click positions must be converted to
+    /// the column's local space before positioning the morph overlay.
+    content_origin: Rc<Cell<Point<Pixels>>>,
+    /// Last pointer position inside the library; the morph origin fallback
+    /// for triggers that carry no position (context menu, keyboard).
+    pointer_position: Point<Pixels>,
+    /// When the Entries ⇄ Agent page transition started; `None` at rest.
+    page_anim_at: Option<Instant>,
 
     // Composer
-    pub(crate) composer: Option<ComposerKind>,
     composer_body: Entity<InputState>,
     assistant_input: Entity<InputState>,
 
     // Assistant
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) assistant_busy: bool,
+    /// Scroll position of the assistant transcript (explicit scrollbar).
+    assistant_scroll: ScrollHandle,
+    /// Name of the tool currently executing, rendered as an orb status row.
+    pub(crate) active_tool: Option<String>,
+    /// `search_knowledge` hits waiting to be attached to the answer.
+    pending_citations: Vec<KnowledgeCitation>,
+    /// Whether the assistant's reasoning is rendered (Settings → UI toggle).
+    pub(crate) show_thinking: bool,
 
     // Provider settings
-    providers: Vec<ProviderInfo>,
+    pub(crate) providers: Vec<ProviderInfo>,
     provider_models: HashMap<String, Arc<Vec<(String, String)>>>,
     active_provider: Option<String>,
     active_model: Option<String>,
     providers_loading: bool,
-    /// Provider whose API key input is currently shown.
+    /// Provider whose configuration dialog is open, if any.
     api_key_provider: Option<String>,
     api_key_input: Entity<InputState>,
     logging_in: HashSet<String>,
@@ -149,6 +229,8 @@ pub struct WorktableView {
     prompt_input: Entity<InputState>,
     auth_notice: Option<AuthNotice>,
     settings_status: Option<String>,
+    /// Feedback from actions inside the provider configuration dialog.
+    provider_dialog_status: Option<String>,
 
     // GitHub Stars
     github_input: Entity<InputState>,
@@ -159,21 +241,31 @@ pub struct WorktableView {
     github_error: Option<String>,
 
     // Helix embedded graph
-    helix_building: bool,
-    helix_status: Option<String>,
+    pub(crate) knowledge_building: bool,
+    pub(crate) knowledge_status: Option<String>,
+    /// Set to stop a running knowledge build (button clicked again).
+    knowledge_cancel: Arc<std::sync::atomic::AtomicBool>,
 
     /// Set when a stored provider was found to be stale and auto-cleared;
     /// drives the assistant's "provider was removed — pick a new one" note.
     stale_provider_cleared: bool,
 
+    /// Locally extracted primary topic per entry id, rebuilt whenever entries
+    /// change. Topic grouping reads this instead of re-extracting per frame.
+    topic_cache: HashMap<String, String>,
+    /// Topics from the knowledge graph (AI-named once a build enriched them).
+    /// These win over the local cache, so grouping and search use the graph's
+    /// vocabulary.
+    graph_topics: HashMap<String, String>,
+
     // UI state
-    pub(crate) library_menu_open: bool,
     pub(crate) sort_mode: SortMode,
-    pub(crate) dark_mode: bool,
-    settings_tab: SettingsTab,
-    settings_scroll: VirtualListScrollHandle,
-    provider_row_sizes: Rc<Vec<Size<Pixels>>>,
-    entries_scroll: VirtualListScrollHandle,
+    /// Sort direction. Clicking the already-active sort mode flips this.
+    pub(crate) sort_ascending: bool,
+    pub(crate) theme_mode: AppThemeMode,
+    /// `None` shows the Settings category list; `Some` a category page.
+    settings_tab: Option<SettingsTab>,
+    pub(crate) entries_scroll: VirtualListScrollHandle,
     /// When the entries list last gained a new top entry — drives the
     /// "existing list glides down while the new card fades in" entrance.
     list_insert_at: Option<Instant>,
@@ -194,12 +286,10 @@ impl WorktableView {
         let focus_handle = cx.focus_handle();
         let search_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search")
+                .placeholder("Search entries")
                 .clean_on_escape()
         });
-        let composer_body = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Add a note or a prompt (development)")
-        });
+        let composer_body = cx.new(|cx| InputState::new(window, cx).placeholder("Add a note"));
         let assistant_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Ask your notes…")
@@ -220,6 +310,8 @@ impl WorktableView {
                 .placeholder("GitHub username…")
                 .submit_on_enter(false)
         });
+        let entry_edit_input =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder("Write markdown…"));
 
         let mut view = Self {
             service,
@@ -230,11 +322,22 @@ impl WorktableView {
             selected_anchor: None,
             search_input,
             query: String::new(),
-            composer: None,
+            entry_modal: None,
+            entry_edit_input,
+            entry_editing: false,
+            entry_edit_status: None,
+            card_bounds: Rc::new(RefCell::new(HashMap::new())),
+            content_origin: Rc::new(Cell::new(point(Pixels::ZERO, Pixels::ZERO))),
+            pointer_position: point(Pixels::ZERO, Pixels::ZERO),
+            page_anim_at: None,
             composer_body,
             assistant_input,
             messages: Vec::new(),
             assistant_busy: false,
+            assistant_scroll: ScrollHandle::new(),
+            active_tool: None,
+            pending_citations: Vec::new(),
+            show_thinking: false,
             providers: Vec::new(),
             provider_models: HashMap::new(),
             active_provider: None,
@@ -247,21 +350,23 @@ impl WorktableView {
             prompt_input,
             auth_notice: None,
             settings_status: None,
+            provider_dialog_status: None,
             github_input,
             github_username: None,
             github_total_stars: None,
             github_repos: Vec::new(),
             github_loading: false,
             github_error: None,
-            helix_building: false,
+            knowledge_building: false,
+            knowledge_status: None,
+            knowledge_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stale_provider_cleared: false,
-            helix_status: None,
-            library_menu_open: false,
+            topic_cache: HashMap::new(),
+            graph_topics: HashMap::new(),
             sort_mode: SortMode::Time,
-            dark_mode: false,
-            settings_tab: SettingsTab::Ui,
-            settings_scroll: VirtualListScrollHandle::new(),
-            provider_row_sizes: Rc::new(Vec::new()),
+            sort_ascending: SortMode::Time.default_ascending(),
+            theme_mode: AppThemeMode::System,
+            settings_tab: None,
             entries_scroll: VirtualListScrollHandle::new(),
             list_insert_at: None,
             recent_entry_id: None,
@@ -276,23 +381,26 @@ impl WorktableView {
         view.load_entries(cx);
         view.refresh_providers(cx);
         view.load_github_username(cx);
+        view.load_preferences(window, cx);
+        view.load_knowledge_topics(cx);
         view
-    }
-
-    fn save_ui_setting(&self, key: &str, value: &str, cx: &mut Context<Self>) {
-        let service = Arc::clone(&self.service);
-        let key = key.to_owned();
-        let value = value.to_owned();
-        cx.spawn(async move |_, _| {
-            let _ = service.set_config(&key, &value).await;
-        })
-        .detach();
     }
 
     fn subscribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Route search input changes into `self.query`.
         let query_input = self.search_input.clone();
         let subscription = cx.subscribe(&self.search_input, move |this, _emitter, event, cx| {
+            if matches!(
+                event,
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false
+                }
+            ) {
+                // Enter in the search field asks the agent (Tab arms the
+                // button first for the keyboard flow).
+                this.ask_agent_from_search(cx);
+            }
             if matches!(event, InputEvent::Change) {
                 this.query = query_input.read(cx).value().to_string();
                 let visible: HashSet<String> = this.visible_entry_ids().into_iter().collect();
@@ -321,7 +429,10 @@ impl WorktableView {
                         shift: false
                     }
                 ) {
-                    this.submit_composer(cx);
+                    let input = this.composer_body.clone();
+                    if this.queue_composer_entry(cx) {
+                        this.set_input(&input, "", cx);
+                    }
                 }
             });
             self._subscriptions.push(subscription);
@@ -411,9 +522,6 @@ impl WorktableView {
         // out beside the active one.
         let subscription = cx.observe_window_bounds(window, |_, _, cx| cx.notify());
         self._subscriptions.push(subscription);
-
-        // Focus the search field when the user opts in via Cmd+F.
-        let _ = window;
     }
 
     fn load_entries(&mut self, cx: &mut Context<Self>) {
@@ -425,6 +533,7 @@ impl WorktableView {
                     Ok(entries) => this.entries = entries,
                     Err(error) => eprintln!("Worktable: failed to load entries: {error}"),
                 }
+                this.rebuild_topic_cache();
                 cx.notify();
             });
         })
@@ -531,12 +640,31 @@ impl WorktableView {
         cx.notify();
     }
 
-    pub fn show_github_stars(&mut self, cx: &mut Context<Self>) {
-        self.mode = AppMode::GithubStars;
-        self.library_menu_open = false;
+    /// Open the GitHub stars dialog: account, fetch, and import controls in
+    /// one modal instead of a full settings page.
+    pub fn open_github_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.github_username.is_none() {
             self.load_github_username(cx);
         }
+        let main = cx.entity();
+        let dialog_view = cx.new(|_| GithubStarsDialog {
+            main: main.downgrade(),
+        });
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            dialog
+                .title("GitHub stars")
+                .width(dialog_width(window, design::GITHUB_DIALOG_WIDTH))
+                .child(dialog_view.clone())
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("github-dialog-close")
+                            .label("Close")
+                            .ghost()
+                            .debug_selector(|| "github-dialog-close".into())
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
         cx.notify();
     }
 
@@ -576,8 +704,7 @@ impl WorktableView {
                         }
                     }
                     Err(error) => {
-                        this.github_import_status =
-                            Some(format!("Import failed: {error}"));
+                        this.github_import_status = Some(format!("Import failed: {error}"));
                     }
                 }
                 cx.notify();
@@ -585,7 +712,6 @@ impl WorktableView {
         })
         .detach();
     }
-
 
     pub fn fetch_github_stars(&mut self, cx: &mut Context<Self>) {
         // Prefer the text currently in the input; fall back to the stored username.
@@ -631,50 +757,211 @@ impl WorktableView {
         .detach();
     }
 
-    pub fn build_helix(&mut self, cx: &mut Context<Self>) {
-        if self.helix_building {
+    /// Build the knowledge graph: mirror entries locally (topic extraction +
+    /// semantic links), then let the active provider's model name the topics
+    /// so the graph links entries by meaning rather than wording.
+    /// Abort a running knowledge build; the pass stops between phases/batches.
+    pub fn cancel_knowledge(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge_building {
+            self.knowledge_cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.knowledge_status = Some("Stopping knowledge build…".to_owned());
+            cx.notify();
+        }
+    }
+
+    pub fn build_knowledge(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge_building {
+            self.cancel_knowledge(cx);
             return;
         }
-        self.helix_building = true;
-        self.helix_status = Some("Building Helix graph…".to_owned());
+        self.knowledge_building = true;
+        self.knowledge_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = Arc::clone(&self.knowledge_cancel);
+        self.knowledge_status = Some("Building knowledge…".to_owned());
         cx.notify();
+
         let db_path = self.service.database_path().to_owned();
-        let helix_path = worktable_helix::helix_path_for_sqlite(&db_path);
+        let graph_path = worktable_helix::helix_path_for_sqlite(&db_path);
+        let service = Arc::clone(&self.service);
+        let can_enrich = self.agent_ready();
         cx.spawn(async move |view, cx| {
-            // Run the blocking build on a dedicated thread. `tokio::task::spawn_blocking`
-            // cannot be used here: this spawn runs on GPUI's executor, which has no Tokio
-            // reactor, and calling it from there panics with "no reactor running".
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let client = worktable_helix::HelixClient::open_embedded(helix_path);
-                let result = client.build_from_sqlite_blocking(&db_path);
-                let _ = tx.send(result);
-            });
-            let result = rx.await;
-            let _ = view.update(cx, |this, cx| {
-                this.helix_building = false;
-                match result {
-                    Ok(Ok(synced)) => {
-                        if synced == 0 {
-                            this.helix_status =
-                                Some("Helix up to date — no new entries to sync.".to_owned());
-                        } else {
-                            this.helix_status = Some(format!(
-                                "Helix synced {synced} new entries. Topics + relations ready."
-                            ));
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        this.helix_status = Some(format!("Helix build failed: {e}"));
-                    }
-                    Err(e) => {
-                        this.helix_status = Some(format!("Helix task failed: {e}"));
-                    }
+            // Phase 1 — mirror entries into the graph on a dedicated thread.
+            // `tokio::task::spawn_blocking` cannot be used here: this spawn
+            // runs on GPUI's executor, which has no Tokio reactor.
+            let local = {
+                let local_path = graph_path.clone();
+                let local_db = db_path.clone();
+                run_blocking(move || {
+                    let client = worktable_helix::HelixClient::open_embedded(local_path);
+                    client.build_from_sqlite_blocking(&local_db)
+                })
+                .await
+            };
+            let synced = match local {
+                Ok(Ok(synced)) => synced,
+                Ok(Err(error)) => {
+                    report_knowledge_status(view, cx, format!("Knowledge build failed: {error}"));
+                    return;
                 }
+                Err(error) => {
+                    report_knowledge_status(view, cx, format!("Knowledge build failed: {error}"));
+                    return;
+                }
+            };
+
+            // Phase 2 — AI topics, when a provider is configured.
+            let mut enriched = 0usize;
+            let mut enrichment_note: Option<String> = None;
+            let mut stopped = false;
+            if can_enrich {
+                loop {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        stopped = true;
+                        break;
+                    }
+                    let batch_path = graph_path.clone();
+                    let batch_db = db_path.clone();
+                    let batch = run_blocking(move || {
+                        worktable_helix::HelixClient::open_embedded(batch_path)
+                            .unenriched_entries_blocking(&batch_db, 8)
+                    })
+                    .await;
+                    let batch = match batch {
+                        Ok(Ok(batch)) => batch,
+                        Ok(Err(error)) => {
+                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            break;
+                        }
+                        Err(error) => {
+                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            break;
+                        }
+                    };
+                    if batch.is_empty() {
+                        break;
+                    }
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        stopped = true;
+                        break;
+                    }
+                    let batch_len = batch.len();
+                    let topics = match service.enrich_topics(batch).await {
+                        Ok(topics) if !topics.is_empty() => topics,
+                        Ok(_) => {
+                            enrichment_note = Some(
+                                "AI topics returned nothing; keeping keyword topics.".to_owned(),
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            break;
+                        }
+                    };
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        stopped = true;
+                        break;
+                    }
+                    let apply_path = graph_path.clone();
+                    let _ = run_blocking(move || {
+                        let client = worktable_helix::HelixClient::open_embedded(apply_path);
+                        for (id, topics) in topics {
+                            let _ = client.apply_ai_topics_blocking(&id, topics);
+                        }
+                    })
+                    .await;
+                    enriched += batch_len;
+                    let _ = view.update(cx, |this, cx| {
+                        this.knowledge_status =
+                            Some(format!("Naming topics with AI… {enriched} entries so far"));
+                        cx.notify();
+                    });
+                }
+            } else {
+                enrichment_note = Some("Configure a provider to name topics with AI.".to_owned());
+            }
+
+            // Export the graph's topics into the view's cache: grouping and
+            // search then use the graph's vocabulary (AI when available).
+            let export_path = graph_path.clone();
+            let topics = run_blocking(move || {
+                worktable_helix::HelixClient::open_embedded(export_path).knowledge_topics_blocking()
+            })
+            .await
+            .unwrap_or_default();
+            let _ = view.update(cx, |this, cx| {
+                this.apply_knowledge_topics(topics);
+                this.knowledge_building = false;
+                let summary = if stopped {
+                    format!("Knowledge build stopped after {enriched} AI-named entries.")
+                } else if enriched > 0 {
+                    format!(
+                        "Knowledge ready — {synced} new entries synced, {enriched} named by AI."
+                    )
+                } else if synced == 0 {
+                    "Knowledge is up to date.".to_owned()
+                } else {
+                    format!("Knowledge ready — {synced} new entries linked.")
+                };
+                this.knowledge_status = Some(match enrichment_note {
+                    Some(note) if enriched == 0 && !stopped => format!("{summary} {note}"),
+                    _ => summary,
+                });
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Load the graph's topics into the view cache (startup and after builds).
+    fn load_knowledge_topics(&mut self, cx: &mut Context<Self>) {
+        let db_path = self.service.database_path().to_owned();
+        cx.spawn(async move |view, cx| {
+            let graph_path = worktable_helix::helix_path_for_sqlite(&db_path);
+            let topics = run_blocking(move || {
+                worktable_helix::HelixClient::open_embedded(graph_path).knowledge_topics_blocking()
+            })
+            .await
+            .unwrap_or_default();
+            if !topics.is_empty() {
+                let _ = view.update(cx, |this, cx| {
+                    this.apply_knowledge_topics(topics);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Record the graph's topics. They layer over the local extraction rather
+    /// than replacing the cache, so a late entry-load cannot drop them.
+    fn apply_knowledge_topics(&mut self, topics: HashMap<String, String>) {
+        for (id, topic) in topics {
+            self.graph_topics.insert(id, topic);
+        }
+    }
+
+    /// Recompute the cached primary topic for every entry. Topic extraction
+    /// tokenizes title + content, so running it per entry per frame made the
+    /// list stutter while scrolling; grouping reads the cache instead.
+    fn rebuild_topic_cache(&mut self) {
+        self.topic_cache = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.clone(), helix_primary_topic(entry)))
+            .collect();
+    }
+
+    /// Primary topic for `entry`: the knowledge graph's (AI-named when the
+    /// graph was built with a provider), else the local extraction, else a
+    /// fresh extraction.
+    pub(crate) fn primary_topic(&self, entry: &WorktableEntry) -> String {
+        self.graph_topics
+            .get(&entry.id)
+            .or_else(|| self.topic_cache.get(&entry.id))
+            .cloned()
+            .unwrap_or_else(|| helix_primary_topic(entry))
     }
 
     pub(crate) fn visible_entries(&self) -> Vec<&WorktableEntry> {
@@ -694,35 +981,47 @@ impl WorktableView {
                     .contains(&query)
                     || entry.content.to_lowercase().contains(&query)
                     || entry.source.to_lowercase().contains(&query)
+                    // The graph's topic vocabulary (AI-named when available)
+                    // is part of search, so a topic finds its entries even
+                    // when their wording differs.
+                    || self.primary_topic(entry).to_lowercase().contains(&query)
             })
             .collect();
+        let ascending = self.sort_ascending;
         match self.sort_mode {
             SortMode::Time => {
-                filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                if ascending {
+                    filtered.sort_by_key(|entry| entry.created_at);
+                } else {
+                    filtered.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+                }
             }
             SortMode::Alpha => {
                 filtered.sort_by(|a, b| {
-                    let a_key = a
-                        .title
-                        .as_deref()
-                        .unwrap_or(&a.content)
-                        .to_lowercase();
-                    let b_key = b
-                        .title
-                        .as_deref()
-                        .unwrap_or(&b.content)
-                        .to_lowercase();
-                    a_key.cmp(&b_key)
+                    let a_key = a.title.as_deref().unwrap_or(&a.content).to_lowercase();
+                    let b_key = b.title.as_deref().unwrap_or(&b.content).to_lowercase();
+                    if ascending {
+                        a_key.cmp(&b_key)
+                    } else {
+                        b_key.cmp(&a_key)
+                    }
                 });
             }
             SortMode::Topic => {
-                // Grouped view still needs a deterministic order: topics alphabetically,
-                // then time within each topic. For the flat visible list used for selection,
-                // sort by primary topic then time.
+                // Grouped view still needs a deterministic order: topics
+                // alphabetically, then time within each topic. For the flat
+                // visible list used for selection, sort by primary topic then
+                // time.
                 filtered.sort_by(|a, b| {
-                    let ta = helix_primary_topic(a);
-                    let tb = helix_primary_topic(b);
-                    ta.cmp(&tb).then_with(|| b.created_at.cmp(&a.created_at))
+                    let ta = self.primary_topic(a);
+                    let tb = self.primary_topic(b);
+                    let topic = if ascending { ta.cmp(&tb) } else { tb.cmp(&ta) };
+                    let time = if ascending {
+                        a.created_at.cmp(&b.created_at)
+                    } else {
+                        b.created_at.cmp(&a.created_at)
+                    };
+                    topic.then_with(|| time)
                 });
             }
         }
@@ -737,7 +1036,13 @@ impl WorktableView {
     }
 
     pub(crate) fn set_sort_mode(&mut self, mode: SortMode, cx: &mut Context<Self>) {
-        self.sort_mode = mode;
+        if self.sort_mode == mode {
+            // Clicking the active sort flips its direction.
+            self.sort_ascending = !self.sort_ascending;
+        } else {
+            self.sort_mode = mode;
+            self.sort_ascending = mode.default_ascending();
+        }
         cx.notify();
     }
 
@@ -751,94 +1056,227 @@ impl WorktableView {
 
     // ---- Public action methods (called from app-level handlers) ------------
 
-    pub fn open_composer_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_composer(ComposerKind::Note, window, cx);
-    }
-
-    pub fn open_composer_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_composer(ComposerKind::Link, window, cx);
-    }
-
-    pub fn open_composer_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_composer(ComposerKind::Image, window, cx);
-    }
-
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.search_input.read(cx).focus_handle(cx);
         handle.focus(window, cx);
     }
 
     pub fn show_entries(&mut self, cx: &mut Context<Self>) {
-        self.mode = AppMode::Entries;
-        self.library_menu_open = false;
-        cx.notify();
+        self.show_library_page(AppMode::Entries, cx);
     }
 
     pub fn show_assistant(&mut self, cx: &mut Context<Self>) {
-        self.mode = AppMode::Assistant;
-        self.library_menu_open = false;
+        self.show_library_page(AppMode::Assistant, cx);
+    }
+
+    /// Whether the Entries ⇄ Agent slide is still running (test helper;
+    /// `render_library_pages` derives the same window inline for the tween).
+    #[cfg(test)]
+    pub(crate) fn page_transition_active(&self) -> bool {
+        self.page_anim_at
+            .is_some_and(|started| started.elapsed() < worktable_ui::PAGE_SLIDE.total())
+    }
+
+    /// Switch between the Entries and Agent pages with the transitions.dev
+    /// slide + fade (see `render`). Other mode changes are full-page swaps.
+    fn show_library_page(&mut self, mode: AppMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.page_anim_at = if matches!(self.mode, AppMode::Entries | AppMode::Assistant)
+            && matches!(mode, AppMode::Entries | AppMode::Assistant)
+        {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.mode = mode;
         cx.notify();
     }
 
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.mode = AppMode::Settings;
-        self.library_menu_open = false;
+        self.settings_tab = None;
         if self.providers.is_empty() {
             self.refresh_providers(cx);
         }
         cx.notify();
     }
 
-    pub fn show_provider_config(&mut self, cx: &mut Context<Self>) {
-        self.mode = AppMode::ProviderConfig;
-        self.library_menu_open = false;
+    /// Show Settings opened on one of its category pages.
+    pub fn show_settings_at(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        self.mode = AppMode::Settings;
+        self.settings_tab = Some(tab);
         if self.providers.is_empty() {
             self.refresh_providers(cx);
         }
         cx.notify();
     }
 
-    pub fn configure_provider(&mut self, provider_id: &str, cx: &mut Context<Self>) {
+    /// Open the modal configuration dialog for one provider. The dialog is the
+    /// only place keys and OAuth sign-ins are entered, so the provider list
+    /// stays scannable.
+    pub fn open_provider_dialog(
+        &mut self,
+        provider_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(provider) = self
             .providers
             .iter()
             .find(|provider| provider.id == provider_id)
+            .cloned()
         else {
             return;
         };
 
-        if provider.supports_api_key {
-            self.api_key_provider = Some(provider_id.to_owned());
-            let input = self.api_key_input.clone();
-            self.set_input(&input, "", cx);
-            self.settings_status = Some(format!(
-                "Configuring {provider_id}: enter an API key or use OAuth below."
-            ));
-        } else {
-            self.api_key_provider = None;
-            self.settings_status = Some(format!("{provider_id} uses OAuth configuration below."));
-        }
-        self.update_provider_row_sizes();
-        self.mode = AppMode::ProviderConfig;
-        cx.notify();
-    }
+        self.api_key_provider = Some(provider_id.to_owned());
+        self.provider_dialog_status = None;
+        let input = self.api_key_input.clone();
+        self.set_input(&input, "", cx);
 
-    pub fn toggle_library_menu(&mut self, cx: &mut Context<Self>) {
-        self.library_menu_open = !self.library_menu_open;
+        let main = cx.entity();
+        let dialog_view = cx.new(|_| ProviderDialogView {
+            main: main.downgrade(),
+            provider_id: provider_id.to_owned(),
+            api_key_input: self.api_key_input.clone(),
+            opened_at: Instant::now(),
+        });
+        let title = provider.name.clone();
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            dialog
+                .title(format!("Configure {title}"))
+                .width(dialog_width(window, design::PROVIDER_DIALOG_WIDTH))
+                .child(dialog_view.clone())
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("provider-dialog-close")
+                            .label("Close")
+                            .ghost()
+                            .debug_selector(|| "provider-dialog-close".into())
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
         cx.notify();
     }
 
     pub fn cancel_composer(&mut self, cx: &mut Context<Self>) {
-        self.composer = None;
+        if self.entry_modal.is_some() {
+            self.close_entry_modal(cx);
+        }
+    }
+
+    /// Load UI preferences persisted in config.
+    fn load_preferences(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // System is the default; a stored preference overrides it.
+        self.apply_theme(window, cx);
+        let service = Arc::clone(&self.service);
+        let appearance = window.appearance();
+        cx.spawn(async move |view, cx| {
+            let show_thinking = service.get_config("show_thinking").await;
+            let theme_mode = service.get_config("theme_mode").await;
+            let _ = view.update(cx, |this, cx| {
+                if let Ok(Some(value)) = show_thinking {
+                    this.show_thinking = value == "1";
+                }
+                if let Ok(Some(value)) = theme_mode
+                    && let Some(mode) = AppThemeMode::from_config(&value)
+                {
+                    this.theme_mode = mode;
+                    match mode {
+                        AppThemeMode::Light => {
+                            gpui_component::Theme::change(
+                                gpui_component::ThemeMode::Light,
+                                None,
+                                cx,
+                            );
+                        }
+                        AppThemeMode::Dark => {
+                            gpui_component::Theme::change(
+                                gpui_component::ThemeMode::Dark,
+                                None,
+                                cx,
+                            );
+                        }
+                        AppThemeMode::System => {
+                            let mode = if matches!(
+                                appearance,
+                                gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                            ) {
+                                gpui_component::ThemeMode::Dark
+                            } else {
+                                gpui_component::ThemeMode::Light
+                            };
+                            gpui_component::Theme::change(mode, None, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resolve and apply the current theme mode. `System` follows the
+    /// window's platform appearance at apply time.
+    fn apply_theme(&self, window: &Window, cx: &mut Context<Self>) {
+        let mode = match self.theme_mode {
+            AppThemeMode::Light => gpui_component::ThemeMode::Light,
+            AppThemeMode::Dark => gpui_component::ThemeMode::Dark,
+            AppThemeMode::System => {
+                if matches!(
+                    window.appearance(),
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                ) {
+                    gpui_component::ThemeMode::Dark
+                } else {
+                    gpui_component::ThemeMode::Light
+                }
+            }
+        };
+        gpui_component::Theme::change(mode, None, cx);
+    }
+
+    /// Select a theme mode, apply it, and persist it.
+    pub fn set_theme_mode(
+        &mut self,
+        mode: AppThemeMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_mode = mode;
+        self.apply_theme(window, cx);
+        let value = mode.as_config().to_owned();
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |_view, _cx| {
+            let _ = service.set_config("theme_mode", &value).await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Flip the "show thinking" preference and persist it.
+    pub fn toggle_show_thinking(&mut self, cx: &mut Context<Self>) {
+        self.show_thinking = !self.show_thinking;
+        let value = if self.show_thinking { "1" } else { "0" }.to_owned();
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |_view, _cx| {
+            let _ = service.set_config("show_thinking", &value).await;
+        })
+        .detach();
         cx.notify();
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.dark_mode = !self.dark_mode;
-        let mode = if self.dark_mode {
-            gpui_component::ThemeMode::Dark
-        } else {
-            gpui_component::ThemeMode::Light
+        self.theme_mode = match self.theme_mode {
+            AppThemeMode::Dark => AppThemeMode::Light,
+            _ => AppThemeMode::Dark,
+        };
+        let mode = match self.theme_mode {
+            AppThemeMode::Dark => gpui_component::ThemeMode::Dark,
+            _ => gpui_component::ThemeMode::Light,
         };
         gpui_component::Theme::change(mode, None, cx);
         cx.notify();
@@ -851,8 +1289,31 @@ impl WorktableView {
         cx.notify();
     }
 
+    /// List keyboard commands only apply on the Library page with no detail
+    /// overlay; otherwise Enter while prompting the agent (or a detail view)
+    /// could open or delete an entry the user cannot even see.
+    fn list_actions_allowed(&self) -> bool {
+        self.mode == AppMode::Entries && self.entry_modal.is_none()
+    }
+
+    /// Whether one of the view's text fields currently owns the keyboard.
+    /// While typing, Enter adds the note (or sends the prompt) and Backspace
+    /// edits the field — neither may reach the list commands behind it.
+    fn text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        let Some(focused) = window.focused(cx) else {
+            return false;
+        };
+        [
+            self.search_input.read(cx).focus_handle(cx),
+            self.composer_body.read(cx).focus_handle(cx),
+            self.assistant_input.read(cx).focus_handle(cx),
+        ]
+        .into_iter()
+        .any(|handle| handle == focused)
+    }
+
     pub fn move_selection(&mut self, direction: isize) {
-        if self.mode != AppMode::Entries {
+        if !self.list_actions_allowed() {
             return;
         }
         let visible = self.visible_entries();
@@ -880,11 +1341,12 @@ impl WorktableView {
     }
 
     pub fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
+        if !self.list_actions_allowed() || self.selected.is_empty() {
             return;
         }
         let ids: Vec<String> = self.selected.iter().cloned().collect();
         self.entries.retain(|entry| !ids.contains(&entry.id));
+        self.rebuild_topic_cache();
         self.selected.clear();
         self.selected_anchor = None;
         cx.notify();
@@ -899,6 +1361,9 @@ impl WorktableView {
     }
 
     pub fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        if !self.list_actions_allowed() {
+            return;
+        }
         if self.selected.len() > 1 {
             self.copy_entries_as_list(cx);
             return;
@@ -914,17 +1379,173 @@ impl WorktableView {
     }
 
     pub fn copy_selected_link(&mut self, cx: &mut Context<Self>) {
+        if !self.list_actions_allowed() {
+            return;
+        }
         if let Some(entry) = self.selected_entry()
-            && entry.kind == "link" {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.content.clone()));
-            }
+            && content_is_link(&entry.content)
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.content.clone()));
+        }
     }
 
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected_entry()
-            && entry.kind == "link" {
-                cx.open_url(&entry.content);
-            }
+        // The detail view is the single destination for Enter/Open; links
+        // inside it get their own chip.
+        if !self.list_actions_allowed() {
+            return;
+        }
+        if let Some(id) = self.selected_entry().map(|entry| entry.id.clone()) {
+            let origin = self.entry_origin(&id);
+            self.open_entry_modal(&id, origin, cx);
+        }
+    }
+
+    /// Convert a window-space point/rect into the content column's local
+    /// space (the overlay's coordinate system).
+    fn local_point(&self, position: Point<Pixels>) -> Point<Pixels> {
+        position - self.content_origin.get()
+    }
+
+    fn local_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds::new(self.local_point(bounds.origin), bounds.size)
+    }
+
+    /// A small morph origin centered on a window-space pointer position.
+    pub(crate) fn pointer_origin(&self, position: Point<Pixels>) -> Bounds<Pixels> {
+        morph_origin_at(self.local_point(position))
+    }
+
+    /// The morph's starting rect: the entry's card when it is mounted (its
+    /// live prepainted rect, converted to column space), else a small square
+    /// at the last pointer position.
+    pub(crate) fn entry_origin(&self, id: &str) -> Bounds<Pixels> {
+        if let Some(bounds) = self.card_bounds.borrow().get(id) {
+            return self.local_bounds(*bounds);
+        }
+        morph_origin_at(self.local_point(self.pointer_position))
+    }
+
+    /// Open the full-content view for `id`, morphing from `origin`.
+    pub fn open_entry_modal(&mut self, id: &str, origin: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.entries.iter().all(|entry| entry.id != id) {
+            return;
+        }
+        self.entry_editing = false;
+        self.entry_edit_status = None;
+        self.entry_modal = Some(EntryModalState {
+            entry_id: id.to_owned(),
+            origin,
+            opened_at: Instant::now(),
+            closing_at: None,
+        });
+        cx.notify();
+    }
+
+    /// Switch the detail view into the markdown editor.
+    pub fn start_entry_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .entry_modal
+            .as_ref()
+            .map(|modal| modal.entry_id.clone())
+        else {
+            return;
+        };
+        let Some(content) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.content.clone())
+        else {
+            return;
+        };
+        let input = self.entry_edit_input.clone();
+        input.update(cx, |state, cx| state.set_value(&content, window, cx));
+        let handle = input.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+        self.entry_editing = true;
+        self.entry_edit_status = None;
+        cx.notify();
+    }
+
+    /// Leave the editor without saving.
+    pub fn cancel_entry_edit(&mut self, cx: &mut Context<Self>) {
+        self.entry_editing = false;
+        self.entry_edit_status = None;
+        cx.notify();
+    }
+
+    /// Persist the editor's markdown and keep the detail view open.
+    pub fn save_entry_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .entry_modal
+            .as_ref()
+            .map(|modal| modal.entry_id.clone())
+        else {
+            return;
+        };
+        let Some(mut updated) = self.entries.iter().find(|entry| entry.id == id).cloned() else {
+            return;
+        };
+        let content = self.entry_edit_input.read(cx).value().to_string();
+        if content == updated.content {
+            self.entry_editing = false;
+            self.entry_edit_status = None;
+            cx.notify();
+            return;
+        }
+        updated.content = content;
+
+        let service = Arc::clone(&self.service);
+        let saved = updated.clone();
+        cx.spawn(async move |view, cx| {
+            let result = service.update_entry(saved.clone()).await;
+            let _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(entry) =
+                            this.entries.iter_mut().find(|entry| entry.id == saved.id)
+                        {
+                            *entry = saved.clone();
+                        }
+                        // The graph topic for this entry is stale; let the
+                        // local extraction (or the next build) take over.
+                        this.graph_topics.remove(&saved.id);
+                        this.rebuild_topic_cache();
+                        this.entry_editing = false;
+                        this.entry_edit_status = None;
+                    }
+                    Err(error) => {
+                        this.entry_edit_status = Some(format!("Couldn't save the entry: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Play the close morph, then unmount the panel.
+    pub fn close_entry_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.entry_modal.as_mut() else {
+            return;
+        };
+        if modal.closing_at.is_some() {
+            return;
+        }
+        modal.closing_at = Some(Instant::now());
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(worktable_ui::MORPH_CLOSE.total())
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.entry_modal = None;
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn select_at(&mut self, id: String, extend: bool) {
@@ -950,17 +1571,14 @@ impl WorktableView {
 
     pub fn select_range(&mut self, id: String, _cx: &mut Context<Self>) {
         let visible_ids = self.visible_entry_ids();
-        let anchor = self
-            .selected_anchor
-            .clone()
-            .unwrap_or_else(|| id.clone());
+        let anchor = self.selected_anchor.clone().unwrap_or_else(|| id.clone());
         let anchor_idx = visible_ids.iter().position(|x| x == &anchor);
         let target_idx = visible_ids.iter().position(|x| x == &id);
         if let (Some(a), Some(b)) = (anchor_idx, target_idx) {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             self.selected.clear();
-            for idx in start..=end {
-                self.selected.insert(visible_ids[idx].clone());
+            for id in visible_ids.iter().take(end + 1).skip(start) {
+                self.selected.insert(id.clone());
             }
             // Keep the original anchor for subsequent shifts; update UI anchor to target
             self.selected_anchor = Some(anchor.clone());
@@ -978,62 +1596,92 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiThoughtDelta { delta, .. } => {
+                self.assistant_scroll.scroll_to_bottom();
                 match self.messages.last_mut().filter(|m| m.streaming) {
                     Some(message) => message.thinking.push_str(delta),
                     None => self.messages.push(ChatMessage {
-                        role: Role::Assistant,
+                        role: ChatRole::Assistant,
                         text: String::new(),
                         thinking: delta.clone(),
                         streaming: true,
+                        citations: Vec::new(),
+                        thinking_collapsed: false,
                     }),
                 }
                 cx.notify();
             }
             WorktableEvent::AiMessageDelta { delta, .. } => {
+                self.assistant_scroll.scroll_to_bottom();
                 match self.messages.last_mut().filter(|m| m.streaming) {
-                    Some(message) => message.text.push_str(delta),
-                    None => self.messages.push(ChatMessage {
-                        role: Role::Assistant,
-                        text: delta.clone(),
-                        thinking: String::new(),
-                        streaming: true,
-                    }),
+                    Some(message) => {
+                        message.text.push_str(delta);
+                        // Text is arriving: the tool row has done its job.
+                        self.active_tool = None;
+                    }
+                    None => {
+                        let citations = citation_refs(std::mem::take(&mut self.pending_citations));
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::Assistant,
+                            text: delta.clone(),
+                            thinking: String::new(),
+                            streaming: true,
+                            citations,
+                            thinking_collapsed: false,
+                        });
+                        self.active_tool = None;
+                    }
                 }
                 cx.notify();
             }
             WorktableEvent::AiToolStarted { name, .. } => {
-                if !self
-                    .messages
-                    .iter()
-                    .any(|m| m.text.contains("using a tool"))
-                {
-                    self.messages.push(ChatMessage {
-                        role: Role::Assistant,
-                        text: format!("> using **{name}**…"),
-                        thinking: String::new(),
-                        streaming: true,
-                    });
-                }
+                self.active_tool = Some(name.clone());
+                cx.notify();
+            }
+            WorktableEvent::AiToolFinished { .. } => {
+                self.active_tool = None;
+                cx.notify();
+            }
+            WorktableEvent::AiCitations { citations, .. } => {
+                // Held until the answer's first delta, so the citation footer
+                // lands on the message that carries the [n] markers.
+                self.pending_citations = citations.clone();
                 cx.notify();
             }
             WorktableEvent::AiRunFinished { .. } => {
                 self.assistant_busy = false;
+                self.active_tool = None;
                 for message in self.messages.iter_mut().rev() {
                     if message.streaming {
                         message.streaming = false;
                         break;
                     }
                 }
+                // The answer is in: fold the reasoning away by default.
+                for message in self.messages.iter_mut() {
+                    if !message.thinking.is_empty() {
+                        message.thinking_collapsed = true;
+                    }
+                }
+                // A run without answer text produced no message to annotate;
+                // drop any citations it collected.
+                self.pending_citations.clear();
                 cx.notify();
             }
             WorktableEvent::AiRunFailed { error, .. } | WorktableEvent::AiWorkerError { error } => {
                 self.providers_loading = false;
                 self.settings_status = Some(error.clone());
                 self.assistant_busy = false;
+                self.active_tool = None;
+                self.pending_citations.clear();
                 for message in self.messages.iter_mut().rev() {
                     if message.streaming {
                         message.streaming = false;
                         break;
+                    }
+                }
+                for message in self.messages.iter_mut() {
+                    if !message.thinking.is_empty() {
+                        message.thinking_collapsed = true;
                     }
                 }
                 if !self.messages.iter().any(|m| m.text.contains(error)) {
@@ -1090,9 +1738,9 @@ impl WorktableView {
                 self.logging_in.remove(provider_id);
                 self.pending_prompt = None;
                 if *ok {
-                    self.settings_status = Some(format!("Signed in to {provider_id}."));
+                    self.provider_dialog_status = Some(format!("Signed in to {provider_id}."));
                 } else {
-                    self.settings_status = Some(format!(
+                    self.provider_dialog_status = Some(format!(
                         "Sign-in failed for {provider_id}: {}",
                         error.as_deref().unwrap_or("unknown error")
                     ));
@@ -1123,7 +1771,8 @@ impl WorktableView {
         self.active_model = snapshot.active_model.clone();
         // Drop any api-key entry row that no longer exists.
         if let Some(provider) = &self.api_key_provider
-            && !self.providers.iter().any(|p| &p.id == provider) {
+            && !self.providers.iter().any(|p| &p.id == provider)
+        {
             self.api_key_provider = None;
         }
         // A stored active provider the catalog no longer knows (e.g. saved by
@@ -1132,7 +1781,8 @@ impl WorktableView {
         // CTA until a valid provider is chosen again.
         if let Some(provider) = self.active_provider.clone()
             && !provider.is_empty()
-            && !self.providers.iter().any(|p| p.id == provider) {
+            && !self.providers.iter().any(|p| p.id == provider)
+        {
             self.active_provider = None;
             self.active_model = None;
             self.stale_provider_cleared = true;
@@ -1140,25 +1790,6 @@ impl WorktableView {
                 "'{provider}' is no longer an available provider — pick a new one under Providers."
             ));
         }
-        self.update_provider_row_sizes();
-    }
-
-    /// Rebuild the virtual list's row sizes: every provider row uses the
-    /// compact height except the one whose API-key field is expanded.
-    fn update_provider_row_sizes(&mut self) {
-        self.provider_row_sizes = Rc::new(
-            self.providers
-                .iter()
-                .map(|provider| {
-                    let height = if self.api_key_provider.as_deref() == Some(provider.id.as_str()) {
-                        PROVIDER_ROW_EXPANDED_HEIGHT
-                    } else {
-                        PROVIDER_ROW_HEIGHT
-                    };
-                    size(px(0.), px(height))
-                })
-                .collect(),
-        );
     }
 
     /// The agent can serve prompts only when the worker runs AND a provider
@@ -1166,7 +1797,7 @@ impl WorktableView {
     /// less and the composer turns into a setup call-to-action instead of a
     /// dead input.
     fn agent_ready(&self) -> bool {
-        self.service.has_ai_worker()
+        self.service.has_ai_runtime()
             && self
                 .active_provider
                 .as_deref()
@@ -1177,7 +1808,52 @@ impl WorktableView {
                 .is_some_and(|model| !model.is_empty())
     }
 
+    /// Abort the in-flight assistant run (the orb button while busy).
+    pub fn cancel_assistant(&mut self, cx: &mut Context<Self>) {
+        if !self.assistant_busy {
+            return;
+        }
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |_view, _cx| {
+            let _ = service.cancel_prompt("wt-session").await;
+        })
+        .detach();
+    }
+
     pub fn send_assistant(&mut self, cx: &mut Context<Self>) {
+        let text = self.assistant_input.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let input = self.assistant_input.clone();
+        self.set_input(&input, "", cx);
+        self.submit_assistant_prompt(text, cx);
+    }
+
+    /// Send the library search query to the agent. Tab from the search field
+    /// reaches the Ask agent button; Enter switches to Agent mode and runs
+    /// the query as the prompt.
+    pub fn ask_agent_from_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.query.trim().to_owned();
+        self.show_assistant(cx);
+        if query.is_empty() {
+            return;
+        }
+        self.clear_search(cx);
+        self.submit_assistant_prompt(query, cx);
+    }
+
+    /// Submit one prompt: always shows the user's message, then either runs it
+    /// or explains the (missing) provider setup.
+    pub fn submit_assistant_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.assistant_busy {
+            return;
+        }
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.messages.push(ChatMessage::user(text.clone()));
         if !self.agent_ready() {
             self.messages.push(ChatMessage::assistant(
                 "The AI assistant isn't configured yet — pick a provider, add an API key, and choose a model in Settings.",
@@ -1185,18 +1861,9 @@ impl WorktableView {
             cx.notify();
             return;
         }
-        if self.assistant_busy {
-            return;
-        }
-        let text = self.assistant_input.read(cx).value().to_string();
-        if text.trim().is_empty() {
-            return;
-        }
-        let text = text.trim().to_owned();
-        self.messages.push(ChatMessage::user(text.clone()));
         self.assistant_busy = true;
-        let input = self.assistant_input.clone();
-        self.set_input(&input, "", cx);
+        self.active_tool = None;
+        self.pending_citations.clear();
         cx.notify();
 
         let service = Arc::clone(&self.service);
@@ -1254,10 +1921,12 @@ impl WorktableView {
                 this.set_input(&input, "", cx);
                 match result {
                     Ok(()) => {
-                        this.settings_status = Some(format!("Saved API key for {provider_id}."));
+                        this.provider_dialog_status =
+                            Some(format!("Saved API key for {provider_id}."));
                     }
                     Err(error) => {
-                        this.settings_status = Some(format!("Failed to save API key: {error}"));
+                        this.provider_dialog_status =
+                            Some(format!("Failed to save API key: {error}"));
                     }
                 }
                 this.refresh_providers(cx);
@@ -1293,7 +1962,7 @@ impl WorktableView {
 
     pub fn login_oauth(&mut self, provider_id: &str, cx: &mut Context<Self>) {
         self.logging_in.insert(provider_id.to_owned());
-        self.settings_status = Some(format!("Starting sign-in for {provider_id}…"));
+        self.provider_dialog_status = Some(format!("Starting sign-in for {provider_id}…"));
         self.auth_notice = None;
         self.pending_prompt = None;
         cx.notify();
@@ -1305,7 +1974,7 @@ impl WorktableView {
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
                     this.logging_in.remove(&provider_id);
-                    this.settings_status = Some(format!("Failed to start sign-in: {error}"));
+                    this.provider_dialog_status = Some(format!("Failed to start sign-in: {error}"));
                     cx.notify();
                 });
             }
@@ -1321,7 +1990,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 this.logging_in.remove(&provider_id);
                 this.pending_prompt = None;
-                this.settings_status = Some("Sign-in cancelled.".to_owned());
+                this.provider_dialog_status = Some("Sign-in cancelled.".to_owned());
                 cx.notify();
             });
         })
@@ -1336,10 +2005,10 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
-                        this.settings_status = Some(format!("Signed out of {provider_id}."));
+                        this.provider_dialog_status = Some(format!("Signed out of {provider_id}."));
                     }
                     Err(error) => {
-                        this.settings_status = Some(format!("Failed to sign out: {error}"));
+                        this.provider_dialog_status = Some(format!("Failed to sign out: {error}"));
                     }
                 }
                 this.refresh_providers(cx);
@@ -1384,7 +2053,7 @@ impl WorktableView {
             let result = service.answer_auth_prompt(&prompt_id, &answer).await;
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
-                    this.settings_status = Some(format!("Failed to answer prompt: {error}"));
+                    this.provider_dialog_status = Some(format!("Failed to answer prompt: {error}"));
                     cx.notify();
                 });
             }
@@ -1392,40 +2061,29 @@ impl WorktableView {
         .detach();
     }
 
-    fn submit_composer(&mut self, cx: &mut Context<Self>) {
-        let Some(kind) = self.composer else {
-            return;
-        };
-        let body = trim_opt(self.composer_body.read(cx).value().as_ref());
-
-        let (valid, content, entry_kind) = match kind {
-            ComposerKind::Note => match body {
-                Some(content) => (true, content, "text"),
-                None => (false, String::new(), "text"),
-            },
-            ComposerKind::Link => match body {
-                Some(url) => (true, url, "link"),
-                None => (false, String::new(), "link"),
-            },
-            ComposerKind::Image => match body {
-                Some(path) => (true, path, "image"),
-                None => (false, String::new(), "image"),
-            },
-        };
-        if !valid {
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.queue_composer_entry(cx) {
             return;
         }
+        let input = self.composer_body.clone();
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// Queue the note in the bar for insertion. Returns false when it is empty.
+    fn queue_composer_entry(&mut self, cx: &mut Context<Self>) -> bool {
+        let body = trim_opt(self.composer_body.read(cx).value().as_ref());
+        let Some(content) = body else {
+            return false;
+        };
 
         let entry = WorktableEntry {
             id: crate::service::new_entry_id(),
-            kind: entry_kind.to_owned(),
             content,
             title: None,
             source: "Worktable".to_owned(),
             created_at: crate::service::unix_time_ms(),
         };
 
-        self.composer = None;
         cx.notify();
 
         let service = Arc::clone(&self.service);
@@ -1435,6 +2093,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 if result.is_ok() {
                     this.entries.insert(0, entry.clone());
+                    this.rebuild_topic_cache();
                     this.selected.clear();
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
@@ -1445,30 +2104,141 @@ impl WorktableView {
             });
         })
         .detach();
+        true
     }
 
-    fn open_composer(&mut self, kind: ComposerKind, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer = Some(kind);
-        self.composer_body.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-            match kind {
-                ComposerKind::Note => state.set_placeholder("Write your note…", window, cx),
-                ComposerKind::Link => {
-                    state.set_placeholder("https://…  (or a plain link)", window, cx)
-                }
-                ComposerKind::Image => state.set_placeholder("Image path or URL…", window, cx),
-            }
-        });
+    /// Focus the always-visible note input (⌘N).
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.composer_body.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
         cx.notify();
+    }
 
-        // Focus the first field on the next frame so the composer is mounted.
-        let view = cx.entity();
-        window.defer(cx, move |window, cx| {
-            view.update(cx, |this, cx| {
-                let handle = this.composer_body.read(cx).focus_handle(cx);
-                handle.focus(window, cx);
-            });
+    /// Open the system image picker; chosen images become image entries.
+    pub fn pick_image(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose an image".into()),
         });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            for path in paths {
+                let Some(mime) = image_mime_for(&path) else {
+                    continue;
+                };
+                let mime = mime.to_owned();
+                let path = path.to_string_lossy().into_owned();
+                let _ = view.update(cx, |this, cx| {
+                    this.add_captured_image(path.clone(), mime.clone(), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Save an image entry through the system save panel. Local files are
+    /// copied; remote images are fetched first.
+    pub fn save_image(&mut self, content: String, cx: &mut Context<Self>) {
+        let trimmed = content.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let is_remote = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+        let local = std::path::PathBuf::from(&trimmed);
+        let (directory, suggested) = if is_remote {
+            (std::env::temp_dir(), None)
+        } else {
+            (
+                local
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(std::env::temp_dir),
+                local
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            )
+        };
+        let receiver = cx.prompt_for_new_path(&directory, suggested.as_deref());
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(target))) = receiver.await else {
+                return;
+            };
+            let result = if is_remote {
+                match reqwest::get(&trimmed).await {
+                    Ok(response) => match response.bytes().await {
+                        Ok(bytes) => std::fs::write(&target, &bytes),
+                        Err(error) => Err(std::io::Error::other(error)),
+                    },
+                    Err(error) => Err(std::io::Error::other(error)),
+                }
+            } else {
+                std::fs::copy(&trimmed, &target).map(|_| ())
+            };
+            let _ = view.update(cx, |this, cx| {
+                this.entry_edit_status = Some(match result {
+                    Ok(()) => "Image saved".to_owned(),
+                    Err(error) => format!("Couldn't save the image: {error}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Open an image in a borderless fullscreen popup above every other app,
+    /// fading it in with the modal motion curve.
+    pub fn open_image_viewer(
+        &mut self,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = image_source_for(&content) else {
+            return;
+        };
+        let bounds = window
+            .display(cx)
+            .map(|display| display.bounds())
+            .unwrap_or_else(|| {
+                Bounds::new(
+                    point(Pixels::ZERO, Pixels::ZERO),
+                    size(
+                        design::to_pixels(rems(80.0), window),
+                        design::to_pixels(rems(50.0), window),
+                    ),
+                )
+            });
+        let label: SharedString = content
+            .rsplit('/')
+            .next()
+            .unwrap_or(&content)
+            .to_owned()
+            .into();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: WindowBackgroundAppearance::Opaque,
+            focus: true,
+            show: true,
+            ..WindowOptions::default()
+        };
+        if let Err(error) = cx.open_window(options, move |window, cx| {
+            let viewer = cx.new(|cx| ImageViewer::new(source, label, cx));
+            let handle = viewer.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            viewer
+        }) {
+            self.entry_edit_status = Some(format!("Couldn't open the image: {error}"));
+            cx.notify();
+        }
     }
 
     /// Insert text captured from another application without opening the window.
@@ -1479,7 +2249,6 @@ impl WorktableView {
 
         let entry = WorktableEntry {
             id: crate::service::new_entry_id(),
-            kind: "text".to_owned(),
             content,
             title: None,
             source: "Selection".to_owned(),
@@ -1492,6 +2261,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 if result.is_ok() {
                     this.entries.insert(0, entry.clone());
+                    this.rebuild_topic_cache();
                     this.selected.clear();
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
@@ -1514,7 +2284,6 @@ impl WorktableView {
         let _ = mime_type;
         let entry = WorktableEntry {
             id: crate::service::new_entry_id(),
-            kind: "image".to_owned(),
             content: path,
             title: None,
             source: "Selection".to_owned(),
@@ -1527,6 +2296,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 if result.is_ok() {
                     this.entries.insert(0, entry.clone());
+                    this.rebuild_topic_cache();
                     this.selected.clear();
                     this.selected.insert(entry.id.clone());
                     this.selected_anchor = Some(entry.id);
@@ -1595,9 +2365,10 @@ impl Render for WorktableView {
             window.refresh();
         }
         if let Some(start) = self.splash_start
-            && start.elapsed() > Duration::from_millis(650) {
-                self.splash_start = None;
-            }
+            && start.elapsed() > Duration::from_millis(650)
+        {
+            self.splash_start = None;
+        }
         let theme = cx.theme().clone();
         let is_splash = self.splash_start.is_some();
 
@@ -1612,37 +2383,50 @@ impl Render for WorktableView {
             .text_size(theme.font_size)
             .key_context("worktable-list")
             .on_action(
-                cx.listener(|this, _: &crate::actions::SelectPrevious, _, _| {
-                    this.move_selection(-1)
+                cx.listener(|this, _: &crate::actions::SelectPrevious, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.move_selection(-1)
+                    }
                 }),
             )
             .on_action(
-                cx.listener(|this, _: &crate::actions::SelectNext, _, _| this.move_selection(1)),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::actions::DeleteEntry, _, cx| {
-                    this.delete_selected(cx)
+                cx.listener(|this, _: &crate::actions::SelectNext, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.move_selection(1)
+                    }
                 }),
             )
             .on_action(
-                cx.listener(|this, _: &crate::actions::OpenEntry, _, cx| this.open_selected(cx)),
+                cx.listener(|this, _: &crate::actions::DeleteEntry, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.delete_selected(cx)
+                    }
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &crate::actions::CopyEntry, _, cx| this.copy_selected(cx)),
+                cx.listener(|this, _: &crate::actions::OpenEntry, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.open_selected(cx)
+                    }
+                }),
             )
             .on_action(
-                cx.listener(|this, _: &crate::actions::CopyLink, _, cx| {
-                    this.copy_selected_link(cx)
+                cx.listener(|this, _: &crate::actions::CopyEntry, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.copy_selected(cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CopyLink, window, cx| {
+                    if !this.text_input_focused(window, cx) {
+                        this.copy_selected_link(cx)
+                    }
                 }),
             )
             .on_action(
                 cx.listener(|this, _: &crate::actions::NewNote, window, cx| {
-                    this.open_composer_note(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::actions::NewLink, window, cx| {
-                    this.open_composer_link(window, cx)
+                    this.focus_composer(window, cx)
                 }),
             )
             .on_action(
@@ -1672,6 +2456,11 @@ impl Render for WorktableView {
                     this.cancel_composer(cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::SubmitComposer, window, cx| {
+                    this.submit_composer(window, cx)
+                }),
+            )
             .child(
                 h_flex()
                     .relative()
@@ -1680,7 +2469,7 @@ impl Render for WorktableView {
                     .h_full()
                     // The transparent macOS titlebar lets the app background
                     // paint through it; leave room for the traffic lights.
-                    .pt(px(30.))
+                    .pt(design::TITLEBAR_INSET)
                     // Cap the reading column on very wide windows so content
                     // stays comfortable; centered.
                     .justify_center()
@@ -1702,7 +2491,7 @@ impl Render for WorktableView {
                                 .gap_3()
                                 .child(
                                     Icon::new(IconName::GalleryVerticalEnd)
-                                        .size(px(32.))
+                                        .size_8()
                                         .text_color(theme.primary),
                                 )
                                 .child(
@@ -1732,24 +2521,21 @@ fn render_main(
     //   with only the page content sliding between them — the button group
     //   never moves.
     // - Settings: back button + tab group on top, no search bar.
-    // - ProviderConfig / GithubStars: full-page replacements with a back
-    //   button, reached from Settings.
+    // - GithubStars: a full-page replacement with a back button, reached from
+    //   Settings. AI providers configure through a modal dialog instead.
     let theme = cx.theme().clone();
-    let viewport_width = window.viewport_size().width;
     // Panes never exceed the content column, or the hidden pane would peek
-    // out beside the active one.
-    let pane_w = viewport_width.min(px(CONTENT_MAX_WIDTH));
+    // out beside the active one. The column is responsive: full width on
+    // narrow windows, wider on large displays.
+    let pane_w = design::content_column_width(window);
 
     let header: gpui::AnyElement = match this.mode {
         AppMode::Entries | AppMode::Assistant => render_library_header(this, cx),
-        AppMode::Settings => settings_header(this, "Settings", SettingsTab::Ui, cx),
-        AppMode::ProviderConfig => settings_header(this, "AI providers", SettingsTab::Providers, cx),
-        AppMode::GithubStars => settings_header(this, "GitHub Stars", SettingsTab::Data, cx),
+        AppMode::Settings => settings_header(this, cx),
     };
 
     let body: gpui::AnyElement = match this.mode {
         AppMode::Entries | AppMode::Assistant => {
-            let is_assistant = this.mode == AppMode::Assistant;
             // Build both panes sequentially (separate mutable borrows).
             let entries_pane = render_entries_pane(this, window, cx).into_any_element();
             let assistant_pane = render_assistant(this, cx).into_any_element();
@@ -1758,60 +2544,18 @@ fn render_main(
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                // The button group is fixed; only this block slides.
-                .child(library_tabs(this, cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .w(pane_w)
-                        .max_w_full()
-                        .overflow_hidden()
-                        .relative()
-                        .child(
-                            h_flex()
-                                .w(pane_w * 2.)
-                                .h_full()
-                                .relative()
-                                .with_animation(
-                                    if is_assistant {
-                                        "slide-to-assistant"
-                                    } else {
-                                        "slide-to-entries"
-                                    },
-                                    worktable_ui::RESIZE.animation(),
-                                    move |el, t| {
-                                        let (from, to) = if is_assistant {
-                                            (px(0.), -pane_w)
-                                        } else {
-                                            (-pane_w, px(0.))
-                                        };
-                                        el.left(from + (to - from) * t)
-                                    },
-                                )
-                                .child(
-                                    div()
-                                        .w(pane_w)
-                                        .h_full()
-                                        .flex()
-                                        .flex_col()
-                                        .child(entries_pane),
-                                )
-                                .child(
-                                    div()
-                                        .w(pane_w)
-                                        .h_full()
-                                        .flex()
-                                        .flex_col()
-                                        .child(assistant_pane),
-                                ),
-                        ),
-                )
+                // The button group is fixed; only the pages below switch.
+                .child(render_library_pages(
+                    this,
+                    pane_w,
+                    entries_pane,
+                    assistant_pane,
+                    window,
+                    cx,
+                ))
                 .into_any_element()
         }
         AppMode::Settings => render_settings(this, window, cx).into_any_element(),
-        AppMode::ProviderConfig => render_provider_config(this, window, cx).into_any_element(),
-        AppMode::GithubStars => render_github_stars_page(this, window, cx).into_any_element(),
     };
 
     v_flex()
@@ -1819,13 +2563,435 @@ fn render_main(
         .flex_1()
         .min_w_0()
         .size_full()
-        .max_w(px(CONTENT_MAX_WIDTH))
+        .max_w(pane_w)
         .bg(theme.tokens.background)
+        // Dropping image files from Finder adds them as entries, matching the
+        // composer's "drag image" hint.
+        .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+            for path in paths.paths() {
+                if let Some(mime) = image_mime_for(path) {
+                    this.add_captured_image(
+                        path.to_string_lossy().into_owned(),
+                        mime.to_owned(),
+                        cx,
+                    );
+                }
+            }
+        }))
+        // The column is centered on wide windows; the header's origin is the
+        // column's window-space origin, which morph positions subtract.
+        .on_children_prepainted({
+            let origin = this.content_origin.clone();
+            move |children: Vec<Bounds<Pixels>>, _, _| {
+                // Every non-overlay child starts at the column's origin; take
+                // the minimum so child ordering can never skew the morph.
+                if let Some(min) = children
+                    .iter()
+                    .map(|bounds| bounds.origin)
+                    .reduce(|a, b| point(a.x.min(b.x), a.y.min(b.y)))
+                {
+                    origin.set(min);
+                }
+            }
+        })
         .child(header)
         .child(body)
-        .when(this.library_menu_open, |this| {
-            this.child(library_context_menu(cx))
-        })
+        // The entry detail morph lives above the pages; dialogs stack above it.
+        .children(render_entry_modal(this, window, cx))
+        // Modal dialogs live in the window's dialog layer, which must be
+        // rendered by the view tree; Root only stores the active dialog.
+        .children(Root::render_dialog_layer(window, cx))
+}
+
+/// The morphing entry view: the panel's rect tweens from the trigger's rect
+/// (card/click) to the middle of the UI, the content laid out at its target
+/// size and revealed by the growing panel. Port of beui.dev's morphing modal
+/// (rect + fade here; GPUI has no scale/filter).
+/// Fullscreen image viewer: a fade-in panel on top of every other window.
+/// Click anywhere or press ⎋ to close.
+struct ImageViewer {
+    source: ImageSource,
+    label: SharedString,
+    focus_handle: FocusHandle,
+    started_at: Instant,
+}
+
+impl ImageViewer {
+    fn new(source: ImageSource, label: SharedString, cx: &mut Context<Self>) -> Self {
+        Self {
+            source,
+            label,
+            focus_handle: cx.focus_handle(),
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Focusable for ImageViewer {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ImageViewer {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let spec = worktable_ui::MODAL_OPEN;
+        let elapsed = self.started_at.elapsed();
+        let t = if elapsed < spec.total() {
+            // Keep frames coming while the fade runs.
+            let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+            spec.progress((elapsed.as_secs_f32() / spec.total().as_secs_f32()).min(1.0))
+        } else {
+            1.0
+        };
+        div()
+            .id("image-viewer")
+            .debug_selector(|| "image-viewer".into())
+            .key_context("ImageViewer")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.tokens.background)
+            .opacity(t)
+            .on_click(|_, window, _| window.remove_window())
+            .on_action(
+                |_: &crate::actions::CloseImageViewer, window: &mut Window, _: &mut App| {
+                    window.remove_window()
+                },
+            )
+            .child(
+                img(self.source.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .debug_selector(|| "image-viewer-image".into()),
+            )
+            .child(
+                div().absolute().top_3().right_3().child(
+                    Button::new("image-viewer-close")
+                        .icon(app_icon(IconName::Close))
+                        .ghost()
+                        .rounded_full()
+                        .tooltip("Close")
+                        .debug_selector(|| "image-viewer-close".into())
+                        .on_click(|_, window, _| window.remove_window()),
+                ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_3()
+                    .left_3()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(self.label.clone()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_3()
+                    .right_3()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Click anywhere or press ⎋ to close"),
+            )
+    }
+}
+
+fn render_entry_modal(
+    this: &mut WorktableView,
+    window: &mut Window,
+    cx: &mut Context<WorktableView>,
+) -> Option<gpui::AnyElement> {
+    let modal = this.entry_modal.as_ref()?;
+    let entry = this
+        .entries
+        .iter()
+        .find(|entry| entry.id == modal.entry_id)?
+        .clone();
+    let theme = cx.theme().clone();
+    let viewport = window.viewport_size();
+    let pane_w = design::content_column_width(window);
+    let edge = design::to_pixels(rems(0.75), window);
+    let panel_w = (pane_w - edge * 2.0).max(design::to_pixels(rems(16.0), window));
+    let panel_h = viewport.height * 0.72;
+    let target = Bounds::new(
+        point((pane_w - panel_w) / 2.0, (viewport.height - panel_h) / 2.0),
+        size(panel_w, panel_h),
+    );
+
+    let (raw, spec, opening) = match modal.closing_at {
+        Some(started) => (started.elapsed(), worktable_ui::MORPH_CLOSE, false),
+        None => (modal.opened_at.elapsed(), worktable_ui::MORPH_OPEN, true),
+    };
+    // The unmount timer clears the state in production, but never rely on a
+    // clock ticking to stop painting: once the close span is over the panel
+    // is done regardless.
+    if !opening && raw >= spec.total() {
+        return None;
+    }
+    if raw < spec.total() {
+        // Keep frames coming for the morph.
+        let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+    }
+    let eased = spec.progress((raw.as_secs_f32() / spec.total().as_secs_f32()).min(1.0));
+    let t = if opening { eased } else { 1.0 - eased };
+    // Closing shrank back into the card it came from (its live rect, so a
+    // scrolled list still matches); opening grows out of the stored rect.
+    let from = if opening {
+        modal.origin
+    } else {
+        this.card_bounds
+            .borrow()
+            .get(&modal.entry_id)
+            .map(|bounds| this.local_bounds(*bounds))
+            .unwrap_or(modal.origin)
+    };
+    let lerp = |from: Pixels, to: Pixels| from + (to - from) * t;
+    let panel = Bounds::new(
+        point(
+            lerp(from.origin.x, target.origin.x),
+            lerp(from.origin.y, target.origin.y),
+        ),
+        size(
+            lerp(from.size.width, target.size.width),
+            lerp(from.size.height, target.size.height),
+        ),
+    );
+    // Content cross-fades in once the panel is meaningfully large.
+    let content_t = ((t - 0.3) / 0.7).clamp(0.0, 1.0);
+
+    let meta = format!(
+        "{} · {}",
+        entry.source,
+        crate::format::relative_time(entry.created_at)
+    );
+    let close_view = cx.entity();
+    let copy_text = entry.content.clone();
+    let actions = crate::entry_actions::detect_actions(&entry.content);
+    let editing = this.entry_editing;
+
+    // Header: metadata + close.
+    let header = h_flex()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(meta),
+        )
+        .child(div().flex_1())
+        .child(
+            Button::new("entry-modal-close")
+                .icon(app_icon(IconName::Close))
+                .ghost()
+                .tooltip("Close")
+                .debug_selector(|| "entry-modal-close".into())
+                .on_click({
+                    let view = close_view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.close_entry_modal(cx));
+                    }
+                }),
+        );
+
+    let mut body = v_flex().size_full().min_h_0().child(header);
+    if let Some(title) = entry.title.clone() {
+        body = body.child(
+            div()
+                .px_4()
+                .pt_3()
+                .text_base()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title),
+        );
+    }
+
+    if editing {
+        body = body.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .p_3()
+                .debug_selector(|| "entry-modal-editor".into())
+                .child(
+                    Textarea::new(&this.entry_edit_input)
+                        .h(gpui::relative(1.0))
+                        .appearance(true)
+                        .bordered(true),
+                ),
+        );
+    } else if let Some(source) = image_source_for(&entry.content) {
+        body = body.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .p_4()
+                .debug_selector(|| "entry-modal-image".into())
+                .child(render_entry_image(
+                    source,
+                    entry.content.clone(),
+                    &theme,
+                    cx,
+                )),
+        );
+    } else {
+        body = body.child(
+            // The rich text component owns scrolling: its root takes the
+            // container's height, so an outer scroll container cannot measure
+            // the overflow. `scrollable(true)` virtualizes the content and
+            // draws its own scrollbar.
+            div()
+                .flex_1()
+                .min_h_0()
+                .px_4()
+                .pt_3()
+                .pb_2()
+                .debug_selector(|| "entry-modal-scroll".into())
+                .child(
+                    TextView::markdown(
+                        SharedString::from(format!("entry-modal-body:{}", entry.id)),
+                        entry.content.clone(),
+                    )
+                    .selectable(true)
+                    .scrollable(true),
+                ),
+        );
+    }
+
+    let mut footer = h_flex()
+        .flex_wrap()
+        .gap_2()
+        .items_center()
+        .px_4()
+        .py_3()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(modal_chip(
+            "entry-modal-copy",
+            "Copy",
+            Some(IconName::Copy),
+            move |_window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+            },
+        ))
+        .children(actions.into_iter().map(|action| match action {
+            crate::entry_actions::EntryAction::Link(url) => modal_chip(
+                "entry-modal-open-link",
+                "Open link",
+                Some(IconName::ExternalLink),
+                move |_window, cx| cx.open_url(&url),
+            ),
+            crate::entry_actions::EntryAction::Email(email) => {
+                modal_chip("entry-modal-email", "Email", None, move |_window, cx| {
+                    cx.open_url(&format!("mailto:{email}"))
+                })
+            }
+            crate::entry_actions::EntryAction::Phone(phone) => {
+                modal_chip("entry-modal-call", "Call", None, move |_window, cx| {
+                    cx.open_url(&format!("tel:{}", phone.replace([' ', '(', ')'], "")))
+                })
+            }
+        }));
+    footer = footer.child(div().flex_1());
+    if editing {
+        let cancel_view = cx.entity();
+        footer = footer.child(modal_chip(
+            "entry-modal-cancel",
+            "Cancel",
+            None,
+            move |_window, cx| {
+                cancel_view.update(cx, |this, cx| this.cancel_entry_edit(cx));
+            },
+        ));
+        let save_view = cx.entity();
+        footer = footer.child(
+            Button::new("entry-modal-save")
+                .label("Save")
+                .primary()
+                .small()
+                .rounded_full()
+                .debug_selector(|| "entry-modal-save".into())
+                .on_click(move |_, _, cx| {
+                    save_view.update(cx, |this, cx| this.save_entry_edit(cx));
+                }),
+        );
+    } else {
+        let edit_view = cx.entity();
+        footer = footer.child(modal_chip(
+            "entry-modal-edit",
+            "Edit",
+            None,
+            move |window, cx| {
+                edit_view.update(cx, |this, cx| this.start_entry_edit(window, cx));
+            },
+        ));
+    }
+    if let Some(status) = this.entry_edit_status.clone() {
+        footer = footer.child(
+            div()
+                .id("entry-modal-edit-status")
+                .role(Role::Status)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status),
+        );
+    }
+    body = body.child(footer);
+
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .id("entry-modal-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .debug_selector(|| "entry-modal-backdrop".into())
+                    .bg(theme.tokens.background.opacity(0.62 * t))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_entry_modal(cx))),
+            )
+            .child(
+                div()
+                    .id("entry-modal")
+                    .debug_selector(|| "entry-modal".into())
+                    .occlude()
+                    .absolute()
+                    .left(panel.origin.x)
+                    .top(panel.origin.y)
+                    .w(panel.size.width)
+                    .h(panel.size.height)
+                    .min_w_0()
+                    .overflow_hidden()
+                    .rounded(theme.radius_tokens().lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.tokens.popover)
+                    // The whole panel fades with the tween so the morph reads
+                    // as a materialization, not a pop.
+                    .opacity(t.clamp(0.0, 1.0))
+                    .shadow_lg()
+                    // Lay the content out at the target size; the growing
+                    // panel clips it, so text never reflows mid-morph.
+                    .child(
+                        div()
+                            .w(target.size.width)
+                            .h(target.size.height)
+                            .opacity(content_t)
+                            .child(body),
+                    ),
+            )
+            .into_any_element(),
+    )
 }
 
 fn render_library_header(
@@ -1834,25 +3000,25 @@ fn render_library_header(
 ) -> gpui::AnyElement {
     let theme = cx.theme().clone();
 
-    // Search field + Ask Agent + hamburger as real flex siblings — the old
-    // absolutely-positioned button overlapped the field's text.
+    // Search field + page toggle + library menu as real flex siblings. The
+    // search field doubles as the prompt box: Enter sends the query to the
+    // agent; Tab moves focus on to the page toggle like every other control.
     h_flex()
         .id("library-header")
+        .debug_selector(|| "library-header".into())
         .w_full()
         .items_center()
         .gap_2()
         .px_4()
-        .pt_2()
-        .pb_2()
+        .py_2()
         .bg(theme.tokens.background)
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .h(px(36.))
+                .debug_selector(|| "library-search".into())
                 .child(
                     Input::new(&this.search_input)
-                        .h(px(36.))
                         .w_full()
                         .appearance(true)
                         .bordered(false)
@@ -1861,61 +3027,53 @@ fn render_library_header(
                         .text_color(theme.foreground)
                         .prefix(
                             Icon::new(IconName::Search)
-                                .size(px(18.))
+                                .size_4()
                                 .text_color(theme.muted_foreground),
                         ),
                 ),
         )
-        .child(
-            Button::new("ask-agent")
-                .label("Ask Agent")
-                .primary()
-                .shadow_sm()
-                .h(px(32.))
-                .text_xs()
-                .on_click(cx.listener(|this, _, _, cx| this.show_assistant(cx))),
-        )
-        .child(
-            div()
-                .size(px(36.))
-                .flex_shrink_0()
-                .items_center()
-                .justify_center()
-                .child(library_menu_button(this, cx)),
-        )
+        .child(page_toggle_button(this, cx))
+        .child(library_menu_button(this, cx))
         .into_any_element()
 }
 
 /// Shared header for the Settings-family pages: a back button at the left
 /// corner (returns to Settings on the given tab) and — on the Settings page
 /// itself — the UI/Data/Providers tab group.
-fn settings_header(
-    this: &mut WorktableView,
-    title: &str,
-    back_to: SettingsTab,
-    cx: &mut Context<WorktableView>,
-) -> gpui::AnyElement {
+fn settings_header(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
     let theme = cx.theme().clone();
-    let is_settings = this.mode == AppMode::Settings;
+    let page = this.settings_tab;
+    let title = page.map(SettingsTab::title).unwrap_or("Settings");
 
     h_flex()
         .id("settings-header")
+        .debug_selector(|| "settings-header".into())
         .w_full()
         .items_center()
         .gap_3()
         .px_4()
-        .pt_2()
-        .pb_2()
+        .py_2()
         .bg(theme.tokens.background)
         .child(
             Button::new("settings-back")
                 .icon(app_icon(IconName::ArrowLeft))
                 .label("Back")
                 .ghost()
-                .h(px(32.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings_tab = back_to;
-                    this.show_settings(cx);
+                .debug_selector(|| "settings-back".into())
+                .tooltip(if page.is_some() {
+                    "Back to settings"
+                } else {
+                    "Back to entries"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.settings_tab.is_some() {
+                        // Category pages return to the Settings list; the
+                        // list's Back returns to the main UI.
+                        this.settings_tab = None;
+                        cx.notify();
+                    } else {
+                        this.show_entries(cx);
+                    }
                 })),
         )
         .child(
@@ -1925,136 +3083,115 @@ fn settings_header(
                 .child(title.to_owned()),
         )
         .child(div().flex_1())
-        .when(is_settings, |el| {
-            el.child(settings_tab_group(this, cx))
-        })
         .into_any_element()
 }
 
-/// The UI / Data / Providers segmented control.
-fn settings_tab_group(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
+/// The library menu: a visible dropdown trigger owning its own open state,
+/// dismissal and keyboard navigation. The `secondary` variant keeps a filled
+/// rest state and switches to its active background while the popup is open.
+/// Entries ⇄ Agent toggle: an icon-only circular button left of the menu that
+/// shows the current page's icon and switches to the other page.
+fn page_toggle_button(this: &WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let tabs = [
-        ("settings-tab-ui", "UI", SettingsTab::Ui),
-        ("settings-tab-data", "Data", SettingsTab::Data),
-        ("settings-tab-providers", "Providers", SettingsTab::Providers),
-    ];
-    let mut group = h_flex()
-        .gap_1()
-        .p_1()
-        .bg(theme.tokens.background)
-        .rounded(px(RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme.border.opacity(0.6));
-    for (id, label, tab) in tabs {
-        let active = this.settings_tab == tab;
-        let mut btn = Button::new(id)
-            .label(label)
-            .h(px(26.))
-            .text_xs()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.settings_tab = tab;
-                cx.notify();
-            }));
-        btn = if active { btn.primary() } else { btn.ghost() };
-        group = group.child(btn);
-    }
-    group.into_any_element()
+    let is_assistant = this.mode == AppMode::Assistant;
+    // The icon shows where a click takes you: a sparkle pair for the agent, a
+    // dashboard for the entries list.
+    Button::new("page-toggle")
+        .secondary()
+        .size_10()
+        .rounded_full()
+        .debug_selector(|| "page-toggle".into())
+        .tooltip(if is_assistant {
+            "Showing agent — switch to entries"
+        } else {
+            "Showing entries — switch to agent"
+        })
+        .when(is_assistant, |button| {
+            button.icon(app_icon(IconName::LayoutDashboard))
+        })
+        .when(!is_assistant, |button| {
+            button.child(sparkle_icon(theme.foreground))
+        })
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.mode == AppMode::Assistant {
+                this.show_entries(cx);
+            } else {
+                this.show_assistant(cx);
+            }
+        }))
 }
 
+/// The library menu: Settings, the entry sort modes (the button group they
+/// replaced sat under the header), and Quit.
 fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
-    let theme = cx.theme().clone();
+    let view = cx.entity();
+    let (is_time, is_alpha, is_topic) = (
+        this.sort_mode == SortMode::Time,
+        this.sort_mode == SortMode::Alpha,
+        this.sort_mode == SortMode::Topic,
+    );
+    let ascending = this.sort_ascending;
 
     Button::new("library-menu")
         .icon(app_icon(IconName::Menu))
-        .ghost()
-        .size(px(40.))
-        .rounded(px(59.))
-        .bg(theme.muted)
-        .text_color(theme.muted_foreground)
-        .selected(this.library_menu_open)
-        .on_click(cx.listener(|this, _, _, cx| this.toggle_library_menu(cx)))
-}
-
-fn library_context_menu(cx: &mut Context<WorktableView>) -> gpui::AnyElement {
-    let theme = cx.theme().clone();
-
-    fn menu_row(
-        id: &'static str,
-        label: &'static str,
-        icon: IconName,
-        tall: bool,
-        cx: &mut Context<WorktableView>,
-        on_click: impl Fn(&mut WorktableView, &mut Window, &mut Context<WorktableView>) + 'static,
-    ) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        h_flex()
-            .id(id)
-            .w_full()
-            .h(px(if tall { 40.0 } else { 36.0 }))
-            .items_center()
-            .gap_3()
-            .px_4()
-            .rounded(px(RADIUS_ROW))
-            .cursor_pointer()
-            .hover(|this| this.bg(theme.muted))
-            .on_click(cx.listener(move |this, _event, window, cx| on_click(this, window, cx)))
-            .child(
-                Icon::new(icon)
-                    .size(px(16.))
-                    .text_color(theme.muted_foreground),
+        .secondary()
+        .size_10()
+        .rounded_full()
+        .tooltip("Library menu")
+        .debug_selector(|| "library-menu".into())
+        .dropdown_menu(move |menu, _, _| {
+            let settings_view = view.clone();
+            let mut menu = menu
+                .item(
+                    PopupMenuItem::new("Settings")
+                        .icon(Icon::new(IconName::Settings))
+                        .on_click(move |_, _, cx| {
+                            settings_view.update(cx, |this, cx| this.show_settings(cx));
+                        }),
+                )
+                .separator();
+            for (mode, checked, label) in [
+                (
+                    SortMode::Time,
+                    is_time,
+                    if is_time && ascending {
+                        "Oldest first"
+                    } else {
+                        "Newest first"
+                    },
+                ),
+                (
+                    SortMode::Alpha,
+                    is_alpha,
+                    if is_alpha && ascending {
+                        "A to Z"
+                    } else {
+                        "Z to A"
+                    },
+                ),
+                (
+                    SortMode::Topic,
+                    is_topic,
+                    if is_topic && ascending {
+                        "Topics A to Z"
+                    } else {
+                        "Topics Z to A"
+                    },
+                ),
+            ] {
+                let view = view.clone();
+                menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.set_sort_mode(mode, cx));
+                    },
+                ));
+            }
+            menu.separator().item(
+                PopupMenuItem::new("Quit Worktable")
+                    .icon(Icon::new(IconName::Close))
+                    .on_click(|_, _, cx| cx.quit()),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(label.to_owned()),
-            )
-            .into_any_element()
-    }
-
-    v_flex()
-        .id("library-context-menu")
-        .absolute()
-        .top(px(52.))
-        .right(px(8.))
-        .w(px(220.))
-        .p(px(4.))
-        .gap_1()
-        .rounded(px(RADIUS_MENU))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.popover)
-        .shadow_lg()
-        .child(menu_row(
-            "library-menu-settings",
-            "Settings",
-            IconName::Settings,
-            true,
-            cx,
-            |this, _window, cx| this.show_settings(cx),
-        ))
-        .child(menu_row(
-            "library-menu-archive",
-            "Archive",
-            IconName::FolderOpen,
-            true,
-            cx,
-            |this, _window, cx| {
-                this.library_menu_open = false;
-                cx.notify();
-            },
-        ))
-        .child(div().mx(px(4.)).h(px(1.)).bg(theme.border))
-        .child(menu_row(
-            "library-menu-exit",
-            "Exit Worktable",
-            IconName::Close,
-            true,
-            cx,
-            |_this, _window, cx| cx.quit(),
-        ))
-        .into_any_element()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,19 +3206,20 @@ fn render_settings(
     let theme = cx.theme().clone();
     let view = cx.entity();
 
-    if this.providers.is_empty() {
+    if this.settings_tab == Some(SettingsTab::Providers) && this.providers.is_empty() {
         let message = this
             .settings_status
             .clone()
             .unwrap_or_else(|| "Loading providers…".to_owned());
         let loader = if this.providers_loading {
-            let phase = pulse_delta(&ZERON_PULSE, cx.entity_id(), cx);
-            let opacity = worktable_ui::pulse_opacity(phase);
             div()
-                .size(px(12.))
-                .rounded_full()
-                .bg(theme.primary)
-                .opacity(opacity)
+                .debug_selector(|| "providers-loading".into())
+                .child(
+                    Orb::new("providers-loading", OrbVariant::G2)
+                        .view(cx.entity_id())
+                        .size(rems(1.75))
+                        .color(theme.primary),
+                )
                 .into_any_element()
         } else {
             div().into_any_element()
@@ -2124,53 +3262,92 @@ fn render_settings(
         })
         .unwrap_or_else(|| "No AI provider is active yet.".to_owned());
 
-    let configure = Button::new("configure-providers")
-        .label("Configure providers")
-        .icon(app_icon(IconName::Settings))
-        .primary()
-        .on_click(cx.listener(|this, _, _, cx| this.show_provider_config(cx)));
-
-    // The tab group lives in the settings header (`settings_tab_group`); the
-    // body only switches on `this.settings_tab`.
-    let _ = &theme;
-
-    let _tab_bar = ();
-    let ui_section = v_flex().gap_4().p_4().child(
-        v_flex()
-            .gap_2()
-            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("UI"))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Appearance"),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().child("Dark theme"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Ayu Light / Ayu Dark"),
-                            ),
-                    )
-                    .child(
-                        Switch::new("toggle-theme")
-                            .checked(this.dark_mode)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                if *checked != this.dark_mode {
-                                    this.toggle_theme(cx);
-                                }
-                            })),
-                    ),
-            ),
-    );
+    // Appearance page: theme mode group + the thinking toggle.
+    let is_light = this.theme_mode == AppThemeMode::Light;
+    let is_dark = this.theme_mode == AppThemeMode::Dark;
+    let is_system = this.theme_mode == AppThemeMode::System;
+    let appearance_section = v_flex()
+        .gap_5()
+        .p_4()
+        .child(
+            v_flex()
+                .gap_2()
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Theme"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Light, dark, or follow the system appearance"),
+                )
+                .child(
+                    ButtonGroup::new("theme-mode-group")
+                        .compact()
+                        .outline()
+                        .child(
+                            Button::new("theme-light")
+                                .icon(app_icon(IconName::Sun))
+                                .tooltip("Light")
+                                .debug_selector(|| "theme-light".into())
+                                .selected(is_light),
+                        )
+                        .child(
+                            Button::new("theme-dark")
+                                .icon(app_icon(IconName::Moon))
+                                .tooltip("Dark")
+                                .debug_selector(|| "theme-dark".into())
+                                .selected(is_dark),
+                        )
+                        .child(
+                            Button::new("theme-system")
+                                .icon(app_icon(IconName::Cpu))
+                                .tooltip("System")
+                                .debug_selector(|| "theme-system".into())
+                                .selected(is_system),
+                        )
+                        .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
+                            let mode = match selected.first() {
+                                Some(0) => AppThemeMode::Light,
+                                Some(1) => AppThemeMode::Dark,
+                                _ => AppThemeMode::System,
+                            };
+                            if mode != this.theme_mode {
+                                this.set_theme_mode(mode, window, cx);
+                            }
+                        })),
+                ),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().text_sm().child("Show thinking"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Display the assistant's reasoning while it works"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| "thinking-switch".into())
+                        .child(
+                            Switch::new("toggle-thinking")
+                                .checked(this.show_thinking)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    if *checked != this.show_thinking {
+                                        this.toggle_show_thinking(cx);
+                                    }
+                                })),
+                        ),
+                ),
+        );
 
     // Data tab: one row per data provider, with a Configure button that opens
     // the provider's full-page setup.
@@ -2195,22 +3372,17 @@ fn render_settings(
                 .items_center()
                 .gap_3()
                 .p_3()
-                .rounded(px(RADIUS_CARD))
+                .rounded(theme.radius_tokens().md)
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.popover)
-                .shadow_2xs()
-                .child(
-                    Icon::new(IconName::Star)
-                        .size(px(18.))
-                        .text_color(theme.primary),
-                )
+                .child(Icon::new(IconName::Star).size_5().text_color(theme.primary))
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
                         .gap_1()
-                        .child(div().text_sm().child("GitHub Stars"))
+                        .child(div().text_sm().child("GitHub stars"))
                         .child(
                             div()
                                 .text_xs()
@@ -2222,201 +3394,148 @@ fn render_settings(
                     Button::new("configure-github-stars")
                         .label("Configure")
                         .ghost()
-                        .h(px(28.))
-                        .on_click(cx.listener(|this, _, _, cx| this.show_github_stars(cx))),
+                        .small()
+                        .debug_selector(|| "configure-github-stars".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_github_dialog(window, cx)),
+                        ),
                 ),
         );
 
-
-    let providers_section = v_flex().gap_4().items_center().child(
-        v_flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .text_2xl()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("AI providers"),
-            )
-            .child(
-                div()
-                    .max_w(px(480.))
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        "Choose a provider, model, and authentication method for the assistant.",
-                    ),
-            )
-            .child(div().text_sm().text_color(theme.primary).child(active))
-            .child(configure),
-    );
+    // One card per provider; Configure opens the modal auth dialog. The model
+    // picker stays on the row so switching a model is one click.
+    let provider_rows: Vec<gpui::AnyElement> = this
+        .providers
+        .iter()
+        .map(|provider| render_settings_provider_row(this, provider, &view, cx))
+        .collect();
+    let login_panel = this
+        .logging_in
+        .iter()
+        .next()
+        .cloned()
+        .and_then(|provider_id| render_active_login(&view, &provider_id, cx));
+    let mut providers_section = v_flex()
+        .gap_2()
+        .p_4()
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("AI providers"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Choose a provider, model, and authentication method for the assistant."),
+        )
+        .child(div().text_sm().text_color(theme.primary).child(active))
+        .children(provider_rows);
+    if let Some(status) = &this.settings_status {
+        providers_section = providers_section.child(
+            div()
+                .id("providers-status")
+                .role(Role::Status)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status.clone()),
+        );
+    }
+    if let Some(panel) = login_panel {
+        providers_section = providers_section.child(panel);
+    }
 
     let content = match this.settings_tab {
-        SettingsTab::Ui => ui_section.into_any_element(),
-        SettingsTab::Data => data_section.into_any_element(),
-        SettingsTab::Providers => providers_section.into_any_element(),
+        None => settings_categories(&theme, cx).into_any_element(),
+        Some(SettingsTab::Appearance) => appearance_section.into_any_element(),
+        Some(SettingsTab::Data) => data_section.into_any_element(),
+        Some(SettingsTab::Providers) => providers_section.into_any_element(),
     };
 
-    let _ = _tab_bar;
     v_flex()
         .flex_1()
+        .w_full()
         .overflow_y_scrollbar()
-        .p_4()
-        .gap_4()
         .child(content)
         .into_any_element()
 }
 
-fn render_provider_config(
-    this: &mut WorktableView,
-    _window: &mut Window,
+/// The Settings landing list: one line-separated row per category.
+fn settings_categories(
+    theme: &gpui_component::Theme,
     cx: &mut Context<WorktableView>,
 ) -> impl IntoElement {
-    let theme = cx.theme().clone();
-
-    if this.providers.is_empty() {
-        let message = this
-            .settings_status
-            .clone()
-            .unwrap_or_else(|| "Loading providers…".to_owned());
-        let view = cx.entity();
-        return v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .gap_3()
+    let mut list = v_flex()
+        .w_full()
+        .debug_selector(|| "settings-categories".into());
+    for tab in [
+        SettingsTab::Appearance,
+        SettingsTab::Data,
+        SettingsTab::Providers,
+    ] {
+        let id = match tab {
+            SettingsTab::Appearance => "settings-category-appearance",
+            SettingsTab::Data => "settings-category-data",
+            SettingsTab::Providers => "settings-category-providers",
+        };
+        let selector = id.to_owned();
+        let row = ListItem::new(id)
+            .debug_selector(move || selector.clone())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings_tab = Some(tab);
+                cx.notify();
+            }))
             .child(
-                div()
-                    .max_w(px(520.))
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(message),
-            )
-            .child(
-                Button::new("retry-providers")
-                    .label("Retry")
-                    .ghost()
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.refresh_providers(cx));
-                    }),
-            )
-            .into_any_element();
-    }
-
-    let view = cx.entity();
-    let back_button = Button::new("back-to-settings")
-        .label("Back to Settings")
-        .ghost()
-        .flex_shrink_0()
-        .on_click(move |_, _, cx| {
-            view.update(cx, |this, cx| this.show_settings(cx));
-        });
-
-    let provider_heading = h_flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .px_4()
-        .pt_3()
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("AI providers"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Choose a provider, model, and authentication method."),
-                ),
-        )
-        .child(back_button);
-
-    // Status + active line above the provider list.
-    let mut status = v_flex().gap_1().px_4().pt_3();
-    if let Some(status_text) = &this.settings_status {
-        status = status.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(tab.title()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(tab.description()),
+                            ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    ),
+            );
+        list = list.child(
             div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(status_text.clone()),
+                .w_full()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.6))
+                .child(row),
         );
     }
-    if let Some(active) = &this.active_provider {
-        status = status.child(div().text_sm().text_color(theme.primary).child(format!(
-                    "Active: {}{}",
-                    active,
-                    this.active_model
-                        .as_deref()
-                        .map(|model| format!(" / {model}"))
-                        .unwrap_or_default()
-                )));
-    }
-
-    let login_panel = render_active_login(this, cx);
-
-    // Provider rows are virtualized and their fixed sizes are retained between
-    // renders. This keeps scroll geometry stable while streamed UI updates call
-    // for normal GPUI repaints.
-    let view = cx.entity();
-    let item_sizes = this.provider_row_sizes.clone();
-    let list = v_virtual_list(
-        view.clone(),
-        "providers-list",
-        item_sizes.clone(),
-        move |this, range, window, cx| {
-            range
-                .into_iter()
-                .map(|index| render_provider_row(this, index, item_sizes[index].height, window, cx))
-                .collect::<Vec<_>>()
-        },
-    )
-    .track_scroll(&this.settings_scroll)
-    .flex_1();
-
-    let scrollbar = Scrollbar::vertical(&this.settings_scroll).axis(ScrollbarAxis::Vertical);
-
-    let mut root = v_flex()
-        .flex_1()
-        .min_h_0()
-        .size_full()
-        .child(provider_heading)
-        .child(status)
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .relative()
-                .child(list)
-                .child(scrollbar),
-        );
-    if let Some(panel) = login_panel {
-        root = root.child(div().px_4().pt_3().child(panel));
-    }
-
-    root.into_any_element()
+    list
 }
 
-/// A single fixed-height provider row (name + auth badges | controls).
-fn render_provider_row(
+/// One provider card in Settings → Providers: identity and auth badges,
+/// the model picker when the provider is usable, and the Configure button
+/// that opens the auth dialog.
+fn render_settings_provider_row(
     this: &WorktableView,
-    index: usize,
-    height: Pixels,
-    _window: &mut Window,
+    provider: &ProviderInfo,
+    view: &gpui::Entity<WorktableView>,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
-    let Some(provider) = this.providers.get(index) else {
-        return div().h(height).w_full().into_any_element();
-    };
     let theme = cx.theme().clone();
-    let name = provider.name.clone();
     let is_active = this.active_provider.as_deref() == Some(&provider.id);
-    let logging_in = this.logging_in.contains(&provider.id);
     let active_model = this.active_model.clone();
 
     let mut badges = Vec::new();
@@ -2424,106 +3543,58 @@ fn render_provider_row(
         badges.push(if provider.api_key_set {
             "API key ✓"
         } else {
-            "API key"
+            "API key not set"
         });
     }
     if provider.supports_oauth {
         badges.push(if provider.oauth_set {
             "OAuth ✓"
         } else {
-            "OAuth"
+            "OAuth not connected"
         });
     }
     if is_active {
-        badges.push("active");
+        badges.push("Active");
     }
     let badge_text = badges.join(" · ");
 
-    let mut left = h_flex().gap_2().items_center().flex_1().min_w_0();
-    left = left.child(
-        div()
-            .flex_shrink_0()
-            .text_sm()
-            .font_weight(gpui::FontWeight::BOLD)
-            .child(name),
-    );
-    if !badge_text.is_empty() {
-        left = left.child(
-            div()
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .p_3()
+        .rounded(theme.radius_tokens().md)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .child(
+            v_flex()
                 .flex_1()
                 .min_w_0()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .line_clamp(1)
-                .child(badge_text),
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(provider.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(badge_text),
+                ),
         );
-    }
 
+    let usable = provider.api_key_set || provider.oauth_set;
     let model_options = this
         .provider_models
         .get(&provider.id)
         .cloned()
         .unwrap_or_default();
-    let controls = render_provider_field(
-        &cx.entity(),
-        provider,
-        model_options,
-        logging_in,
-        active_model,
-        this.api_key_provider.as_deref() == Some(&provider.id),
-        this.api_key_input.clone(),
-        _window,
-        cx,
-    );
-
-    h_flex()
-        .h(height)
-        .w_full()
-        .px_3()
-        .items_center()
-        .justify_between()
-        .border_b_1()
-        .border_color(theme.border.opacity(0.5))
-        .child(left)
-        .child(controls)
-        .into_any_element()
-}
-
-/// The controls on the right side of a provider row: model picker, API key,
-/// and OAuth sign-in.
-fn render_provider_field(
-    view: &gpui::Entity<WorktableView>,
-    provider: &ProviderInfo,
-    model_options: Arc<Vec<(String, String)>>,
-    logging_in: bool,
-    active_model: Option<String>,
-    showing_key: bool,
-    api_key_input: Entity<InputState>,
-    _window: &mut Window,
-    cx: &mut Context<WorktableView>,
-) -> gpui::AnyElement {
-    let view = view.clone();
-    let mut row = h_flex().gap_2().items_center();
-
-    let configure_view = view.clone();
-    let configure_provider_id = provider.id.clone();
-    row = row.child(
-        Button::new(format!("configure:{}", provider.id))
-            .label("Configure")
-            .icon(app_icon(IconName::Settings))
-            .ghost()
-            .h(px(28.))
-            .on_click(move |_, _, cx| {
-                configure_view.update(cx, |this, cx| {
-                    this.configure_provider(&configure_provider_id, cx)
-                });
-            }),
-    );
-
-    let usable = provider.api_key_set || provider.oauth_set;
     if usable && !model_options.is_empty() {
         row = row.child(model_picker_button(
-            &view,
+            view,
             provider,
             model_options,
             active_model,
@@ -2531,86 +3602,24 @@ fn render_provider_field(
         ));
     }
 
-    if provider.supports_api_key {
-        if showing_key {
-            row = row
-                .child(Input::new(&api_key_input).h(px(30.)).w(px(220.)))
-                .child(
-                    Button::new(format!("save-key:{}", provider.id))
-                        .label("Save")
-                        .primary()
-                        .h(px(28.))
-                        .on_click({
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| this.save_api_key(cx));
-                            }
-                        }),
-                );
-        } else {
-            let label = if provider.api_key_set {
-                "Change API key"
-            } else {
-                "Set API key"
-            };
-            let view = view.clone();
-            let provider_id = provider.id.clone();
-            row = row.child(
-                Button::new(format!("set-key:{}", provider.id))
-                    .label(label)
-                    .ghost()
-                    .h(px(28.))
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.api_key_provider = Some(provider_id.clone());
-                            let input = this.api_key_input.clone();
-                            this.set_input(&input, "", cx);
-                            cx.notify();
-                        });
-                    }),
-            );
-        }
-    }
-
-    if provider.supports_oauth {
-        if provider.oauth_set {
-            let view = view.clone();
-            let provider_id = provider.id.clone();
-            row = row.child(
-                Button::new(format!("logout:{}", provider.id))
-                    .label("Sign out")
-                    .ghost()
-                    .h(px(28.))
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.logout_provider(&provider_id, cx));
-                    }),
-            );
-        } else if logging_in {
-            let view = view.clone();
-            let provider_id = provider.id.clone();
-            row = row.child(
-                Button::new(format!("cancel-login:{}", provider.id))
-                    .label("Cancel")
-                    .ghost()
-                    .h(px(28.))
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.cancel_login(&provider_id, cx));
-                    }),
-            );
-        } else {
-            let view = view.clone();
-            let provider_id = provider.id.clone();
-            row = row.child(
-                Button::new(format!("login:{}", provider.id))
-                    .label("Sign in with OAuth")
-                    .icon(app_icon(IconName::ExternalLink))
-                    .h(px(28.))
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.login_oauth(&provider_id, cx));
-                    }),
-            );
-        }
-    }
+    let configure_view = view.clone();
+    let provider_id = provider.id.clone();
+    row = row.child(
+        Button::new(format!("configure:{}", provider.id))
+            .label("Configure")
+            .icon(app_icon(IconName::Settings))
+            .ghost()
+            .small()
+            .debug_selector({
+                let selector = format!("configure:{}", provider.id);
+                move || selector.clone()
+            })
+            .on_click(move |_, window, cx| {
+                configure_view.update(cx, |this, cx| {
+                    this.open_provider_dialog(&provider_id, window, cx)
+                });
+            }),
+    );
 
     row.into_any_element()
 }
@@ -2635,7 +3644,7 @@ fn model_picker_button(
         .label(label)
         .icon(app_icon(IconName::ChevronDown))
         .ghost()
-        .h(px(28.))
+        .small()
         .dropdown_menu(move |menu, _, _| {
             let mut menu = menu;
             for (model_id, model_name) in models.iter() {
@@ -2658,134 +3667,141 @@ fn model_picker_button(
 }
 
 /// A panel showing the in-progress OAuth login (auth URL, device code, and any
-/// prompt the user must answer).
+/// prompt the user must answer) for one provider.
 fn render_active_login(
-    this: &WorktableView,
-    cx: &mut Context<WorktableView>,
+    view: &gpui::Entity<WorktableView>,
+    provider_id: &str,
+    cx: &mut App,
 ) -> Option<gpui::AnyElement> {
-    let provider_id = this.logging_in.iter().next()?.clone();
+    let this = view.read(cx);
+    if !this.logging_in.contains(provider_id) {
+        return None;
+    }
+    let provider_id = provider_id.to_owned();
     let theme = cx.theme().clone();
 
     let mut column = v_flex().gap_2();
 
     let mut has_content = false;
     if let Some(notice) = &this.auth_notice
-        && notice.provider_id == provider_id {
-            has_content = true;
-            match &notice.notify {
-                AuthNotifyKind::AuthUrl { url, instructions } => {
-                    let url = url.clone();
-                    let instructions = instructions.clone();
-                    let view = cx.entity();
-                    column = column
-                        .child(
-                            div().text_sm().child(
-                                instructions
-                                    .clone()
-                                    .unwrap_or_else(|| "Open this URL to authorize:".to_owned()),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(url.clone()),
-                        )
-                        .child(
-                            Button::new(format!("open-url:{provider_id}"))
-                                .label("Open in browser")
-                                .icon(app_icon(IconName::ExternalLink))
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| this.open_auth_url(&url, cx));
-                                }),
-                        );
-                }
-                AuthNotifyKind::DeviceCode {
-                    user_code,
-                    verification_uri,
-                    ..
-                } => {
-                    let verification_uri = verification_uri.clone();
-                    let user_code = user_code.clone();
-                    let view = cx.entity();
-                    column = column
-                        .child(
-                            div()
-                                .text_sm()
-                                .child("Enter this code on the provider's website:"),
-                        )
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(theme.primary)
-                                .child(user_code),
-                        )
-                        .child(
-                            Button::new(format!("open-device-url:{provider_id}"))
-                                .label("Open verification page")
-                                .icon(app_icon(IconName::ExternalLink))
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.open_auth_url(&verification_uri, cx)
-                                    });
-                                }),
-                        );
-                }
-                _ => {}
+        && notice.provider_id == provider_id
+    {
+        has_content = true;
+        match &notice.notify {
+            AuthNotifyKind::AuthUrl { url, instructions } => {
+                let url = url.clone();
+                let instructions = instructions.clone();
+                let view = view.clone();
+                column = column
+                    .child(
+                        div().text_sm().child(
+                            instructions
+                                .clone()
+                                .unwrap_or_else(|| "Open this URL to authorize:".to_owned()),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(url.clone()),
+                    )
+                    .child(
+                        Button::new(format!("open-url:{provider_id}"))
+                            .label("Open in browser")
+                            .icon(app_icon(IconName::ExternalLink))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| this.open_auth_url(&url, cx));
+                            }),
+                    );
             }
+            AuthNotifyKind::DeviceCode {
+                user_code,
+                verification_uri,
+                ..
+            } => {
+                let verification_uri = verification_uri.clone();
+                let user_code = user_code.clone();
+                let view = view.clone();
+                column = column
+                    .child(
+                        div()
+                            .text_sm()
+                            .child("Enter this code on the provider's website:"),
+                    )
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme.primary)
+                            .child(user_code),
+                    )
+                    .child(
+                        Button::new(format!("open-device-url:{provider_id}"))
+                            .label("Open verification page")
+                            .icon(app_icon(IconName::ExternalLink))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_auth_url(&verification_uri, cx)
+                                });
+                            }),
+                    );
+            }
+            _ => {}
         }
+    }
 
     if let Some(pending) = &this.pending_prompt
-        && pending.provider_id == provider_id {
-            has_content = true;
-            match &pending.prompt {
-                AuthPromptKind::Text { message, .. }
-                | AuthPromptKind::Secret { message, .. }
-                | AuthPromptKind::ManualCode { message, .. } => {
-                    let message = message.clone();
-                    let view = cx.entity();
-                    column = column.child(div().text_sm().child(message)).child(
-                        h_flex()
-                            .gap_2()
-                            .child(Input::new(&this.prompt_input).h(px(32.)))
-                            .child(
-                                Button::new(format!("answer-prompt:{provider_id}"))
-                                    .label("Submit")
-                                    .primary()
-                                    .on_click(move |_, _, cx| {
-                                        view.update(cx, |this, cx| this.answer_prompt(cx));
-                                    }),
-                            ),
+        && pending.provider_id == provider_id
+    {
+        has_content = true;
+        match &pending.prompt {
+            AuthPromptKind::Text { message, .. }
+            | AuthPromptKind::Secret { message, .. }
+            | AuthPromptKind::ManualCode { message, .. } => {
+                let message = message.clone();
+                let view = view.clone();
+                column = column.child(div().text_sm().child(message)).child(
+                    h_flex()
+                        .gap_2()
+                        .child(Input::new(&this.prompt_input))
+                        .child(
+                            Button::new(format!("answer-prompt:{provider_id}"))
+                                .label("Submit")
+                                .primary()
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.answer_prompt(cx));
+                                }),
+                        ),
+                );
+            }
+            AuthPromptKind::Select { message, options } => {
+                let message = message.clone();
+                let view = view.clone();
+                let mut options_column = v_flex().gap_1();
+                for option in options {
+                    let option_id = option.id.clone();
+                    let label = option.label.clone();
+                    options_column = options_column.child(
+                        Button::new(format!("prompt-option:{}", option.id))
+                            .label(label)
+                            .ghost()
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.answer_prompt_option(&option_id, cx)
+                                    });
+                                }
+                            }),
                     );
                 }
-                AuthPromptKind::Select { message, options } => {
-                    let message = message.clone();
-                    let view = cx.entity();
-                    let mut options_column = v_flex().gap_1();
-                    for option in options {
-                        let option_id = option.id.clone();
-                        let label = option.label.clone();
-                        options_column = options_column.child(
-                            Button::new(format!("prompt-option:{}", option.id))
-                                .label(label)
-                                .ghost()
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, _, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.answer_prompt_option(&option_id, cx)
-                                        });
-                                    }
-                                }),
-                        );
-                    }
-                    column = column
-                        .child(div().text_sm().child(message))
-                        .child(options_column);
-                }
+                column = column
+                    .child(div().text_sm().child(message))
+                    .child(options_column);
             }
         }
+    }
 
     if !has_content {
         return None;
@@ -2804,406 +3820,43 @@ fn render_active_login(
     )
 }
 
-fn render_github_stars_page(
-    this: &mut WorktableView,
-    _window: &mut Window,
-    cx: &mut Context<WorktableView>,
-) -> gpui::AnyElement {
-    let theme = cx.theme().clone();
-    let view = cx.entity();
-
-    let total_text = if this.github_loading {
-        match this.github_total_stars {
-            Some(total) => format!("★ {} total stars — updating…", total),
-            None => "Fetching stars…".to_owned(),
-        }
-    } else if let Some(total) = this.github_total_stars {
-        format!("★ {} total stars", total)
-    } else if this.github_error.is_some() {
-        String::new()
-    } else {
-        "No data yet — enter a username and fetch.".to_owned()
-    };
-
-    let mut column = v_flex()
-        .gap_2()
-        .p_3()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.popover);
-
-    column = column
-        .child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("GitHub Stars"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Total stars + per-repo breakdown"),
-                ),
-        )
-        .child(div().text_xs().text_color(theme.muted_foreground).child(
-            "Stored in wt_ai_config (github_username). Uses GITHUB_TOKEN if set for 5000 req/h.",
-        ));
-
-    // Input + Save + Fetch: input on its own row so the buttons never
-    // overflow the 390pt column; Save + Fetch share a second row.
-    let save_view = view.clone();
-    let fetch_view = view.clone();
-    let input_row = v_flex()
-        .gap_2()
-        .w_full()
-        .child(
-            div()
-                .w_full()
-                .child(Input::new(&this.github_input).h(px(32.)).w_full()),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("github-save")
-                        .label("Save")
-                        .icon(app_icon(IconName::Check))
-                        .h(px(28.))
-                        .flex_shrink_0()
-                        .on_click(move |_, _, cx| {
-                            save_view.update(cx, |this, cx| this.save_github_username(cx));
-                        }),
-                )
-                .child(
-                    Button::new("github-fetch")
-                        .label(if this.github_loading {
-                            "Fetching…"
-                        } else {
-                            "Fetch Stars"
-                        })
-                        .icon(app_icon(IconName::ExternalLink))
-                        .primary()
-                        .h(px(28.))
-                        .flex_shrink_0()
-                        .disabled(this.github_loading)
-                        .on_click(move |_, _, cx| {
-                            fetch_view.update(cx, |this, cx| this.fetch_github_stars(cx));
-                        }),
-                ),
-        );
-
-    column = column.child(input_row);
-
-    // Import starred repositories (with starred-at timestamps and
-    // descriptions) as entries.
-    let import_view = view.clone();
-    column = column.child(
-        v_flex()
-            .gap_1()
-            .w_full()
-            .items_start()
-            .child(
-                Button::new("github-import-stars")
-                    .label(if this.github_importing {
-                        "Importing…"
-                    } else {
-                        "Import stars to entries"
-                    })
-                    .icon(app_icon(IconName::ArrowDown))
-                    .primary()
-                    .shadow_sm()
-                    .h(px(28.))
-                    .flex_shrink_0()
-                    .disabled(this.github_importing || this.github_loading)
-                    .on_click(move |_, _, cx| {
-                        import_view.update(cx, |this, cx| this.import_github_stars(cx));
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Each star becomes a link entry with its date and description"),
-            ),
-    );
-    if let Some(status) = &this.github_import_status {
-        column = column.child(
-            div()
-                .text_sm()
-                .text_color(theme.primary)
-                .child(status.clone()),
-        );
-    }
-
-    if !total_text.is_empty() {
-        let color = if this.github_loading {
-            theme.muted_foreground
-        } else {
-            theme.primary
-        };
-        column = column.child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(color)
-                .child(total_text),
-        );
-    }
-
-    if let Some(error) = &this.github_error {
-        column = column.child(
-            div()
-                .text_sm()
-                .text_color(theme.danger)
-                .child(error.clone()),
-        );
-    }
-
-    if this.github_loading {
-        let phase = pulse_delta(&ZERON_PULSE, cx.entity_id(), cx);
-        let opacity = worktable_ui::pulse_opacity(phase);
-        column = column.child(
-            div()
-                .h(px(2.))
-                .w_full()
-                .rounded(px(2.))
-                .bg(theme.border.opacity(0.5))
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(opacity.clamp(0.2, 1.0)))
-                        .bg(theme.primary)
-                        .rounded(px(2.)),
-                ),
-        );
-    }
-
-    if !this.github_repos.is_empty() {
-        let mut repos_list = v_flex()
-            .gap_1()
-            .max_h(px(260.))
-            .overflow_y_scrollbar()
-            .pr_2();
-        // Show at most 50 repos to keep UI snappy; user likely cares about top starred.
-        for repo in this.github_repos.iter().take(50) {
-            let name = repo.name.clone();
-            let url = repo.html_url.clone();
-            let stars = repo.stars;
-            // Clicking the row opens the repo URL.
-            let view_for_click = view.clone();
-            let url_for_click = url.clone();
-            let row_id = format!("github-repo:{}", name);
-            repos_list = repos_list.child(
-                h_flex()
-                    .id(row_id)
-                    .justify_between()
-                    .items_center()
-                    .px_2()
-                    .py_1()
-                    .rounded(theme.radius)
-                    .hover(|s| s.bg(theme.tokens.list_hover))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        if !url_for_click.is_empty() {
-                            view_for_click.update(cx, |this, cx| {
-                                cx.open_url(&url_for_click);
-                                let _ = this;
-                            });
-                        }
-                    })
-                    .child(div().text_sm().child(name).text_color(theme.foreground))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("★ {}", stars)),
-                    ),
-            );
-        }
-        if this.github_repos.len() > 50 {
-            repos_list =
-                repos_list.child(div().text_xs().text_color(theme.muted_foreground).child(
-                    format!("… and {} more repositories", this.github_repos.len() - 50),
-                ));
-        }
-        column = column
-            .child(div().h(px(1.)).bg(theme.border.opacity(0.5)))
-            .child(repos_list);
-    } else if this.github_total_stars == Some(0)
-        && !this.github_loading
-        && this.github_error.is_none()
-    {
-        // User exists but has no public repos.
-        column = column.child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child("No public repositories found."),
-        );
-    }
-
-    // Outer wrapper ensures a sensible max width in Settings (centered),
-    // with page padding so the card never touches the window edges.
-    div()
-        .w_full()
-        .max_w(px(520.))
-        .mx_auto()
-        .p_4()
-        .child(column)
-        .into_any_element()
-}
-
 fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let bar = if this.composer.is_some() {
-        let is_note = this.composer == Some(ComposerKind::Note);
-        let is_link = this.composer == Some(ComposerKind::Link);
-        let is_image = this.composer == Some(ComposerKind::Image);
-        v_flex()
-            .id("composer-active")
-            .w_full()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .rounded(px(16.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_center()
-                    .child(
-                        ButtonGroup::new("composer-kind")
-                            .compact()
-                            .outline()
-                            .child(
-                                Button::new("composer-note")
-                                    .label("Note")
-                                    .icon(Icon::new(IconName::File))
-                                    .selected(is_note),
-                            )
-                            .child(
-                                Button::new("composer-link")
-                                    .label("Link")
-                                    .icon(Icon::new(IconName::ExternalLink))
-                                    .selected(is_link),
-                            )
-                            .child(
-                                Button::new("composer-image")
-                                    .label("Image")
-                                    .icon(Icon::new(IconName::GalleryVerticalEnd))
-                                    .selected(is_image),
-                            )
-                            .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
-                                if selected.contains(&0) {
-                                    this.open_composer_note(window, cx);
-                                } else if selected.contains(&1) {
-                                    this.open_composer_link(window, cx);
-                                } else if selected.contains(&2) {
-                                    this.open_composer_image(window, cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Input::new(&this.composer_body)
-                            .h(px(36.))
-                            .appearance(false)
-                            .bordered(false)
-                            .focus_bordered(false)
-                            .flex_1()
-                            .min_w_0(),
-                    )
-                    .child(
-                        Button::new("cancel-composer")
-                            .label("Cancel")
-                            .ghost()
-                            .text_xs()
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_composer(cx))),
-                    )
-                    .child(
-                        Button::new("submit-composer")
-                            .label("Save")
-                            .primary()
-                            .icon(app_icon(IconName::Check))
-                            .text_xs()
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| this.submit_composer(cx))),
-                    ),
-            )
-            .into_any_element()
-    } else {
-        h_flex()
-            .id("composer-prompt")
-            .w_full()
-            .h(px(52.))
-            .items_center()
-            .gap_3()
-            .px_4()
-            .rounded(px(16.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.tokens.list_hover))
-            .on_click(cx.listener(|this, _, window, cx| this.open_composer_note(window, cx)))
-            .child(
-                div()
-                    .size_6()
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(theme.primary.opacity(0.12))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::Plus).size(px(16.)).text_color(theme.primary)),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child("Add a note"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("⌘N note  •  ⌘L link  •  drag image"),
-                    ),
-            )
-            .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(theme.muted_foreground))
-            .into_any_element()
-    };
-
-    div()
-        .absolute()
-        .left(px(16.))
-        .right(px(16.))
-        .bottom(px(16.))
-        .child(bar)
+    h_flex()
+        .id("composer-bar")
+        .debug_selector(|| "composer-bar".into())
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py_3()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            Button::new("add-image")
+                .icon(app_icon(IconName::Plus))
+                .ghost()
+                .flex_shrink_0()
+                .tooltip("Add image…")
+                .debug_selector(|| "add-image".into())
+                .on_click(cx.listener(|this, _, _, cx| this.pick_image(cx))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .debug_selector(|| "composer-input".into())
+                .child(Input::new(&this.composer_body).w_full()),
+        )
+        .child(
+            Button::new("add-note")
+                .icon(app_icon(IconName::Check))
+                .primary()
+                .flex_shrink_0()
+                .tooltip("Add note")
+                .debug_selector(|| "add-note".into())
+                .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx))),
+        )
         .into_any_element()
 }
 
@@ -3211,43 +3864,21 @@ fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> im
 /// a unit under the fixed Entries|Agent button group.
 fn render_entries_pane(
     this: &mut WorktableView,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
     let theme = cx.theme().clone();
     let view = cx.entity();
     let visible = this.visible_entries();
 
-    // Text for "Copy as list" — when multiple are selected, copy those; otherwise copy all visible.
-    let selected_for_clipboard = this.selected.clone();
-    let clipboard_text = {
-        let entries_to_copy: Vec<&WorktableEntry> = if selected_for_clipboard.len() > 1 {
-            visible
-                .iter()
-                .filter(|e| selected_for_clipboard.contains(&e.id))
-                .copied()
-                .collect()
-        } else {
-            visible.to_vec()
-        };
-        entries_to_copy
-            .iter()
-            .map(|entry| {
-                if let Some(title) = &entry.title {
-                    format!("{title}\n{}", entry.content)
-                } else {
-                    entry.content.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    };
-
-    // Flatten sections into virtual-list items with fixed row sizes.
+    // Flatten sections into virtual-list items with fixed row sizes. Rows keep
+    // only the entry id; the card looks the entry up when it renders, so the
+    // view never clones the whole entry set on every frame.
     let mut sections: Vec<(String, Vec<&WorktableEntry>)> = Vec::new();
-    for entry in visible.clone() {
+    for entry in &visible {
+        let entry = *entry;
         let label = if this.sort_mode == SortMode::Topic {
-            helix_primary_topic(entry)
+            this.primary_topic(entry)
         } else if this.sort_mode == SortMode::Time {
             // Time sort groups by creation day: Today / Yesterday / weekday / date.
             crate::format::day_bucket(entry.created_at)
@@ -3261,29 +3892,37 @@ fn render_entries_pane(
         }
     }
     if this.sort_mode == SortMode::Topic {
+        let ascending = this.sort_ascending;
         sections.sort_by(|a, b| {
             if a.0 == "OTHER" {
                 std::cmp::Ordering::Greater
             } else if b.0 == "OTHER" {
                 std::cmp::Ordering::Less
-            } else {
+            } else if ascending {
                 a.0.cmp(&b.0)
+            } else {
+                b.0.cmp(&a.0)
             }
         });
     }
 
     enum Row {
         Header(String),
-        Card(std::sync::Arc<WorktableEntry>),
+        Card(String),
     }
+    // Row metrics resolve from the current rem size so the list zooms with the
+    // rest of the interface.
+    let section_header_height = design::to_pixels(design::SECTION_HEADER_HEIGHT, window);
+    let card_height = design::to_pixels(design::ENTRY_CARD_HEIGHT, window);
+    let row_gap = design::to_pixels(design::ENTRY_ROW_GAP, window);
     let mut rows: Vec<Row> = Vec::new();
     let mut sizes: Vec<Size<Pixels>> = Vec::new();
     for (label, entries) in &sections {
         rows.push(Row::Header(label.clone()));
-        sizes.push(size(px(0.), px(SECTION_HEADER_HEIGHT)));
+        sizes.push(size(Pixels::ZERO, section_header_height));
         for entry in entries {
-            rows.push(Row::Card(std::sync::Arc::new((*entry).clone())));
-            sizes.push(size(px(0.), px(ENTRY_CARD_HEIGHT)));
+            rows.push(Row::Card(entry.id.clone()));
+            sizes.push(size(Pixels::ZERO, card_height + row_gap));
         }
     }
     let rows = std::rc::Rc::new(rows);
@@ -3293,24 +3932,46 @@ fn render_entries_pane(
         view.clone(),
         "entries-virtual-list",
         item_sizes.clone(),
-        move |this, range, window, cx| {
-            let clipboard_text = clipboard_text.clone();
+        move |this, range, _window, cx| {
             let rows = rows.clone();
             range
                 .into_iter()
-                .map(|index| {
-                    let row = &rows[index];
-                    match row {
-                        Row::Header(label) => {
-                            let theme = cx.theme().clone();
-                            library_section_heading(label, &theme).into_any_element()
-                        }
-                        Row::Card(entry) => render_entry_card(
-                            entry,
-                            &this.selected,
-                            &clipboard_text,
-                            cx,
-                        ),
+                .map(|index| match &rows[index] {
+                    Row::Header(label) => {
+                        let theme = cx.theme().clone();
+                        library_section_heading(label, &theme).into_any_element()
+                    }
+                    Row::Card(id) => {
+                        let show_topic = this.sort_mode != SortMode::Topic;
+                        this.entries
+                            .iter()
+                            .find(|entry| &entry.id == id)
+                            .map(|entry| {
+                                let topic = this.primary_topic(entry);
+                                let bounds_map = this.card_bounds.clone();
+                                let entry_id = entry.id.clone();
+                                div()
+                                    .px_4()
+                                    .pb(design::ENTRY_ROW_GAP)
+                                    // Record the card's real rect for the
+                                    // morph (the first child is the card).
+                                    .on_children_prepainted(move |child_bounds, _, _| {
+                                        if let Some(bounds) = child_bounds.first() {
+                                            bounds_map
+                                                .borrow_mut()
+                                                .insert(entry_id.clone(), *bounds);
+                                        }
+                                    })
+                                    .child(render_entry_card(
+                                        entry,
+                                        &topic,
+                                        &this.selected,
+                                        show_topic,
+                                        cx,
+                                    ))
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| div().into_any_element())
                     }
                 })
                 .collect::<Vec<_>>()
@@ -3348,130 +4009,389 @@ fn render_entries_pane(
         this.list_insert_at = None;
     }
 
-    let sort = sort_bar(this, cx);
-
     let body = if empty {
         empty_el
     } else {
+        // Boundary fades only appear when there is content beyond the edge;
+        // reaching the top or bottom hides the respective fade entirely.
+        let scroll = this.entries_scroll.base_handle();
+        let scroll_offset = scroll.offset();
+        let max_offset = scroll.max_offset();
+        let epsilon = Pixels::from(0.5);
+        let at_top = scroll_offset.y >= -epsilon;
+        let at_bottom = max_offset.y <= epsilon || scroll_offset.y <= -(max_offset.y) + epsilon;
+
+        // No horizontal padding here: the scrollbar belongs to the region's
+        // trailing edge. Rows and headings apply their own content inset.
         let list_container = div()
+            .id("entries-list")
+            .debug_selector(|| "entries-list".into())
+            .role(Role::List)
+            .aria_label("Entries")
             .flex_1()
             .min_h_0()
             .relative()
-            .px_4()
-            .pb(px(84.))
+            // Track the pointer so position-less triggers (context menu,
+            // keyboard) can still morph from where the user is.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                this.pointer_position = event.position;
+            }))
+            .on_scroll_wheel(cx.listener(|_this, _, _, cx| cx.notify()))
             .child(list)
+            // Soften the top and bottom cut: the content fades into the
+            // surface instead of clipping hard at the scroll viewport. The
+            // bottom fade sits at the list's viewport edge (above the
+            // composer clearance), not under the padding.
+            .when(!at_top, |container| {
+                container.child(
+                    div()
+                        .debug_selector(|| "entries-fade-top".into())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(rems(0.75))
+                        .bg(linear_gradient(
+                            180.0,
+                            linear_color_stop(theme.tokens.background, 0.0),
+                            linear_color_stop(theme.tokens.background.opacity(0.0), 1.0),
+                        )),
+                )
+            })
+            .when(!at_bottom, |container| {
+                container.child(
+                    div()
+                        .debug_selector(|| "entries-fade-bottom".into())
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(rems(0.75))
+                        .bg(linear_gradient(
+                            0.0,
+                            linear_color_stop(theme.tokens.background, 0.0),
+                            linear_color_stop(theme.tokens.background.opacity(0.0), 1.0),
+                        )),
+                )
+            })
             .child(scrollbar);
         let container = if inserting {
-            let recent = this.recent_entry_id.clone();
+            let slide = card_height;
             list_container
                 .with_animation(
                     "entries-insert",
                     worktable_ui::RESIZE.animation(),
-                    move |el, t| el.relative().top(px(ENTRY_CARD_HEIGHT * (1.0 - t))),
+                    move |el, t| el.relative().top(slide * (1.0 - t)),
                 )
                 .into_any_element()
         } else {
             list_container.into_any_element()
         };
-        v_flex().flex_1().min_h_0().size_full().child(container).into_any_element()
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .child(container)
+            .into_any_element()
     };
 
     v_flex()
         .id("entries-pane")
+        .debug_selector(|| "entries-pane".into())
         .flex_1()
         .min_h_0()
         .size_full()
-        .child(
-            v_flex()
-                .pt_2()
-                .pb_1()
-                .px_4()
-                .gap_2()
-                .child(sort)
-                .when(inserting, |el| {
-                    // The new card fades in at the top while the list glides.
-                    let _ = &el;
-                    el
-                }),
-        )
         .child(body)
         .child(composer_bar(this, cx).into_any_element())
         .into_any_element()
 }
 
+/// The Entries ⇄ Agent pages, stacked so both can animate at once.
+///
+/// Port of transitions.dev's page slide: the exiting page fades toward its own
+/// 8px offset while the entering page fades in from the opposite side, over
+/// 250ms `cubic-bezier(0.22,1,0.36,1)`. The tween is computed from wall time
+/// and the shared frame clock is leased while it runs — element-animation
+/// wrappers would remount the page subtrees (and replay every message's
+/// entrance) on each switch. GPUI cannot blur element content, so the spec's
+/// 3px blur is carried by the fade (see DESIGN.md).
+fn render_library_pages(
+    this: &mut WorktableView,
+    pane_w: Pixels,
+    entries_pane: gpui::AnyElement,
+    assistant_pane: gpui::AnyElement,
+    window: &mut Window,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let is_assistant = this.mode == AppMode::Assistant;
+    let slide = design::to_pixels(design::PAGE_SLIDE_DISTANCE, window);
+    let transition = this.page_anim_at.and_then(|started| {
+        let elapsed = started.elapsed();
+        (elapsed < worktable_ui::PAGE_SLIDE.total()).then_some(elapsed)
+    });
+    if transition.is_some() {
+        // Keep frames coming for the duration of the slide.
+        let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+    }
+    let eased = |elapsed: std::time::Duration| {
+        let raw = elapsed.as_secs_f32() / worktable_ui::PAGE_SLIDE.total().as_secs_f32();
+        worktable_ui::PAGE_SLIDE.progress(raw)
+    };
 
-fn library_tabs(this: &WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
-    let is_entries = this.mode == AppMode::Entries;
-    h_flex()
-        .id("library-tabs")
-        .w_full()
+    let page = |assistant: bool, body: gpui::AnyElement| -> gpui::AnyElement {
+        let active = assistant == is_assistant;
+        let visible = active || transition.is_some();
+        // `progress` runs rest → exit offset. The entering page reverses it,
+        // so it fades in from the offset; the exiting page runs it forward.
+        let progress = match transition {
+            Some(elapsed) if active => 1.0 - eased(elapsed),
+            Some(elapsed) => eased(elapsed),
+            None => 0.0,
+        };
+        let offset = if assistant { slide } else { -slide };
+        let selector = if assistant {
+            "assistant-page"
+        } else {
+            "entries-page"
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .w(pane_w)
+            .h_full()
+            .flex()
+            .flex_col()
+            .debug_selector(move || selector.to_owned())
+            .when(!visible, |el| el.hidden())
+            .left(offset * progress)
+            .opacity(1.0 - progress)
+            .child(body)
+            .into_any_element()
+    };
+
+    let entries = page(false, entries_pane);
+    let assistant = page(true, assistant_pane);
+    div()
+        .flex_1()
+        .min_h_0()
+        .w(pane_w)
+        .max_w_full()
+        .overflow_hidden()
+        .relative()
+        .child(entries)
+        .child(assistant)
+        .into_any_element()
+}
+
+/// Whether the entry's content is a bare URL.
+fn content_is_link(content: &str) -> bool {
+    let candidate = content.trim();
+    candidate.starts_with("http://") || candidate.starts_with("https://")
+}
+
+/// Whether the entry's content points at an image file (path or URL).
+fn content_is_image(content: &str) -> bool {
+    image_source_for(content).is_some()
+}
+
+/// Turn image content into a renderable source. Local paths must exist;
+/// http(s) URLs are loaded by the image element's HTTP client.
+fn image_source_for(content: &str) -> Option<ImageSource> {
+    let candidate = content.split_whitespace().next().unwrap_or(content).trim();
+    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        return Some(candidate.to_owned().into());
+    }
+    let path = std::path::Path::new(candidate);
+    image_mime_for(path)?;
+    if path.is_file() {
+        Some(path.into())
+    } else {
+        None
+    }
+}
+
+/// The image inside the entry detail: contained, with a hover download
+/// button and double-click fullscreen.
+fn render_entry_image(
+    source: ImageSource,
+    content: String,
+    theme: &gpui_component::theme::Theme,
+    cx: &mut Context<WorktableView>,
+) -> gpui::AnyElement {
+    let view = cx.entity();
+    let save_content = content.clone();
+    let fullscreen_content = content.clone();
+    div()
+        .id("entry-image-frame")
+        .debug_selector(|| "entry-image-frame".into())
+        .group("entry-image")
+        .relative()
+        .size_full()
+        .flex()
+        .items_center()
         .justify_center()
-        .py_2()
+        .overflow_hidden()
+        .rounded(theme.radius_tokens().md)
+        .bg(theme.muted.opacity(0.35))
         .child(
-            ButtonGroup::new("library-tabs-group")
-                .child(
-                    Button::new("entries-tab")
-                        .label("Entries")
-                        .selected(is_entries),
-                )
-                .child(
-                    Button::new("agent-tab")
-                        .label("Agent")
-                        .selected(!is_entries && this.mode == AppMode::Assistant),
-                )
-                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                    if selected.contains(&0) {
-                        this.show_entries(cx);
-                    } else if selected.contains(&1) {
-                        this.show_assistant(cx);
+            img(source)
+                .w_full()
+                .h_full()
+                .object_fit(ObjectFit::Contain)
+                .on_click(move |event, window, cx| {
+                    if event.click_count() >= 2 {
+                        view.update(cx, |this, cx| {
+                            this.open_image_viewer(fullscreen_content.clone(), window, cx);
+                        });
                     }
-                })),
+                }),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_2()
+                .right_2()
+                .opacity(0.0)
+                .group_hover("entry-image", |style| style.opacity(1.0))
+                .child(
+                    Button::new("entry-image-save")
+                        .icon(app_icon(IconName::ArrowDown))
+                        .secondary()
+                        .rounded_full()
+                        .tooltip("Save image…")
+                        .debug_selector(|| "entry-image-save".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_image(save_content.clone(), cx)
+                        })),
+                ),
         )
         .into_any_element()
 }
 
-fn sort_bar(this: &WorktableView, cx: &mut Context<WorktableView>) -> gpui::AnyElement {
-    let is_time = this.sort_mode == SortMode::Time;
-    let is_alpha = this.sort_mode == SortMode::Alpha;
-    let is_topic = this.sort_mode == SortMode::Topic;
-    h_flex()
-        .id("sort-bar")
-        .w_full()
-        .justify_center()
-        .pb_2()
+/// Mime for a dropped image file, when the extension is one we accept.
+fn image_mime_for(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" | "heif" => Some("image/heic"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Resolve a dialog's design width, clamped to the window so narrow windows
+/// never clip the modal.
+fn dialog_width(window: &Window, width: gpui::Rems) -> Pixels {
+    let available = window.viewport_size().width - Pixels::from(32.0);
+    design::to_pixels(width, window).min(available)
+}
+
+/// A Gemini-like sparkle: a large star with a small one at its shoulder.
+/// GPUI's icon set has stars but no sparkle glyph, so compose two.
+fn sparkle_icon(color: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .relative()
+        .size_4()
         .child(
-            ButtonGroup::new("sort-mode-group")
-                .compact()
-                .outline()
-                .child(
-                    Button::new("sort-time")
-                        .label("Time")
-                        .icon(Icon::new(IconName::SortDescending))
-                        .selected(is_time),
-                )
-                .child(
-                    Button::new("sort-alpha")
-                        .label("A–Z")
-                        .icon(Icon::new(IconName::ALargeSmall))
-                        .selected(is_alpha),
-                )
-                .child(
-                    Button::new("sort-topic")
-                        .label("Topic")
-                        .icon(Icon::new(IconName::BookOpen))
-                        .selected(is_topic),
-                )
-                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
-                    if selected.contains(&0) {
-                        this.set_sort_mode(SortMode::Time, cx);
-                    } else if selected.contains(&1) {
-                        this.set_sort_mode(SortMode::Alpha, cx);
-                    } else if selected.contains(&2) {
-                        this.set_sort_mode(SortMode::Topic, cx);
-                    }
-                })),
+            Icon::new(IconName::StarFill)
+                .size(rems(0.7))
+                .text_color(color)
+                .absolute()
+                .left_0()
+                .bottom_0(),
+        )
+        .child(
+            Icon::new(IconName::StarFill)
+                .size(rems(0.45))
+                .text_color(color)
+                .absolute()
+                .right_0()
+                .top_0(),
         )
         .into_any_element()
+}
+
+/// A compact action chip for the entry view's footer.
+fn modal_chip(
+    id: &'static str,
+    label: &'static str,
+    icon: Option<IconName>,
+    handler: impl Fn(&mut Window, &mut App) + 'static,
+) -> Button {
+    let selector = id.to_owned();
+    let button = Button::new(id)
+        .label(label)
+        .small()
+        .rounded_full()
+        .ghost()
+        .debug_selector(move || selector.clone())
+        .on_click(move |_, window, cx| handler(window, cx));
+    match icon {
+        Some(icon) => button.icon(app_icon(icon)),
+        None => button,
+    }
+}
+
+/// A 44×44 morph origin centered on a pointer position: the panel appears to
+/// grow out of the card under the cursor.
+fn morph_origin_at(position: Point<Pixels>) -> Bounds<Pixels> {
+    let side = Pixels::from(44.0);
+    Bounds::new(
+        point(position.x - side / 2.0, position.y - side / 2.0),
+        size(side, side),
+    )
+}
+
+/// Run a blocking task on a dedicated thread and await it, so GPUI's
+/// executor (no Tokio reactor) never touches blocking I/O.
+async fn run_blocking<T: Send + 'static>(
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(task());
+    });
+    rx.await.map_err(|error| error.to_string())
+}
+
+/// Report a knowledge-build failure through the shared status line.
+fn report_knowledge_status(
+    view: gpui::WeakEntity<WorktableView>,
+    cx: &mut gpui::AsyncApp,
+    status: String,
+) {
+    let _ = view.update(cx, |this, cx| {
+        this.knowledge_building = false;
+        this.knowledge_status = Some(status);
+        cx.notify();
+    });
+}
+
+/// Convert tool citations into UI references. Every `search_knowledge` hit is
+/// a library entry, so the click target is always the in-app
+/// `worktable-entry:` scheme — the app opens the morphing entry view, whose
+/// own chips carry the external URL. A citation without an entry falls back to
+/// opening its URL directly.
+fn citation_refs(citations: Vec<KnowledgeCitation>) -> Vec<CitationRef> {
+    citations
+        .into_iter()
+        .map(|citation| CitationRef {
+            n: citation.n,
+            label: citation.label.into(),
+            snippet: citation.snippet.into(),
+            host: citation.host.into(),
+            url: if citation.entry_id.is_empty() {
+                citation.url.into()
+            } else {
+                format!("worktable-entry:{}", citation.entry_id).into()
+            },
+        })
+        .collect()
 }
 
 pub(crate) fn helix_primary_topic(entry: &WorktableEntry) -> String {
@@ -3479,7 +4399,6 @@ pub(crate) fn helix_primary_topic(entry: &WorktableEntry) -> String {
     // We compute on the fly so the UI stays in sync even before the graph is built.
     let db_entry = worktable_db::Entry {
         id: entry.id.clone(),
-        kind: entry.kind.clone(),
         content: entry.content.clone(),
         title: entry.title.clone(),
         source: entry.source.clone(),
@@ -3501,17 +4420,13 @@ fn library_section_name(entry: &WorktableEntry) -> String {
         return source.to_uppercase();
     }
 
-    match entry.kind.as_str() {
-        "link" => "CONFIGURATION FORMATS".to_owned(),
-        "image" => "REFERENCES".to_owned(),
-        _ => "RESEARCH".to_owned(),
-    }
+    "RESEARCH".to_owned()
 }
 
 fn library_section_heading(label: &str, theme: &gpui_component::Theme) -> impl IntoElement {
     h_flex()
         .w_full()
-        .h(px(16.))
+        .h_4()
         .px_4()
         .items_center()
         .child(
@@ -3524,22 +4439,23 @@ fn library_section_heading(label: &str, theme: &gpui_component::Theme) -> impl I
                 .text_color(theme.muted_foreground)
                 .child(label.to_owned()),
         )
-        .child(div().flex_1().h(px(1.)).bg(theme.border))
+        .child(div().flex_1().h_px().bg(theme.border))
 }
 
 /// One entry card: fixed-height row for the virtual list. Selection circle's
 /// tick is centered; the whole card carries the click/context-menu wiring.
 fn render_entry_card(
     entry: &WorktableEntry,
+    topic: &str,
     selected: &HashSet<String>,
-    clipboard_text: &str,
+    show_topic: bool,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
     let theme = cx.theme().clone();
     let view = cx.entity();
     let is_selected = selected.contains(&entry.id);
-    let topic = helix_primary_topic(entry);
-    let is_image = entry.kind == "image";
+    let topic = topic.to_owned();
+    let is_image = content_is_image(&entry.content);
 
     let selection = div()
         .size_5()
@@ -3553,45 +4469,38 @@ fn render_entry_card(
         .when(is_selected, |this| {
             this.bg(theme.primary).child(
                 Icon::new(IconName::Check)
-                    .size(px(12.))
+                    .size_3()
                     .text_color(theme.primary_foreground),
             )
         });
 
+    let mut meta = h_flex().gap_2().items_center().child(div().flex_1()).child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground.opacity(0.7))
+            .child(crate::format::relative_time(entry.created_at)),
+    );
+    // In Topic mode the section heading already names the topic, so repeating
+    // it on every card is noise.
+    if show_topic {
+        meta = meta.child(
+            div()
+                .px_2()
+                .py_0p5()
+                .rounded(theme.radius_tokens().sm)
+                .bg(theme.muted)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(topic),
+        );
+    }
     let mut content = v_flex()
         .flex_1()
         .min_w_0()
         .gap_1()
         .text_sm()
         .text_color(theme.foreground)
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded(px(RADIUS_CHIP))
-                        .bg(theme.muted)
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(topic),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground.opacity(0.7))
-                        .child(entry_kind(&entry.kind).to_owned()),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground.opacity(0.7))
-                        .child(crate::format::relative_time(entry.created_at)),
-                ),
-        );
+        .child(meta);
     if let Some(title) = &entry.title {
         content = content.child(
             div()
@@ -3601,53 +4510,84 @@ fn render_entry_card(
         );
     }
     if is_image {
-        // Compact photo row: icon + filename (kept whole) + path (truncates).
+        // Thumbnail + filename (kept whole) + path (truncates).
         let filename = entry
             .content
             .split('/')
             .next_back()
             .unwrap_or(&entry.content)
             .to_owned();
-        content = content.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .w_full()
-                .min_w_0()
+        let thumbnail = image_source_for(&entry.content).map(|source| {
+            let selector = format!("entry-thumb-{}", entry.id);
+            let selector_for_debug = selector.clone();
+            div()
+                .size_10()
+                .flex_shrink_0()
                 .overflow_hidden()
-                .p_1()
-                .rounded(px(RADIUS_CHIP))
+                .rounded(theme.radius_tokens().sm)
                 .bg(theme.muted.opacity(0.5))
-                .border_1()
-                .border_color(theme.border.opacity(0.6))
                 .child(
-                    Icon::new(IconName::GalleryVerticalEnd)
-                        .size(px(14.))
-                        .text_color(theme.muted_foreground),
+                    img(source)
+                        .w_full()
+                        .h_full()
+                        .object_fit(ObjectFit::Cover)
+                        .debug_selector(move || selector_for_debug.clone()),
                 )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(filename),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .line_clamp(1)
-                        .child(entry.content.clone()),
-                ),
-        );
+        });
+        let mut row = h_flex()
+            .gap_2()
+            .items_center()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden();
+        if let Some(thumbnail) = thumbnail {
+            row = row.child(thumbnail);
+        } else {
+            row = row.child(
+                div()
+                    .size_10()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme.radius_tokens().sm)
+                    .bg(theme.muted.opacity(0.5))
+                    .child(
+                        Icon::new(IconName::GalleryVerticalEnd)
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    ),
+            );
+        }
+        row = row
+            .child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .line_clamp(1)
+                    .child(filename),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .line_clamp(1)
+                    .child(entry.content.clone()),
+            );
+        content = content.child(row);
     } else {
         // Card preview: collapse hard line breaks so the body is one flowing
         // paragraph. `line_clamp` only clamps wrapped lines — raw `\n`s render
         // full-height, overflow the fixed 108px row, and paint over the
         // neighboring cards. Full content is still used for copy/open.
-        let preview = entry.content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = entry
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         content = content.child(
             div()
                 .line_clamp(if entry.title.is_some() { 2 } else { 3 })
@@ -3661,22 +4601,45 @@ fn render_entry_card(
     }
 
     let entry_id = entry.id.clone();
+    // The accessible name is the entry's title when it has one; otherwise a
+    // bounded preview, so screen readers announce the object, not the raw row.
+    let card_label = entry.title.clone().unwrap_or_else(|| {
+        let mut preview: String = entry.content.chars().take(120).collect();
+        if entry.content.chars().count() > 120 {
+            preview.push('…');
+        }
+        preview
+    });
     let card = h_flex()
         .id(format!("entry:{}", entry.id))
+        .role(Role::ListItem)
+        .aria_label(card_label)
+        .aria_selected(is_selected)
         .w_full()
-        .h(px(ENTRY_CARD_HEIGHT))
+        .h(design::ENTRY_CARD_HEIGHT)
         .overflow_hidden()
         .items_center()
         .gap_4()
-        .px(px(16.))
-        .rounded(px(RADIUS_CARD))
+        .px_4()
+        .rounded(theme.radius_tokens().md)
         .bg(theme.popover)
         .border_1()
         .border_color(theme.border)
-        .shadow_2xs()
         .on_click(cx.listener({
             let entry_id = entry_id.clone();
             move |this, event: &ClickEvent, _window, cx| {
+                // Double click opens the full-content morph, growing out of
+                // the row's own prepainted rect.
+                if event.click_count() >= 2 {
+                    let origin = this
+                        .card_bounds
+                        .borrow()
+                        .get(&entry_id)
+                        .map(|bounds| this.local_bounds(*bounds))
+                        .unwrap_or_else(|| this.pointer_origin(event.position()));
+                    this.open_entry_modal(&entry_id, origin, cx);
+                    return;
+                }
                 let mods = event.modifiers();
                 let shift = mods.shift;
                 let cmd = mods.platform || mods.control;
@@ -3690,7 +4653,21 @@ fn render_entry_card(
                 cx.notify();
             }
         }))
-        .cursor_pointer()
+        .on_mouse_pressure(cx.listener({
+            let entry_id = entry_id.clone();
+            move |this, event: &MousePressureEvent, _window, cx| {
+                // Force click (trackpad) opens the same view.
+                if event.stage == PressureStage::Force {
+                    let origin = this
+                        .card_bounds
+                        .borrow()
+                        .get(&entry_id)
+                        .map(|bounds| this.local_bounds(*bounds))
+                        .unwrap_or_else(|| this.pointer_origin(event.position));
+                    this.open_entry_modal(&entry_id, origin, cx);
+                }
+            }
+        }))
         .child(selection)
         .child(content);
 
@@ -3728,32 +4705,42 @@ fn render_entry_card(
         }
     });
 
-    let entry_kind_menu = entry.kind.clone();
     let content_for_menu = entry.content.clone();
-    let text_for_menu = clipboard_text.to_owned();
-    let id_for_copy = entry.id.clone();
     let id_del = entry.id.clone();
+    let id_view = entry.id.clone();
     let card = card.context_menu(move |menu, _window, _cx| {
         let content_copy = content_for_menu.clone();
         let url_open = content_for_menu.clone();
-        let is_link_menu = entry_kind_menu == "link";
-        let text = text_for_menu.clone();
-        let id_copy2 = id_for_copy.clone();
+        let is_link_menu = content_is_link(&content_for_menu);
         let id_del2 = id_del.clone();
+        let id_view_menu = id_view.clone();
+        let view_for_view = view.clone();
         let view_del = view.clone();
+        let view_copy_list = view.clone();
         menu.item(
+            PopupMenuItem::new("View entry")
+                .icon(Icon::new(IconName::Eye))
+                .on_click(move |_event, _window, cx| {
+                    let id = id_view_menu.clone();
+                    view_for_view.update(cx, |this, cx| {
+                        let origin = this.entry_origin(&id);
+                        this.open_entry_modal(&id, origin, cx);
+                    });
+                }),
+        )
+        .separator()
+        .item(
             PopupMenuItem::new("Copy")
                 .icon(Icon::new(IconName::Copy))
                 .on_click(move |_event, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(content_copy.clone()));
-                    let _ = id_copy2;
                 }),
         )
         .item(
             PopupMenuItem::new("Copy as list")
                 .icon(Icon::new(IconName::Copy))
                 .on_click(move |_event, _window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    view_copy_list.update(cx, |this, cx| this.copy_entries_as_list(cx));
                 }),
         )
         .when(is_link_menu, |m| {
@@ -3783,17 +4770,6 @@ fn render_entry_card(
     card.into_any_element()
 }
 
-
-fn entry_kind(kind: &str) -> &'static str {
-    match kind {
-        "text" => "TEXT",
-        "link" => "LINK",
-        "image" => "IMAGE",
-        _ => "ENTRY",
-    }
-}
-
-/// Trim whitespace; empty strings become `None`.
 fn trim_opt(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -3813,37 +4789,95 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
 
     let mut messages = v_flex()
         .id("assistant-messages")
-        .flex_1()
+        .debug_selector(|| "assistant-messages".into())
+        .role(Role::Log)
+        .aria_label("Assistant conversation")
+        .size_full()
         .gap_3()
         .overflow_y_scroll()
+        .track_scroll(&this.assistant_scroll)
         .p_4();
 
     // One shared pulse-clock phase for every animated loader in this render.
-    let dots_delta = if this.assistant_busy || this.messages.iter().any(|m| m.is_thinking_only())
-    {
+    let dots_delta = if this.assistant_busy || this.messages.iter().any(|m| m.is_thinking_only()) {
         pulse_delta(&TEXT_DOTS, cx.entity_id(), cx)
     } else {
         0.0
     };
 
+    // Citation chips route back into the app: note citations select their
+    // entry, external links open in the browser.
+    let citation_open: CitationOpenHandler = {
+        let view = cx.entity();
+        std::sync::Arc::new(
+            move |url: &str, position: Point<Pixels>, _window: &mut Window, cx: &mut App| {
+                if let Some(id) = url.strip_prefix("worktable-entry:") {
+                    let id = id.to_owned();
+                    view.update(cx, |this, cx| {
+                        // Morph from the entry's card when the Library page is
+                        // mounted; otherwise grow from the click point.
+                        let origin = this
+                            .card_bounds
+                            .borrow()
+                            .get(&id)
+                            .map(|bounds| this.local_bounds(*bounds))
+                            .unwrap_or_else(|| this.pointer_origin(position));
+                        this.open_entry_modal(&id, origin, cx);
+                    });
+                } else {
+                    cx.open_url(url);
+                }
+            },
+        )
+    };
+
     if this.messages.is_empty() {
         messages = messages.child(fade_in(
             "assistant-welcome",
-            div().child(welcome_panel(&theme, configured)).when(!configured, |el| {
-                el.mt_2().child(
-                    Button::new("assistant-setup-cta")
-                        .label("Configure provider")
-                        .icon(app_icon(IconName::Settings))
-                        .primary()
-                        .shadow_sm()
-                        .on_click(cx.listener(|this, _, _, cx| this.show_provider_config(cx))),
-                )
-            }),
+            div()
+                .child(welcome_panel(&theme, configured))
+                .when(!configured, |el| {
+                    el.mt_2().child(
+                        Button::new("assistant-setup-cta")
+                            .label("Configure provider")
+                            .icon(app_icon(IconName::Settings))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_settings_at(SettingsTab::Providers, cx)
+                            })),
+                    )
+                }),
         ));
     } else {
         for (idx, message) in this.messages.iter().enumerate() {
-            let id = SharedString::from(format!("msg-{}-{}", idx, message.text.len()));
-            let bubble = render_message(&theme, message, dots_delta);
+            // Chat is append-only between clears, so the index is a stable
+            // identity; keying on the streamed text length would restart the
+            // entrance animation on every delta.
+            let id = SharedString::from(format!("msg-{idx}"));
+            // The thinking header toggles this message's block; long
+            // reasoning is capped and scrolls instead of freezing layout.
+            let toggle: Option<ToggleThinking> = {
+                let view = cx.entity();
+                Some(Rc::new(move |_, _, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(message) = this.messages.get_mut(idx) {
+                            message.thinking_collapsed = !message.thinking_collapsed;
+                        }
+                        cx.notify();
+                    });
+                }))
+            };
+            let bubble = render_message(
+                &theme,
+                message,
+                idx,
+                cx.entity_id(),
+                dots_delta,
+                MessageOptions {
+                    show_thinking: this.show_thinking,
+                    citation_open: Some(citation_open.clone()),
+                    on_toggle_thinking: toggle,
+                },
+            );
             let animated = if message.streaming {
                 fade_quick(id, div().child(bubble))
             } else {
@@ -3851,53 +4885,120 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
             };
             messages = messages.child(animated);
         }
-        if this.assistant_busy {
-            // Waiting for the LLM: bobbing dots while no answer bubble is
-            // streaming yet (the thinking block carries its own "Thinking" dots).
+        if let Some(tool) = this.active_tool.clone() {
+            // A tool is executing: the knowledge search shows the globe orb
+            // (the knowledge-base loader), other tools the S1 lattice.
+            let (label, variant) = if tool == "search_knowledge" {
+                ("Searching your knowledge…".to_owned(), OrbVariant::G2)
+            } else {
+                (format!("Using {tool}…"), OrbVariant::S1)
+            };
+            let orb = Orb::new("assistant-tool", variant)
+                .view(cx.entity_id())
+                .size(rems(1.5))
+                .color(theme.primary)
+                .label(label)
+                .surface(theme.popover)
+                .label_color(theme.muted_foreground)
+                .border(theme.border)
+                .text_xs();
+            messages = messages.child(
+                h_flex()
+                    .id("assistant-tool")
+                    .debug_selector(|| "assistant-tool".into())
+                    .role(Role::Status)
+                    .aria_label("Searching the knowledge base")
+                    .px_3()
+                    .child(orb),
+            );
+        } else if this.assistant_busy {
+            // Waiting for the LLM: the S1 orb pulses while no answer is
+            // streaming yet. When the reasoning block is visible its shimmer
+            // label already carries the activity, so the orb would repeat it.
             let waiting = this
                 .messages
                 .last()
-                .map(|m| m.is_thinking_only() || !m.streaming)
+                .map(|m| !m.streaming || (m.is_thinking_only() && !this.show_thinking))
                 .unwrap_or(true);
             if waiting {
-                let bob_delta = pulse_delta(&BOBBING_DOTS, cx.entity_id(), cx);
+                let orb = Orb::new("assistant-thinking", OrbVariant::S1)
+                    .view(cx.entity_id())
+                    .size(rems(1.25))
+                    .color(theme.muted_foreground)
+                    .label("Thinking…")
+                    .surface(theme.popover)
+                    .label_color(theme.muted_foreground)
+                    .border(theme.border)
+                    .text_xs();
                 messages = messages.child(
                     h_flex()
                         .id("assistant-waiting")
+                        .debug_selector(|| "assistant-thinking".into())
                         .px_3()
-                        .child(worktable_ui::bobbing_dots(
-                            bob_delta,
-                            theme.muted_foreground,
-                            px(7.),
-                        )),
+                        .child(orb),
                 );
             }
         }
     }
 
-    let helix_button = Button::new("build-helix")
-        .icon(app_icon(IconName::HardDrive))
+    // One button for both states: the inner content toggles between the
+    // build icon and the G2 orb (same slot, same size), and a click while
+    // building stops the pass.
+    let knowledge_button = Button::new("build-knowledge")
         .ghost()
-        .tooltip("Build Helix knowledge graph (topics + relations) from entries — stored next to worktable.db as helix.json")
-        .disabled(this.helix_building)
-        .on_click(cx.listener(|this, _, _, cx| this.build_helix(cx)));
-
-    let helix_status = this
-        .helix_status
-        .as_deref()
-        .map(|s| {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(s.to_owned())
-                .into_any_element()
+        .tooltip(if this.knowledge_building {
+            "Stop building knowledge"
+        } else {
+            "Build knowledge from entries"
         })
-        .unwrap_or_else(|| div().into_any_element());
+        .debug_selector(|| "build-knowledge".into())
+        .on_click(cx.listener(|this, _, _, cx| this.build_knowledge(cx)))
+        .when(this.knowledge_building, |button| {
+            button.child(
+                Orb::new("knowledge-building", OrbVariant::G2)
+                    .view(cx.entity_id())
+                    .size(rems(1.5))
+                    .color(theme.primary),
+            )
+        })
+        .when(!this.knowledge_building, |button| {
+            button.icon(app_icon(IconName::HardDrive))
+        });
+
+    let knowledge_status: gpui::AnyElement =
+        if this.knowledge_building || this.knowledge_status.is_some() {
+            let mut row = h_flex()
+                .id("knowledge-status")
+                .debug_selector(|| "knowledge-status".into())
+                .gap_2()
+                .items_center();
+            if let Some(status) = this.knowledge_status.as_deref() {
+                row = row.child(
+                    div()
+                        .id("knowledge-status-text")
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .role(Role::Status)
+                        .aria_label(status.to_owned())
+                        .child(status.to_owned()),
+                );
+            }
+            row.into_any_element()
+        } else {
+            div().into_any_element()
+        };
 
     v_flex()
         .flex_1()
         .min_h_0()
-        .child(messages)
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(messages)
+                .child(Scrollbar::vertical(&this.assistant_scroll)),
+        )
         .child(
             v_flex()
                 .gap_1()
@@ -3914,25 +5015,396 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .debug_selector(|| "assistant-input".into())
                                 .child(
                                     Input::new(&this.assistant_input)
                                         .disabled(!configured)
-                                        .h(px(36.))
                                         .w_full(),
                                 ),
                         )
-                        .child(helix_button)
-                        .child(
-                            Button::new("send-assistant")
-                                .label(if this.assistant_busy { "…" } else { "Send" })
-                                .primary()
-                                .icon(app_icon(IconName::ArrowRight))
-                                .flex_shrink_0()
-                                .disabled(!configured || this.assistant_busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.send_assistant(cx))),
-                        ),
+                        .child(knowledge_button)
+                        .child({
+                            let send: gpui::AnyElement = if this.assistant_busy {
+                                Button::new("abort-assistant")
+                                    .child(
+                                        Orb::new("assistant-send-orb", OrbVariant::S1)
+                                            .view(cx.entity_id())
+                                            .size(rems(1.25))
+                                            .color(theme.primary),
+                                    )
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .tooltip("Stop the assistant")
+                                    .debug_selector(|| "abort-assistant".into())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_assistant(cx)),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                Button::new("send-assistant")
+                                    .icon(app_icon(IconName::ArrowUp))
+                                    .primary()
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .tooltip("Send")
+                                    .debug_selector(|| "send-assistant".into())
+                                    .disabled(!configured)
+                                    .on_click(cx.listener(|this, _, _, cx| this.send_assistant(cx)))
+                                    .into_any_element()
+                            };
+                            send
+                        }),
                 )
-                .child(helix_status),
+                .child(knowledge_status),
         )
         .into_any_element()
+}
+
+/// The body of the provider configuration dialog.
+///
+/// It is a separate entity because dialogs are built while the main view is
+/// still rendering; reading the main view from the dialog builder itself would
+/// borrow it twice. This view only holds a weak handle and reads state when
+/// its own render runs.
+struct ProviderDialogView {
+    main: WeakEntity<WorktableView>,
+    provider_id: String,
+    api_key_input: Entity<InputState>,
+    /// When the dialog opened — drives the transitions.dev modal entrance
+    /// (250ms, `cubic-bezier(0.22,1,0.36,1)`; the CSS scale is approximated
+    /// with a 4px rise because gpui divs have no scale transform).
+    opened_at: Instant,
+}
+
+impl ProviderDialogView {
+    fn provider(&self, cx: &App) -> Option<ProviderInfo> {
+        self.main
+            .upgrade()?
+            .read(cx)
+            .providers
+            .iter()
+            .find(|provider| provider.id == self.provider_id)
+            .cloned()
+    }
+}
+
+impl Render for ProviderDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let theme = cx.theme().clone();
+
+        // transitions.dev modal entrance: fade + gentle rise over 250ms.
+        let elapsed = self.opened_at.elapsed();
+        let opening = elapsed < worktable_ui::MODAL_OPEN.total();
+        if opening {
+            // Keep frames coming for the short entrance.
+            let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+        }
+        let entrance = if opening {
+            worktable_ui::MODAL_OPEN
+                .progress(elapsed.as_secs_f32() / worktable_ui::MODAL_OPEN.total().as_secs_f32())
+        } else {
+            1.0
+        };
+
+        let Some(main) = self.main.upgrade() else {
+            return div().into_any_element();
+        };
+        let Some(provider) = self.provider(cx) else {
+            return div().into_any_element();
+        };
+        let (status, logging_in) = {
+            let state = main.read(cx);
+            (
+                state.provider_dialog_status.clone(),
+                state.logging_in.contains(&provider.id),
+            )
+        };
+        let login_panel = render_active_login(&main, &provider.id, cx);
+
+        let mut column = v_flex()
+            .debug_selector(|| "provider-dialog".into())
+            .relative()
+            .top(rems(0.25 * (1.0 - entrance)))
+            .opacity(entrance)
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "Choose how the assistant authenticates with {}.",
+                        provider.name
+                    )),
+            );
+
+        if provider.supports_api_key {
+            let hint = if provider.api_key_set {
+                "An API key is saved. Enter a new key to replace it."
+            } else {
+                "Paste the API key from your provider account."
+            };
+            column = column.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(hint),
+            );
+            let main_for_save = main.clone();
+            column = column.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.api_key_input)),
+                    )
+                    .child(
+                        Button::new("save-provider-key")
+                            .label("Save key")
+                            .primary()
+                            .debug_selector(|| "save-provider-key".into())
+                            .on_click(move |_, _, cx| {
+                                main_for_save.update(cx, |this, cx| this.save_api_key(cx));
+                            }),
+                    ),
+            );
+        }
+
+        if provider.supports_oauth {
+            let main_for_auth = main.clone();
+            if provider.oauth_set {
+                let provider_id = provider.id.clone();
+                column = column.child(
+                    Button::new("provider-sign-out")
+                        .label("Sign out")
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            let provider_id = provider_id.clone();
+                            main_for_auth
+                                .update(cx, |this, cx| this.logout_provider(&provider_id, cx));
+                        }),
+                );
+            } else if logging_in {
+                let provider_id = provider.id.clone();
+                column = column.child(
+                    Button::new("provider-cancel-login")
+                        .label("Cancel sign-in")
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            let provider_id = provider_id.clone();
+                            main_for_auth
+                                .update(cx, |this, cx| this.cancel_login(&provider_id, cx));
+                        }),
+                );
+            } else {
+                let provider_id = provider.id.clone();
+                column = column.child(
+                    Button::new("provider-sign-in")
+                        .label("Sign in with OAuth")
+                        .icon(app_icon(IconName::ExternalLink))
+                        .on_click(move |_, _, cx| {
+                            let provider_id = provider_id.clone();
+                            main_for_auth.update(cx, |this, cx| this.login_oauth(&provider_id, cx));
+                        }),
+                );
+            }
+        }
+
+        if let Some(panel) = login_panel {
+            column = column.child(panel);
+        }
+        if let Some(status) = status {
+            column = column.child(
+                div()
+                    .id("provider-dialog-status")
+                    .role(Role::Status)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(status),
+            );
+        }
+
+        column.into_any_element()
+    }
+}
+
+/// The GitHub stars dialog body: account, fetch, the starred-repository
+/// list, and the import action.
+///
+/// Own entity like the provider dialog, so the dialog layer can render it
+/// while the main view is mid-render.
+struct GithubStarsDialog {
+    main: WeakEntity<WorktableView>,
+}
+
+impl Render for GithubStarsDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let theme = cx.theme().clone();
+        let Some(main) = self.main.upgrade() else {
+            return div().into_any_element();
+        };
+        let (input, username, error, repos, loading, importing, import_status, total) = {
+            let this = main.read(cx);
+            (
+                this.github_input.clone(),
+                this.github_username.clone(),
+                this.github_error.clone(),
+                this.github_repos.clone(),
+                this.github_loading,
+                this.github_importing,
+                this.github_import_status.clone(),
+                this.github_total_stars,
+            )
+        };
+
+        let main_for_fetch = main.clone();
+        let fetch = Button::new("github-fetch")
+            .label("Fetch stars")
+            .small()
+            .loading(loading)
+            .debug_selector(|| "github-fetch".into())
+            .on_click(move |_, _, cx| {
+                main_for_fetch.update(cx, |this, cx| {
+                    let value = this.github_input.read(cx).value().to_string();
+                    if value.trim().is_empty() {
+                        this.fetch_github_stars(cx);
+                    } else {
+                        this.save_github_username(cx);
+                    }
+                });
+            });
+
+        let main_for_import = main.clone();
+        let import_enabled = username.as_deref().is_some_and(|user| !user.is_empty());
+        let import = Button::new("github-import-stars")
+            .label("Import stars to entries")
+            .primary()
+            .small()
+            .loading(importing)
+            .disabled(!import_enabled)
+            .debug_selector(|| "github-import-stars".into())
+            .on_click(move |_, _, cx| {
+                main_for_import.update(cx, |this, cx| this.import_github_stars(cx));
+            });
+
+        let repo_list: gpui::AnyElement = if repos.is_empty() {
+            div().into_any_element()
+        } else {
+            div()
+                .id("github-repos")
+                .debug_selector(|| "github-repos".into())
+                .max_h(rems(12.0))
+                .overflow_y_scrollbar()
+                .rounded(theme.radius_tokens().md)
+                .border_1()
+                .border_color(theme.border)
+                .children(repos.iter().take(100).enumerate().map(|(index, repo)| {
+                    let url = repo.html_url.clone();
+                    h_flex()
+                        .id(gpui::ElementId::Name(format!("github-repo-{index}").into()))
+                        .cursor_pointer()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.4))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .text_sm()
+                                .child(repo.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("★ {}", repo.stars)),
+                        )
+                }))
+                .into_any_element()
+        };
+
+        let mut column = v_flex()
+            .debug_selector(|| "github-dialog".into())
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Import the repositories you starred on GitHub as entries."),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("GitHub username"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .debug_selector(|| "github-username".into())
+                                    .child(Input::new(&input).w_full()),
+                            )
+                            .child(fetch),
+                    ),
+            );
+        if let Some(username) = username.filter(|user| !user.is_empty()) {
+            column = column.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Account: {username}")),
+            );
+        }
+        if let Some(error) = error {
+            column = column.child(
+                div()
+                    .id("github-dialog-error")
+                    .role(Role::Alert)
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .child(error),
+            );
+        }
+        if let Some(total) = total.filter(|_| !repos.is_empty()) {
+            column = column.child(
+                div()
+                    .id("github-dialog-summary")
+                    .role(Role::Status)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{} starred repositories · {total} stars total",
+                        repos.len()
+                    )),
+            );
+        }
+        column = column.child(repo_list).child(import);
+        if let Some(status) = import_status {
+            column = column.child(
+                div()
+                    .id("github-dialog-status")
+                    .role(Role::Status)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(status),
+            );
+        }
+        column.into_any_element()
+    }
 }

@@ -15,12 +15,12 @@ use worktable_db::SqliteStore;
 use worktable_events::{AuthNotifyKind, AuthPromptKind, EventBus, WorktableEvent};
 
 use crate::{
-    pi_agent::PiAgentRuntime,
+    agent_runtime::AgentRuntime,
     worker_protocol::{WorkerEvent, WorkerRequest},
 };
 
 const SESSION_LEASE_MS: i64 = 30_000;
-const EVENT_PUMP_POLL_MS: u64 = 25;
+const EVENT_PUMP_POLL_MS: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct AiRun {
@@ -32,7 +32,7 @@ pub struct AiRun {
 #[derive(Clone)]
 pub struct WorktableRuntime {
     store: SqliteStore,
-    ai_agent: Arc<Mutex<Option<PiAgentRuntime>>>,
+    ai_agent: Arc<Mutex<Option<AgentRuntime>>>,
     owner_id: String,
     events: EventBus,
     lease_tasks: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
@@ -73,14 +73,27 @@ impl WorktableRuntime {
 
         // Best-effort Helix mirror. SQLite remains source-of-truth; if Helix is
         // not running we log and continue. Never fail the SQLite insert.
-        // Use a plain thread (not tokio::spawn) because this is called from GPUI's
-        // scheduler which has no Tokio reactor.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let entry_owned = entry.clone();
-            let helix_path = worktable_helix::helix_path_for_sqlite(self.store.database_path());
-            std::thread::spawn(move || {
-                let helix = worktable_helix::HelixClient::open_embedded(helix_path);
+            spawn_helix_mirror(self.store.database_path(), move |helix| {
+                if let Err(err) = helix.sync_entry_blocking(&entry_owned) {
+                    eprintln!("[worktable] Helix sync_entry failed (fallback to SQLite): {err}");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Replace an entry's content and refresh its knowledge-graph node.
+    pub async fn update_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
+        self.store.update_entry_content(&entry.id, &entry.content)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let entry_owned = entry.clone();
+            spawn_helix_mirror(self.store.database_path(), move |helix| {
                 if let Err(err) = helix.sync_entry_blocking(&entry_owned) {
                     eprintln!("[worktable] Helix sync_entry failed (fallback to SQLite): {err}");
                 }
@@ -96,9 +109,7 @@ impl WorktableRuntime {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let id_owned = id.to_owned();
-            let helix_path = worktable_helix::helix_path_for_sqlite(self.store.database_path());
-            std::thread::spawn(move || {
-                let helix = worktable_helix::HelixClient::open_embedded(helix_path);
+            spawn_helix_mirror(self.store.database_path(), move |helix| {
                 if let Err(err) = helix.delete_entry_blocking(&id_owned) {
                     eprintln!("[worktable] Helix delete_entry failed (fallback to SQLite): {err}");
                 }
@@ -138,7 +149,7 @@ impl WorktableRuntime {
         // the session state machine starts clean.
         let _ = self.store.fail_stale_runs(unix_time_ms()?);
 
-        let worker = PiAgentRuntime::start(self.store.clone());
+        let worker = AgentRuntime::start(self.store.clone(), tokio::runtime::Handle::current());
         *agent = Some(worker);
 
         // Start the event pump that drains worker output into the event bus and
@@ -150,6 +161,15 @@ impl WorktableRuntime {
         *self.pump_task.lock().await = Some(pump);
 
         Ok(())
+    }
+
+    /// Extract AI topics for knowledge-graph entries with the active
+    /// provider. Background maintenance, so it skips session leases.
+    pub async fn enrich_topics(
+        &self,
+        entries: Vec<worktable_db::Entry>,
+    ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+        crate::agent_runtime::enrich_topics(&self.store, entries).await
     }
 
     pub async fn submit_prompt(
@@ -241,32 +261,36 @@ impl WorktableRuntime {
         loop {
             interval.tick().await;
 
-            let event = match self.try_recv_agent_event().await {
-                Some(event) => event,
-                None => continue,
-            };
+            // Drain everything queued per tick. Handling a single event per
+            // tick throttled a long stream to ~40 deltas/s, which stalled the
+            // worker behind its channel and made the answer stop mid-flight.
+            loop {
+                let Some(event) = self.try_recv_agent_event().await else {
+                    break;
+                };
 
-            match &event {
-                WorkerEvent::RunCompleted { request_id, .. } => {
-                    self.finish_prompt_request(request_id, "completed", None)
-                        .await;
-                }
-                WorkerEvent::RunFailed {
-                    request_id, error, ..
-                } => {
-                    self.finish_prompt_request(request_id, "failed", Some(error))
-                        .await;
-                }
+                match &event {
+                    WorkerEvent::RunCompleted { request_id, .. } => {
+                        self.finish_prompt_request(request_id, "completed", None)
+                            .await;
+                    }
+                    WorkerEvent::RunFailed {
+                        request_id, error, ..
+                    } => {
+                        self.finish_prompt_request(request_id, "failed", Some(error))
+                            .await;
+                    }
 
-                WorkerEvent::Ready => {
-                    eprintln!("Worktable: AI worker is ready");
-                }
-                WorkerEvent::WorkerError { error } => {
-                    eprintln!("Worktable: AI worker error: {error}");
-                    publish_worker_event(&self.events, &event);
-                }
-                _ => {
-                    publish_worker_event(&self.events, &event);
+                    WorkerEvent::Ready => {
+                        eprintln!("Worktable: AI worker is ready");
+                    }
+                    WorkerEvent::WorkerError { error } => {
+                        eprintln!("Worktable: AI worker error: {error}");
+                        publish_worker_event(&self.events, &event);
+                    }
+                    _ => {
+                        publish_worker_event(&self.events, &event);
+                    }
                 }
             }
         }
@@ -354,6 +378,17 @@ impl WorktableRuntime {
     pub async fn login_oauth(&self, provider_id: &str) -> anyhow::Result<()> {
         self.send_to_worker(WorkerRequest::LoginOAuth {
             provider_id: provider_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Abort the in-flight prompt for `session_id` (empty ids fall back to
+    /// the active run). The worker handles cancellation synchronously and
+    /// emits the failure event the UI already understands.
+    pub async fn cancel_prompt(&self, request_id: &str, session_id: &str) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::Cancel {
+            request_id: request_id.to_owned(),
+            session_id: session_id.to_owned(),
         })
         .await
     }
@@ -452,6 +487,29 @@ impl WorktableRuntime {
     }
 }
 
+/// Run a best-effort Helix operation on a dedicated thread. Plain threads are
+/// used (not `tokio::spawn`) because entry mutations can be called from GPUI's
+/// scheduler, which has no Tokio reactor.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_helix_mirror(
+    database_path: &str,
+    task: impl FnOnce(&worktable_helix::HelixClient) + Send + 'static,
+) {
+    // Each mirror run is a read-modify-write cycle on one JSON graph file.
+    // Concurrent inserts (e.g. a bulk star import) would otherwise interleave
+    // open/merge/save and silently drop entries, so mirror runs serialize.
+    static MIRROR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let helix_path = worktable_helix::helix_path_for_sqlite(database_path);
+    std::thread::spawn(move || {
+        let _guard = MIRROR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let helix = worktable_helix::HelixClient::open_embedded(helix_path);
+        task(&helix);
+    });
+}
+
 fn unix_time_ms() -> anyhow::Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -490,6 +548,26 @@ fn publish_worker_event(events: &EventBus, event: &WorkerEvent) {
             session_id: session_id.clone(),
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
+        },
+        WorkerEvent::ToolFinished {
+            request_id,
+            session_id,
+            tool_call_id,
+            name,
+        } => WorktableEvent::AiToolFinished {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            name: name.clone(),
+        },
+        WorkerEvent::Citations {
+            request_id,
+            session_id,
+            citations,
+        } => WorktableEvent::AiCitations {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            citations: citations.clone(),
         },
         WorkerEvent::RunCompleted { .. } | WorkerEvent::RunFailed { .. } => return,
         WorkerEvent::WorkerError { error } => WorktableEvent::AiWorkerError {
@@ -705,7 +783,10 @@ mod tests {
             let runtime = connect_memory().await;
             runtime.start_ai_worker().await.expect("worker starts");
             runtime.shutdown().await.expect("first shutdown");
-            runtime.shutdown().await.expect("second shutdown is a no-op");
+            runtime
+                .shutdown()
+                .await
+                .expect("second shutdown is a no-op");
         });
     }
 
@@ -747,7 +828,9 @@ mod tests {
             })
             .await;
             let Some(event) = terminal else {
-                panic!("no terminal event within 90s — the app wedges exactly like the user reported");
+                panic!(
+                    "no terminal event within 90s — the app wedges exactly like the user reported"
+                );
             };
             if let WorktableEvent::AiRunFailed { error, .. } = &event {
                 eprintln!("terminal failure (expected with the user's stale provider): {error}");
@@ -755,7 +838,11 @@ mod tests {
 
             // The run row must be finalized (completed/failed), not `running`.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let state = runtime.store.run_state(&run.run_id).expect("query run state").expect("run row exists");
+            let state = runtime
+                .store
+                .run_state(&run.run_id)
+                .expect("query run state")
+                .expect("run row exists");
             assert!(
                 state != "running",
                 "run must be finalized; still '{state}' — leftover-running bug"

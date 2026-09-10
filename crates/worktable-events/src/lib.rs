@@ -1,4 +1,21 @@
 use serde::{Deserialize, Serialize};
+
+/// One `search_knowledge` hit the model may cite as `[n]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeCitation {
+    /// Marker number used in the model's answer.
+    pub n: u32,
+    /// Entry id in the store, so the app can reveal the source in-app.
+    pub entry_id: String,
+    /// Human-readable source label (title, or a content excerpt).
+    pub label: String,
+    /// Short content excerpt shown in the citation preview on hover.
+    pub snippet: String,
+    /// Short display host: URL host for links, otherwise the entry source.
+    pub host: String,
+    /// External URL when the entry points at one; empty for plain notes.
+    pub url: String,
+}
 use tokio::sync::broadcast;
 
 /// A single model advertised by an AI provider.
@@ -117,6 +134,19 @@ pub enum WorktableEvent {
         session_id: String,
         tool_call_id: String,
         name: String,
+    },
+    /// A tool call finished executing.
+    AiToolFinished {
+        request_id: String,
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+    },
+    /// Numbered knowledge citations for the answer being produced.
+    AiCitations {
+        request_id: String,
+        session_id: String,
+        citations: Vec<KnowledgeCitation>,
     },
     AiRunFinished {
         request_id: String,

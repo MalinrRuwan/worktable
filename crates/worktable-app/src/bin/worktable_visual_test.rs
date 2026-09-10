@@ -26,21 +26,32 @@
 //! - `UPDATE_BASELINE=1` — save captures as baselines instead of only output.
 //! - `VISUAL_TEST_OUTPUT_DIR` — output directory (default `target/visual_tests`).
 
+const DEMO_PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x08\x00\x00\x00\x08\x08\x02\x00\x00\x00\x4b\x6d\x29\xdc\x00\x00\x00\x25\x49\x44\x41\x54\x78\x9c\x63\x60\x60\x60\x50\x50\x50\x70\x70\x70\x48\x48\x48\x68\x68\x68\x58\xb0\x60\xc1\x81\x03\x07\x1e\x3c\x78\xc0\x30\xb4\x24\x00\x58\x99\x54\x01\x67\xf0\x51\x8b\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
 #[path = "../actions.rs"]
 mod actions;
 #[path = "../assistant.rs"]
 mod assistant;
+#[path = "../design.rs"]
+mod design;
+#[path = "../entry_actions.rs"]
+mod entry_actions;
 #[path = "../format.rs"]
 mod format;
 #[path = "../github.rs"]
 mod github;
-#[path = "../markdown.rs"]
-mod markdown;
+// The runner mirrors the app's modules but drives only the visual flow, so
+// production entry points (status-item install, capture commands) and some
+// view actions are intentionally unused here. The main binary build still
+// checks them with dead-code warnings enabled.
 #[path = "../service.rs"]
+#[allow(dead_code)]
 mod service;
 #[path = "../status_item.rs"]
+#[allow(dead_code)]
 mod status_item;
 #[path = "../worktable_view.rs"]
+#[allow(dead_code)]
 mod worktable_view;
 
 use std::cell::RefCell;
@@ -48,9 +59,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{AppContext as _, Modifiers, VisualTestAppContext, point, px};
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use worktable_ai::WorktableEntry;
-use worktable_helix;
 
 use service::WorktableService;
 use worktable_view::{AppMode, WorktableView};
@@ -60,19 +70,14 @@ const WINDOW_SIZE: gpui::Size<gpui::Pixels> = gpui::Size {
     height: px(884.),
 };
 
-/// Header row: 30px titlebar inset + pt(8) + 36px controls → center y ≈ 56.
-/// Hamburger is the last 36px slot: 390 - 16 - 18 = 356.
-const HAMBURGER_CENTER: (f32, f32) = (356.0, 56.0);
-/// "Settings" is the FIRST row of the ⋯ menu: 30 + 52 (header) + 4 (pad) + 20.
-const SETTINGS_ROW_CENTER: (f32, f32) = (300.0, 106.0);
-/// "Ask Agent" sits between the search field and the hamburger.
-const ASK_AGENT_CENTER: (f32, f32) = (286.0, 56.0);
+/// Header row: 30px titlebar inset + py_2 (8) + 40px menu button → y ≈ 58.
+/// The menu button is the trailing flex item: 390 - 16 - 20 = 354.
+const MENU_BUTTON_CENTER: (f32, f32) = (354.0, 58.0);
 
 fn sample_entries() -> Vec<WorktableEntry> {
     fn entry(content: &str, created_at: i64) -> WorktableEntry {
         WorktableEntry {
             id: format!("visual-{created_at}"),
-            kind: "text".to_owned(),
             content: content.to_owned(),
             title: None,
             source: "Worktable".to_owned(),
@@ -137,36 +142,34 @@ fn load_worktable_theme(cx: &mut gpui::App) {
     if gpui_component::ThemeRegistry::global_mut(cx)
         .load_themes_from_str(&contents)
         .is_ok()
-    {
-        if let Some(theme) = gpui_component::ThemeRegistry::global(cx)
+        && let Some(theme) = gpui_component::ThemeRegistry::global(cx)
             .themes()
             .get("Ayu Light")
             .cloned()
-        {
-            let mode = gpui_component::Theme::global(cx).mode;
-            gpui_component::Theme::global_mut(cx).apply_config(&theme);
-            gpui_component::Theme::change(mode, None, cx);
-            // Same Tahoe radius scale as `main::init_theme`.
-            let t = gpui_component::Theme::global_mut(cx);
-            t.radius = px(10.);
-            t.radius_lg = px(14.);
-        }
+    {
+        let mode = gpui_component::Theme::global(cx).mode;
+        gpui_component::Theme::global_mut(cx).apply_config(&theme);
+        gpui_component::Theme::change(mode, None, cx);
+        // Same Tahoe radius scale as `main::init_theme`.
+        let t = gpui_component::Theme::global_mut(cx);
+        t.radius = px(10.);
+        t.radius_lg = px(14.);
     }
 }
 
 /// Capture the current frame of `window` to `<output_dir>/<name>.png`.
 fn capture(
     cx: &mut VisualTestAppContext,
-    window: gpui::AnyWindowHandle,
+    window_handle: gpui::AnyWindowHandle,
     name: &str,
 ) -> anyhow::Result<()> {
     // Let the splash / entrance animations finish (real wall time — the view
     // keys its splash off `Instant`, not the test clock).
     std::thread::sleep(std::time::Duration::from_millis(900));
-    cx.update_window(window, |_, window, _| window.refresh())
+    cx.update_window(window_handle, |_, window, _| window.refresh())
         .ok();
     cx.run_until_parked();
-    let image = cx.capture_screenshot(window)?;
+    let image = cx.capture_screenshot(window_handle)?;
     let (w, h) = image.dimensions();
     // Off-screen windows render at the platform scale factor (2x on retina),
     // so wide 1200pt windows capture at 2400px — assert generous bounds only.
@@ -212,6 +215,9 @@ fn run_visual_tests() -> anyhow::Result<()> {
     let service_for_window = service.clone();
     let window = cx.open_offscreen_window(WINDOW_SIZE, move |window, cx| {
         let view = cx.new(|cx| WorktableView::new(service_for_window.clone(), window, cx));
+        view.update(cx, |this, cx| {
+            this.set_theme_mode(worktable_view::AppThemeMode::Light, window, cx)
+        });
         *holder_for_window.borrow_mut() = Some(view.clone());
         cx.new(|cx| Root::new(view, window, cx))
     })?;
@@ -227,51 +233,136 @@ fn run_visual_tests() -> anyhow::Result<()> {
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
     capture(&mut cx, handle, "worktable_entries")?;
 
-    println!("— step 2: hamburger opens the context menu —");
+    println!("— step 1b: entry detail morph —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            let id = this
+                .entries
+                .first()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+            // Long content proves the detail body scrolls. The real card's
+            // rect (recorded at prepaint) is the morph origin.
+            if let Some(entry) = this.entries.iter_mut().find(|entry| entry.id == id) {
+                entry.content = (0..140)
+                    .map(|line| format!("line {line} of a long captured note"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            let origin = this.entry_origin(&id);
+            this.open_entry_modal(&id, origin, cx);
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_entry_modal")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.close_entry_modal(cx);
+            // Restore the short content so later captures are unchanged.
+            if let Some(entry) = this.entries.first_mut() {
+                entry.content =
+                    "Negation in inherited configs. The moment a config can extend a base or \
+                     preset, someone needs to remove an extension the..."
+                        .to_owned();
+            }
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+
+    println!("— step 1c: entry detail editor —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            let id = this
+                .entries
+                .first()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+            let origin = this.entry_origin(&id);
+            this.open_entry_modal(&id, origin, cx);
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| this.start_entry_edit(window, cx));
+    })
+    .ok();
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_entry_editor")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.cancel_entry_edit(cx);
+            this.close_entry_modal(cx);
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+
+    println!("— step 2: menu button opens the library menu —");
     cx.simulate_click(
         handle,
-        point(px(HAMBURGER_CENTER.0), px(HAMBURGER_CENTER.1)),
+        point(px(MENU_BUTTON_CENTER.0), px(MENU_BUTTON_CENTER.1)),
         Modifiers::default(),
     );
     cx.run_until_parked();
-    assert!(cx.read_entity(&view, |v, _| v.library_menu_open));
     capture(&mut cx, handle, "worktable_menu_open")?;
 
-    println!("— step 3: Settings navigates —");
-    cx.simulate_click(
-        handle,
-        point(px(SETTINGS_ROW_CENTER.0), px(SETTINGS_ROW_CENTER.1)),
-        Modifiers::default(),
-    );
+    println!("— step 3: Settings navigates (first menu item: Down, Enter) —");
+    cx.simulate_keystrokes(handle, "down");
+    cx.simulate_keystrokes(handle, "enter");
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
     capture(&mut cx, handle, "worktable_settings")?;
 
-    println!("— step 3b: Data tab → GitHub Stars config page —");
-    // Data tab of the settings header button group.
-    cx.simulate_click(handle, point(px(262.0), px(56.0)), Modifiers::default());
-    cx.run_until_parked();
-    capture(&mut cx, handle, "worktable_settings_data")?;
-    // The Configure button's exact hit box shifts with the section layout;
-    // navigate via the view (same handler the button calls) for the capture.
+    println!("— step 3b: Data category → GitHub stars dialog —");
+    // Same handler the category row calls (the runner only needs the capture).
     cx.update(|cx| {
-        view.update(cx, |this, cx| this.show_github_stars(cx));
+        view.update(cx, |this, cx| {
+            this.show_settings_at(worktable_view::SettingsTab::Data, cx)
+        });
     });
     cx.run_until_parked();
-    assert_eq!(
-        cx.read_entity(&view, |v, _| v.mode),
-        AppMode::GithubStars,
-        "Configure should open the GitHub Stars page"
-    );
-    capture(&mut cx, handle, "worktable_github_stars")?;
-    // Back to Settings (the header's back button).
-    cx.simulate_click(handle, point(px(50.0), px(56.0)), Modifiers::default());
+    capture(&mut cx, handle, "worktable_settings_data")?;
+    // Configure opens the GitHub dialog over Settings (same handler the
+    // button calls).
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| this.open_github_dialog(window, cx));
+    })
+    .ok();
     cx.run_until_parked();
     assert_eq!(
         cx.read_entity(&view, |v, _| v.mode),
         AppMode::Settings,
-        "back returns to Settings"
+        "the dialog overlays Settings"
     );
+    capture(&mut cx, handle, "worktable_github_dialog")?;
+    cx.update_window(handle, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
+    println!("— step 3c: provider configuration dialog —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.show_settings_at(worktable_view::SettingsTab::Providers, cx)
+        });
+    });
+    cx.run_until_parked();
+    let provider_id = cx.read_entity(&view, |v, _| v.providers.first().map(|p| p.id.clone()));
+    if let Some(provider_id) = provider_id {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.open_provider_dialog(&provider_id, window, cx)
+            });
+        })
+        .ok();
+        cx.run_until_parked();
+        capture(&mut cx, handle, "worktable_provider_dialog")?;
+        // Close it again so the following steps start from plain Settings.
+        cx.update_window(handle, |_, window, cx| window.close_dialog(cx))
+            .ok();
+        cx.run_until_parked();
+    }
 
     println!("— step 4: ⌘2 jumps to the assistant —");
     // Ensure the worktable view is focused so global keybindings resolve (Settings contains inputs).
@@ -286,7 +377,7 @@ fn run_visual_tests() -> anyhow::Result<()> {
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
     capture(&mut cx, handle, "worktable_assistant")?;
 
-    println!("— step 5: ⌘1 back to entries, Ask Agent button → assistant —");
+    println!("— step 5: ⌘1 back to entries, page toggle → assistant —");
     cx.update_window(handle, |_, window, cx| {
         let fh = view.read(cx).focus_handle.clone();
         window.focus(&fh, cx);
@@ -296,11 +387,11 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.simulate_keystrokes(handle, "cmd-1");
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
-    cx.simulate_click(
-        handle,
-        point(px(ASK_AGENT_CENTER.0), px(ASK_AGENT_CENTER.1)),
-        Modifiers::default(),
-    );
+    // Same handler the header's page toggle calls; interaction tests cover
+    // the pointer path.
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.show_assistant(cx));
+    });
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
     capture(&mut cx, handle, "worktable_ask_agent")?;
@@ -318,19 +409,25 @@ fn run_visual_tests() -> anyhow::Result<()> {
 
     println!("— step 6: sort A–Z (ButtonGroup) —");
     cx.update(|cx| {
-        view.update(cx, |this, cx| this.set_sort_mode(worktable_view::SortMode::Alpha, cx));
+        view.update(cx, |this, cx| {
+            this.set_sort_mode(worktable_view::SortMode::Alpha, cx)
+        });
     });
     cx.run_until_parked();
-    cx.update_window(handle, |_, window, _| window.refresh()).ok();
+    cx.update_window(handle, |_, window, _| window.refresh())
+        .ok();
     cx.run_until_parked();
     capture(&mut cx, handle, "worktable_sort_alpha")?;
 
-    println!("— step 7: group by Topic (Helix) —");
+    println!("— step 7: group by Topic —");
     cx.update(|cx| {
-        view.update(cx, |this, cx| this.set_sort_mode(worktable_view::SortMode::Topic, cx));
+        view.update(cx, |this, cx| {
+            this.set_sort_mode(worktable_view::SortMode::Topic, cx)
+        });
     });
     cx.run_until_parked();
-    cx.update_window(handle, |_, window, _| window.refresh()).ok();
+    cx.update_window(handle, |_, window, _| window.refresh())
+        .ok();
     cx.run_until_parked();
     {
         let count = cx.read_entity(&view, |v, _| v.visible_entries().len());
@@ -345,23 +442,58 @@ fn run_visual_tests() -> anyhow::Result<()> {
     }
     capture(&mut cx, handle, "worktable_topic")?;
 
-    println!("— step 8: add photo (image entry) → Helix topic —");
+    println!("— step 8: add photo (image entry) → knowledge topic —");
+    let _ = std::fs::write("/tmp/demo_photo_sunset.png", DEMO_PNG);
     cx.update(|cx| {
         view.update(cx, |this, cx| {
-            this.add_captured_image("/tmp/demo_photo_sunset.png".to_string(), "image/png".to_string(), cx)
+            this.add_captured_image(
+                "/tmp/demo_photo_sunset.png".to_string(),
+                "image/png".to_string(),
+                cx,
+            )
         });
     });
     cx.run_until_parked();
-    // Give the Helix sync thread a moment (allow_parking already set)
+    // Give the knowledge sync thread a moment (allow_parking already set)
     std::thread::sleep(std::time::Duration::from_millis(300));
     cx.run_until_parked();
     // Back to Time so the new photo appears at top
     cx.update(|cx| {
-        view.update(cx, |this, cx| this.set_sort_mode(worktable_view::SortMode::Time, cx));
+        view.update(cx, |this, cx| {
+            this.set_sort_mode(worktable_view::SortMode::Time, cx)
+        });
     });
     cx.run_until_parked();
     capture(&mut cx, handle, "worktable_image_entry")?;
-    // Verify Helix contains the photo via its title/path
+    // Open the photo's detail: the image itself with the hover download
+    // affordance (the modal capture drives the real card -> panel morph).
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            let id = this
+                .entries
+                .iter()
+                .find(|entry| entry.content.contains("demo_photo"))
+                .map(|entry| entry.id.clone());
+            if let Some(id) = id {
+                this.open_entry_modal(
+                    &id,
+                    gpui::Bounds::new(
+                        gpui::point(gpui::px(40.), gpui::px(120.)),
+                        gpui::size(gpui::px(280.), gpui::px(108.)),
+                    ),
+                    cx,
+                );
+            }
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    capture(&mut cx, handle, "worktable_image_modal")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.close_entry_modal(cx));
+    });
+    cx.run_until_parked();
+    // Verify the knowledge graph contains the photo via its title/path
     {
         let db_path = cx.read_entity(&view, |v, _| v.service.database_path().to_owned());
         let helix_path = worktable_helix::helix_path_for_sqlite(&db_path);
@@ -371,19 +503,14 @@ fn run_visual_tests() -> anyhow::Result<()> {
         println!("    helix photo hits: {}", hits.len());
     }
 
-    println!("— step 9: composer — Image kind (ButtonGroup) —");
+    println!("— step 9: note bar — focused input —");
     cx.update_window(handle, |_, window, cx| {
-        view.update(cx, |this, cx| this.open_composer_image(window, cx));
+        view.update(cx, |this, cx| this.focus_composer(window, cx));
     })
     .ok();
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(200));
-    capture(&mut cx, handle, "worktable_composer_image")?;
-    // Close composer
-    cx.update(|cx| {
-        view.update(cx, |this, cx| this.cancel_composer(cx));
-    });
-    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_composer_focused")?;
 
     println!("— step 10: multi-select (cmd + shift) —");
     // Select first, cmd-add second, shift-range to third if available
@@ -411,9 +538,13 @@ fn run_visual_tests() -> anyhow::Result<()> {
                     text: String::new(),
                     thinking: "Looking through the entries to find the common themes…".into(),
                     streaming: true,
+                    citations: Vec::new(),
+                    thinking_collapsed: false,
                 },
             ];
             this.assistant_busy = true;
+            // The reasoning block renders only with the Settings → UI toggle on.
+            this.show_thinking = true;
             this.show_assistant(cx);
         });
     });
@@ -421,25 +552,147 @@ fn run_visual_tests() -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(400));
     capture(&mut cx, handle, "worktable_agent_thinking")?;
 
-    // Waiting-for-first-token state: busy, no streaming bubble.
+    // Waiting-for-first-token state: the user message is in, no assistant
+    // bubble yet — the S1 orb gives the status.
     cx.update(|cx| {
         view.update(cx, |this, cx| {
-            use assistant::{ChatMessage, Role};
-            this.messages = vec![
-                ChatMessage::user("Summarize my notes"),
-                ChatMessage {
-                    role: Role::Assistant,
-                    text: String::new(),
-                    thinking: String::new(),
-                    streaming: true,
-                },
-            ];
+            use assistant::ChatMessage;
+            this.messages = vec![ChatMessage::user("Summarize my notes")];
+            this.assistant_busy = true;
             cx.notify();
         });
     });
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(400));
     capture(&mut cx, handle, "worktable_agent_waiting")?;
+
+    println!("— step 11b: streaming answer (typewriter + caret) —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            use assistant::{ChatMessage, Role};
+            this.messages = vec![
+                ChatMessage::user("Explain attention"),
+                ChatMessage {
+                    role: Role::Assistant,
+                    text: "Transformers scale well with data and compute, though attention is \
+                           quadratic in sequence length. The answer types out as the model \
+                           streams, with the caret holding the end of the line."
+                        .into(),
+                    thinking: String::new(),
+                    streaming: true,
+                    citations: Vec::new(),
+                    thinking_collapsed: false,
+                },
+            ];
+            this.assistant_busy = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    capture(&mut cx, handle, "worktable_agent_streaming")?;
+
+    println!("— step 11c: inline citations —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            use assistant::ChatMessage;
+            this.assistant_busy = false;
+            this.messages = vec![
+                ChatMessage::user("Explain attention"),
+                ChatMessage {
+                    role: assistant::Role::Assistant,
+                    text: "Transformers scale well with data and compute[1], though attention \
+                           is quadratic in sequence length[2]."
+                        .into(),
+                    thinking: String::new(),
+                    streaming: false,
+                    citations: vec![
+                        worktable_ui::CitationRef {
+                            n: 1,
+                            label: "Attention Is All You Need".into(),
+                            snippet: "The dominant sequence transduction models are based…".into(),
+                            host: "arxiv.org".into(),
+                            url: "https://arxiv.org/abs/1706.03762".into(),
+                        },
+                        worktable_ui::CitationRef {
+                            n: 2,
+                            label: "Efficient Transformers: A Survey".into(),
+                            snippet: "A survey of efficient transformer architectures…".into(),
+                            host: "arxiv.org".into(),
+                            url: "https://arxiv.org/abs/2009.06732".into(),
+                        },
+                    ],
+                    thinking_collapsed: false,
+                },
+            ];
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    capture(&mut cx, handle, "worktable_agent_citations")?;
+
+    println!("— step 11e: markdown answer —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            use assistant::ChatMessage;
+            this.assistant_busy = false;
+            this.messages = vec![
+                ChatMessage::user("Format a status report"),
+                ChatMessage::assistant(
+                    "## Weekly notes\n\n**Highlights**\n\n- Shipped the entries list\n- Fixed `streaming` selection\n\n1. Review the [GPUI Kit guides](https://gpui-kit.com/docs/coding-guides/)\n2. Re-run `cargo test --workspace`\n\n> Assistant text is selectable with the mouse.\n\n```rust\nlet answer = 42;\n```",
+                ),
+            ];
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    capture(&mut cx, handle, "worktable_agent_markdown")?;
+
+    println!("— step 11f: knowledge search tool status —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            use assistant::ChatMessage;
+            this.show_thinking = false;
+            this.messages = vec![ChatMessage::user("What did I save about sunsets?")];
+            this.active_tool = Some("search_knowledge".to_owned());
+            this.assistant_busy = true;
+            this.knowledge_building = false;
+            this.knowledge_status = None;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    capture(&mut cx, handle, "worktable_agent_tool_search")?;
+    cx.update(|cx| {
+        view.update(cx, |this, _| {
+            this.active_tool = None;
+            this.assistant_busy = false;
+        });
+    });
+    cx.run_until_parked();
+
+    println!("— step 11d: globe loader (knowledge build) —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.knowledge_building = true;
+            this.knowledge_status = Some("Building knowledge…".to_owned());
+            this.messages.clear();
+            this.assistant_busy = false;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    capture(&mut cx, handle, "worktable_agent_globe")?;
+    cx.update(|cx| {
+        view.update(cx, |this, _| {
+            this.knowledge_building = false;
+            this.knowledge_status = None;
+        });
+    });
 
     // Reset chat and go back to entries.
     cx.update(|cx| {
@@ -464,6 +717,12 @@ fn run_visual_tests() -> anyhow::Result<()> {
             },
             move |window, cx| {
                 let view = cx.new(|cx| WorktableView::new(service_for_window.clone(), window, cx));
+                view.update(cx, |this, cx| {
+                    this.set_theme_mode(worktable_view::AppThemeMode::Light, window, cx)
+                });
+                view.update(cx, |this, cx| {
+                    this.set_theme_mode(worktable_view::AppThemeMode::Light, window, cx)
+                });
                 *holder_for_window.borrow_mut() = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             },
@@ -479,6 +738,27 @@ fn run_visual_tests() -> anyhow::Result<()> {
             "wide window starts on entries"
         );
         capture(&mut cx, wide_handle, "worktable_wide_entries")?;
+
+        // The morph must grow out of the card's real (centered) rect on a
+        // wide window, not from a window-space offset.
+        cx.update(|cx| {
+            wide_view.update(cx, |this, cx| {
+                let id = this
+                    .entries
+                    .first()
+                    .map(|entry| entry.id.clone())
+                    .unwrap_or_default();
+                let origin = this.entry_origin(&id);
+                this.open_entry_modal(&id, origin, cx);
+            });
+        });
+        cx.run_until_parked();
+        capture(&mut cx, wide_handle, "worktable_wide_entry_modal")?;
+        cx.update(|cx| {
+            wide_view.update(cx, |this, cx| this.close_entry_modal(cx));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
 
         // Ask Agent on the wide layout — must show ONLY the assistant pane.
         cx.update(|cx| wide_view.update(cx, |this, cx| this.show_assistant(cx)));
@@ -504,6 +784,12 @@ fn run_visual_tests() -> anyhow::Result<()> {
             },
             move |window, cx| {
                 let view = cx.new(|cx| WorktableView::new(service_for_window.clone(), window, cx));
+                view.update(cx, |this, cx| {
+                    this.set_theme_mode(worktable_view::AppThemeMode::Light, window, cx)
+                });
+                view.update(cx, |this, cx| {
+                    this.set_theme_mode(worktable_view::AppThemeMode::Light, window, cx)
+                });
                 *holder_for_window.borrow_mut() = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             },
@@ -532,12 +818,13 @@ fn run_visual_tests() -> anyhow::Result<()> {
 /// Same app keybindings as `main.rs` (`bindings()` is private there, this
 /// runner reproduces them so `simulate_keystrokes` resolves the actions).
 fn bindings() -> Vec<gpui::KeyBinding> {
-    let mut bindings = vec![
+    vec![
         gpui::KeyBinding::new("cmd-1", actions::ShowEntries, None),
         gpui::KeyBinding::new("cmd-2", actions::ShowAssistant, None),
         gpui::KeyBinding::new("cmd-,", actions::ShowSettings, None),
-    ];
-    bindings.into_iter().collect()
+        gpui::KeyBinding::new("escape", actions::CancelComposer, None),
+        gpui::KeyBinding::new("cmd-enter", actions::SubmitComposer, None),
+    ]
 }
 
 fn main() -> anyhow::Result<()> {

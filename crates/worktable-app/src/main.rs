@@ -6,9 +6,10 @@
 
 pub(crate) mod actions;
 pub(crate) mod assistant;
+pub(crate) mod design;
+mod entry_actions;
 pub(crate) mod format;
 pub(crate) mod github;
-pub(crate) mod markdown;
 pub(crate) mod service;
 pub(crate) mod status_item;
 pub(crate) mod worktable_view;
@@ -23,8 +24,8 @@ use std::{
 
 use anyhow::Context as _;
 use gpui::{
-    App, AppContext as _, Application, AsyncApp, Bounds, Context, KeyBinding, SharedString,
-    WindowBounds, WindowOptions, px, size,
+    App, AppContext as _, Application, AsyncApp, Bounds, Context, KeyBinding, Menu, MenuItem,
+    OsAction, SharedString, SystemMenuType, WindowBounds, WindowOptions, px, size,
 };
 use gpui_component::{Root, Theme, ThemeRegistry};
 use tokio::runtime::Runtime;
@@ -59,8 +60,7 @@ fn main() -> anyhow::Result<()> {
         // Keep the quit hook alive for the lifetime of the app.
         let tokio_for_quit = tokio.clone();
         let service_for_quit = service.clone();
-        let quit_subscription = cx.on_app_quit(move |cx| {
-            let _ = cx;
+        let quit_subscription = cx.on_app_quit(move |_cx| {
             let service = service_for_quit.clone();
             let tokio = tokio_for_quit.clone();
             async move {
@@ -69,10 +69,36 @@ fn main() -> anyhow::Result<()> {
         });
         std::mem::forget(quit_subscription);
 
-        // Keyboard shortcuts.
+        // Keyboard shortcuts and the native application menu bar.
         cx.bind_keys(bindings());
+        cx.set_menus(app_menus());
         cx.on_action(|_: &crate::actions::Quit, cx: &mut App| {
             cx.quit();
+        });
+        cx.on_action(|_: &crate::actions::About, _: &mut App| {
+            #[cfg(target_os = "macos")]
+            status_item::show_about_panel();
+        });
+        cx.on_action(|_: &crate::actions::Hide, cx: &mut App| {
+            cx.hide();
+        });
+        cx.on_action(|_: &crate::actions::HideOthers, _: &mut App| {
+            #[cfg(target_os = "macos")]
+            status_item::hide_other_applications();
+        });
+        cx.on_action(|_: &crate::actions::ShowAll, _: &mut App| {
+            #[cfg(target_os = "macos")]
+            status_item::show_all_applications();
+        });
+        cx.on_action(|_: &crate::actions::MinimizeWindow, cx: &mut App| {
+            if let Some(window) = cx.active_window() {
+                let _ = window.update(cx, |_, window, _| window.minimize_window());
+            }
+        });
+        cx.on_action(|_: &crate::actions::ZoomWindow, cx: &mut App| {
+            if let Some(window) = cx.active_window() {
+                let _ = window.update(cx, |_, window, _| window.zoom_window());
+            }
         });
 
         // Window visibility state (driven by the status item and Dock).
@@ -86,7 +112,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         {
             let sender = service.command_sender();
-            if status_item::install(sender).is_none() {
+            if !status_item::install(sender) {
                 eprintln!("Worktable: failed to install the macOS menu-bar item");
             }
         }
@@ -152,10 +178,11 @@ fn resolve_themes_dir() -> PathBuf {
 
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent() {
-            candidates.push(directory.join("../Resources/themes"));
-            candidates.push(directory.join("../../themes"));
-        }
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.join("../Resources/themes"));
+        candidates.push(directory.join("../../themes"));
+    }
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("themes"));
     }
@@ -171,21 +198,69 @@ fn bindings() -> Vec<KeyBinding> {
     use crate::actions::*;
     vec![
         KeyBinding::new("cmd-n", NewNote, None),
-        KeyBinding::new("cmd-l", NewLink, None),
         KeyBinding::new("cmd-f", FocusSearch, None),
         KeyBinding::new("cmd-1", ShowEntries, None),
         KeyBinding::new("cmd-2", ShowAssistant, None),
         KeyBinding::new("cmd-,", ShowSettings, None),
-        KeyBinding::new("cmd-shift-s", ToggleSidebar, None),
         KeyBinding::new("cmd-t", ToggleTheme, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("backspace", DeleteEntry, Some("worktable-list")),
         KeyBinding::new("enter", OpenEntry, Some("worktable-list")),
+        KeyBinding::new("up", SelectPrevious, Some("worktable-list")),
+        KeyBinding::new("down", SelectNext, Some("worktable-list")),
         KeyBinding::new("cmd-c", CopyEntry, Some("worktable-list")),
         KeyBinding::new("cmd-shift-c", CopyLink, Some("worktable-list")),
         KeyBinding::new("escape", CancelComposer, None),
         KeyBinding::new("cmd-enter", SubmitComposer, None),
+        KeyBinding::new("escape", CloseImageViewer, Some("ImageViewer")),
         KeyBinding::new("cmd-shift-p", ClearSearch, Some("worktable-list")),
+    ]
+}
+
+/// The native macOS menu bar: the app menu, File, Edit, View, and Window.
+/// Key equivalents come from the keymap bindings above, so the menu and the
+/// shortcuts never drift apart.
+fn app_menus() -> Vec<Menu> {
+    use crate::actions::*;
+    use gpui_component::input::{
+        Copy as InputCopy, Cut as InputCut, Paste as InputPaste, Redo as InputRedo,
+        SelectAll as InputSelectAll, Undo as InputUndo,
+    };
+
+    vec![
+        Menu::new("Worktable").items(vec![
+            MenuItem::action("About Worktable", About),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", ShowSettings),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Hide Worktable", Hide),
+            MenuItem::action("Hide Others", HideOthers),
+            MenuItem::action("Show All", ShowAll),
+            MenuItem::separator(),
+            MenuItem::action("Quit Worktable", Quit),
+        ]),
+        Menu::new("File").items(vec![MenuItem::action("New Note", NewNote)]),
+        Menu::new("Edit").items(vec![
+            MenuItem::os_action("Undo", InputUndo, OsAction::Undo),
+            MenuItem::os_action("Redo", InputRedo, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cut", InputCut, OsAction::Cut),
+            MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
+            MenuItem::os_action("Paste", InputPaste, OsAction::Paste),
+            MenuItem::os_action("Select All", InputSelectAll, OsAction::SelectAll),
+        ]),
+        Menu::new("View").items(vec![
+            MenuItem::action("Entries", ShowEntries),
+            MenuItem::action("Assistant", ShowAssistant),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Theme", ToggleTheme),
+        ]),
+        Menu::new("Window").items(vec![
+            MenuItem::action("Minimize", MinimizeWindow),
+            MenuItem::action("Zoom", ZoomWindow),
+        ]),
     ]
 }
 
@@ -200,11 +275,7 @@ fn handle_command(
         AppCommand::ToggleWindow => toggle_window(cx, visible, service),
         AppCommand::OpenWindow => open_window(cx, visible, service),
         AppCommand::NewNote => {
-            let _ = dispatch_main_view(cx, |this, window, cx| this.open_composer_note(window, cx));
-            cx.activate(true);
-        }
-        AppCommand::NewLink => {
-            let _ = dispatch_main_view(cx, |this, window, cx| this.open_composer_link(window, cx));
+            let _ = dispatch_main_view(cx, |this, window, cx| this.focus_composer(window, cx));
             cx.activate(true);
         }
         AppCommand::CaptureText(text) => {
@@ -239,10 +310,11 @@ fn toggle_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<Worktabl
 
 fn open_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableService>) {
     if cx.windows().is_empty()
-        && let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
-            eprintln!("Worktable: failed to reopen window: {error:#}");
-            return;
-        }
+        && let Err(error) = open_main_window(cx, service.clone(), visible.clone())
+    {
+        eprintln!("Worktable: failed to reopen window: {error:#}");
+        return;
+    }
     visible.store(true, Ordering::SeqCst);
     cx.activate(true);
 }
@@ -255,12 +327,14 @@ fn open_main_window(
     visible.store(true, Ordering::SeqCst);
     cx.open_window(
         WindowOptions {
+            // A portrait 3:4 window: the reading column stays centered and
+            // the minimum keeps the composer usable.
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(390.), px(884.)),
+                size(px(600.), px(800.)),
                 cx,
             ))),
-            window_min_size: Some(size(px(390.), px(600.))),
+            window_min_size: Some(size(px(480.), px(640.))),
             // Transparent titlebar so the app background paints through it —
             // no visible seam between the title bar and the content.
             titlebar: Some(gpui::TitlebarOptions {

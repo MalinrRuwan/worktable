@@ -10,10 +10,7 @@
 use std::{
     path::PathBuf,
     ptr::NonNull,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -31,9 +28,37 @@ use objc2_app_kit::{
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
 use objc2_foundation::{NSData, NSSize, NSString};
 
-/// Global shift-held state updated by the FlagsChanged monitor.
-/// Used by `worktable_view` to detect Shift+right-click.
-static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+/// Show the standard macOS About panel (App menu → About Worktable).
+pub(crate) fn show_about_panel() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.orderFrontStandardAboutPanel(None);
+    }
+}
+
+/// Hide every other application (App menu → Hide Others).
+pub(crate) fn hide_other_applications() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.hideOtherApplications(None);
+    }
+}
+
+/// Reveal all hidden applications (App menu → Show All).
+pub(crate) fn show_all_applications() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.unhideAllApplications(None);
+    }
+}
+
+/// Virtual keycodes we synthesise or inspect (HIToolbox values).
+const KEYCODE_C: u16 = 8;
+const KEYCODE_LEFT_SHIFT: u16 = 56;
+const KEYCODE_RIGHT_SHIFT: u16 = 60;
+
+/// How long the synthesized copy waits before reading the pasteboard.
+const COPY_SETTLE: Duration = Duration::from_millis(80);
 
 /// A small Objective-C object that forwards menu clicks to the command sender.
 struct MenuTargetIvars {
@@ -54,8 +79,7 @@ define_class!(
                 0 => AppCommand::OpenWindow,
                 1 => AppCommand::ToggleWindow,
                 2 => AppCommand::NewNote,
-                3 => AppCommand::NewLink,
-                4 => AppCommand::Quit,
+                3 => AppCommand::Quit,
                 _ => return,
             };
             self.ivars().sender.send(command);
@@ -70,9 +94,13 @@ impl MenuTarget {
     }
 }
 
-/// Create the status item in the macOS menu bar.
-pub fn install(sender: CommandSender) -> Option<()> {
-    let mtm = MainThreadMarker::new()?;
+/// Create the status item in the macOS menu bar. Returns `false` when the
+/// process is not on the main thread or AppKit refuses the item; the caller
+/// logs that and continues without a menu-bar presence.
+pub fn install(sender: CommandSender) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
 
     let status_bar = NSStatusBar::systemStatusBar();
     // 22 is the standard menu bar icon slot size.
@@ -101,7 +129,7 @@ pub fn install(sender: CommandSender) -> Option<()> {
     std::mem::forget(item);
     install_shift_capture_monitor(sender);
 
-    Some(())
+    true
 }
 
 struct ShiftTracker {
@@ -145,13 +173,11 @@ fn install_shift_capture_monitor(sender: CommandSender) {
     }));
     let handler = RcBlock::new(move |event: NonNull<NSEvent>| {
         let event = unsafe { event.as_ref() };
-        if !matches!(event.keyCode(), 56 | 60) {
+        if !matches!(event.keyCode(), KEYCODE_LEFT_SHIFT | KEYCODE_RIGHT_SHIFT) {
             return;
         }
 
         let shift_active = event.modifierFlags().contains(NSEventModifierFlags::Shift);
-        // Publish global shift state for worktable_view's Shift+right-click handling.
-        SHIFT_HELD.store(shift_active, Ordering::SeqCst);
         let should_capture = tracker
             .lock()
             .map(|mut tracker| {
@@ -186,7 +212,7 @@ fn capture_foreground_selection(sender: CommandSender) {
             .map(|value| value.to_string());
 
         post_copy_shortcut();
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(COPY_SETTLE);
 
         let after_count = pasteboard.changeCount();
         if after_count == before_count {
@@ -228,44 +254,50 @@ fn try_capture_image_from_pasteboard(pasteboard: &NSPasteboard) -> Option<(Strin
     let tiff_type = unsafe { NSPasteboardTypeTIFF };
     if let Some(data) = pasteboard.dataForType(tiff_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "tiff", "image/tiff") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "tiff", "image/tiff")
+    {
+        return Some(result);
+    }
 
     let png_type = unsafe { NSPasteboardTypePNG };
     if let Some(data) = pasteboard.dataForType(png_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "png", "image/png") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "png", "image/png")
+    {
+        return Some(result);
+    }
 
     // JPEG via UTI string "public.jpeg" (no dedicated constant in objc2-app-kit).
     let jpeg_type = NSString::from_str("public.jpeg");
     if let Some(data) = pasteboard.dataForType(&jpeg_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "jpg", "image/jpeg")
+    {
+        return Some(result);
+    }
     // Alternate UTI "public.jpg" on some systems.
     let jpg_type = NSString::from_str("public.jpg");
     if let Some(data) = pasteboard.dataForType(&jpg_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "jpg", "image/jpeg") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "jpg", "image/jpeg")
+    {
+        return Some(result);
+    }
     // HEIC / HEIF fallback
     let heic_type = NSString::from_str("public.heic");
     if let Some(data) = pasteboard.dataForType(&heic_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "heic", "image/heic") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "heic", "image/heic")
+    {
+        return Some(result);
+    }
     let heif_type = NSString::from_str("public.heif");
     if let Some(data) = pasteboard.dataForType(&heif_type)
         && data.length() > 0
-            && let Some(result) = write_image_data(&data, "heif", "image/heif") {
-                return Some(result);
-            }
+        && let Some(result) = write_image_data(&data, "heif", "image/heif")
+    {
+        return Some(result);
+    }
 
     None
 }
@@ -290,21 +322,22 @@ fn write_image_data(data: &NSData, ext: &str, mime_type: &str) -> Option<(String
 
 fn resolve_images_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("WORKTABLE_IMAGES_DIR")
-        && !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".worktable").join("images"))
 }
 
 fn post_copy_shortcut() {
-    let Some(key_down) = CGEvent::new_keyboard_event(None, 8, true) else {
+    let Some(key_down) = CGEvent::new_keyboard_event(None, KEYCODE_C, true) else {
         return;
     };
     CGEvent::set_flags(Some(&key_down), CGEventFlags::MaskCommand);
     CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&key_down));
 
-    let Some(key_up) = CGEvent::new_keyboard_event(None, 8, false) else {
+    let Some(key_up) = CGEvent::new_keyboard_event(None, KEYCODE_C, false) else {
         return;
     };
     CGEvent::set_flags(Some(&key_up), CGEventFlags::MaskCommand);
@@ -346,7 +379,7 @@ fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> 
 
         // Tag each actionable item and point them at the target object.
         let target = MenuTarget::new(sender);
-        let items = [&open, &show, &note, &link, &quit];
+        let items = [&open, &show, &note, &quit];
         for (index, ns_item) in items.iter().enumerate() {
             ns_item.setTag(index as isize);
             ns_item.setTarget(Some(&*target));
@@ -362,23 +395,14 @@ fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> 
 /// Build a monochrome (template) image from a named SF Symbol so it adapts to
 /// the menu-bar appearance.
 fn make_template_image() -> Option<Retained<NSImage>> {
+    // AppKit symbol lookup is main-thread-only; treat a missing marker as
+    // "no image" and fall back to the text title.
     let _mtm = MainThreadMarker::new()?;
     let symbol = NSString::from_str("square.grid.2x2");
+    let description = NSString::from_str("Worktable");
     let image: Retained<NSImage> =
-        NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, None)?;
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, Some(&description))?;
     image.setTemplate(true);
     image.setSize(NSSize::new(18.0, 18.0));
     Some(image)
-}
-
-/// Keep the app alive / present when the status item is used.
-#[allow(dead_code)]
-pub fn activate_app() {
-    let mtm = MainThreadMarker::new();
-    if let Some(mtm) = mtm {
-        let app = NSApplication::sharedApplication(mtm);
-        unsafe {
-            let _: () = msg_send![&*app, activateIgnoringOtherApps: true];
-        }
-    }
 }

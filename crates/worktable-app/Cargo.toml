@@ -2,6 +2,9 @@
 name = "worktable-app"
 version = "0.1.0"
 edition = "2024"
+# `cargo run -p worktable-app` is the documented developer loop; the package
+# also ships the feature-gated visual-test runner.
+default-run = "worktable-app"
 
 [features]
 # Enables GPUI's test-support (and gpui_macos'/gpui_apple's) so the visual-test
@@ -26,7 +29,6 @@ worktable-db = { path = "../worktable-db" }
 worktable-events = { path = "../worktable-events" }
 worktable-ui = { path = "../worktable-ui" }
 uuid = { version = "1", features = ["v4"] }
-pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

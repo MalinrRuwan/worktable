@@ -26,7 +26,18 @@
 //! transformations), so `menu-in`/`dialog-in` approximate their scale component
 //! with fade + translate; see the module report in ARCHITECTURE §4 follow-ups.
 
+pub mod citations;
+pub mod loading;
+pub mod streaming;
 pub mod theme;
+pub mod thinking;
+
+pub use citations::{
+    CitationColors, CitationFooter, CitationRef, CitationSegment, InlineCitations, parse_citations,
+};
+pub use loading::{Orb, OrbVariant};
+pub use streaming::StreamingText;
+pub use thinking::ThinkingState;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationElement, App, Div, ElementId, EntityId, Global, Hsla, IntoElement,
-    ParentElement, Pixels, Rgba, SharedString, Styled, Window, div, px, relative,
+    ParentElement, Pixels, Rgba, SharedString, Styled, Window, div, relative, rems,
 };
 
 pub use gpui::AnimationExt;
@@ -84,10 +95,27 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
     if cx.reduce_motion() {
         return 0.0;
     }
+    let period = spec.total().as_secs_f32();
+    (lease_clock(view, cx).elapsed().as_secs_f32() / period).fract()
+}
+
+/// Time elapsed on the shared animation clock, in one call: leases the clock
+/// for `view` (so frames keep arriving at [`PULSE_TICK`] while it stays
+/// mounted) and returns how long the shared animation epoch has been running.
+///
+/// Components that need monotonic animation time (typewriter reveals) store a
+/// start value from this clock; because every view shares one epoch, two
+/// instances of the same component stay in step.
+pub fn activity_now(view: EntityId, cx: &mut App) -> Duration {
+    lease_clock(view, cx).elapsed()
+}
+
+/// Lease the shared clock for `view` and return the shared epoch. The clock
+/// parks itself when no leases remain, so an idle window schedules no frames.
+fn lease_clock(view: EntityId, cx: &mut App) -> Instant {
     let clock = cx.default_global::<PulseClock>();
     clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    let period = spec.total().as_secs_f32();
-    let phase = (clock.epoch.elapsed().as_secs_f32() / period).fract();
+    let epoch = clock.epoch;
     if !clock.running {
         clock.running = true;
         cx.spawn(async move |cx| {
@@ -114,7 +142,7 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         })
         .detach();
     }
-    phase
+    epoch
 }
 
 // ---------------------------------------------------------------------------
@@ -207,16 +235,10 @@ impl CubicBezier {
     }
 }
 
-/// zeron's signature entrance curve — CSS `cubic-bezier(0.16, 1, 0.3, 1)`.
-pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
-/// CSS `ease-out` — width/height transitions.
-pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
-/// CSS `ease` — quick fades, menu/dialog pops.
-pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
-/// Sidebar resort glide — CSS `cubic-bezier(0.22, 1, 0.36, 1)` (used from M3b).
-pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
-/// CSS `ease-in-out` — the transcript scroll glide (browser smooth-scroll
-/// shape: gentle start, cruise, gentle landing).
+/// transitions.dev's standard ease — CSS `cubic-bezier(0.22, 1, 0.36, 1)`.
+/// Every transition in the app rides this curve.
+pub const EASE_TRANSITIONS: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
+/// CSS `ease-in-out` — shapes the bobbing-dots bounce legs only.
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
 
 // ---------------------------------------------------------------------------
@@ -279,44 +301,51 @@ impl MotionSpec {
     }
 }
 
-/// Entrances: 0.5s expo-out fade + 4px rise.
-pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
+/// Entrances: 0.5s fade + 4px rise.
+pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_TRANSITIONS);
 /// Quick fade: 0.15s.
-pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE_TRANSITIONS);
 /// Popover-in: 0.14s (scale 0.96 approximated, translateY −2).
-pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
+pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE_TRANSITIONS);
 /// Popover-out: 0.1s — quicker than the entrance (exits should get out of the
 /// way; matches the Radix convention of a shorter close than open).
-pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
-/// Dialog-in: 0.18s (scale 0.96→1 approximated).
-pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
+pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE_TRANSITIONS);
+/// Modal open, transitions.dev: scale 0.96→1 + fade in 250ms. GPUI divs have
+/// no scale transform, so callers approximate the scale with a small rise.
+pub const MODAL_OPEN: MotionSpec = MotionSpec::new(250, EASE_TRANSITIONS);
+/// Modal close, transitions.dev: scale back to 0.96 + fade out in 150ms.
+pub const MODAL_CLOSE: MotionSpec = MotionSpec::new(150, EASE_TRANSITIONS);
+/// Entry-detail morph open: a card's rect grows into the middle of the UI.
+pub const MORPH_OPEN: MotionSpec = MotionSpec::new(320, EASE_TRANSITIONS);
+/// Entry-detail morph close: the panel shrinks back toward its source rect.
+pub const MORPH_CLOSE: MotionSpec = MotionSpec::new(200, EASE_TRANSITIONS);
 /// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
-pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
-/// Sidebar / pane width+height transitions: 200ms ease-out.
-pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
+pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE_TRANSITIONS).with_delay(150);
+/// Sidebar / pane width+height transitions: 200ms.
+pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_TRANSITIONS);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
-pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
+pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_TRANSITIONS);
 /// Diff-pane per-file collapse: 180ms height (§1.11).
-pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_TRANSITIONS);
 /// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
 /// divs have no rotation transform at the pinned rev, same caveat as scale).
-pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
-/// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance
-/// (Electron parity — the original rail rode the browser's native smooth
-/// scroll, a fixed-duration gentle ease, never percent-of-remaining).
-pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(500, EASE_IN_OUT);
-/// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`
-/// (`transition-colors` et al. carry it unless overridden; zeron never does).
-pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
-/// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
-/// blend every interactive hover wash rides in the original.
-pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
+pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE_TRANSITIONS);
+/// Rail-tick / scroll-to-row glide: 500ms over the whole distance.
+pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(500, EASE_TRANSITIONS);
+/// Interactive hover wash: 150ms.
+pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TRANSITIONS);
 /// Zeron loader pulse period: 2.4s.
-pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
+pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE_TRANSITIONS);
 /// Gradient matrix spinner wave period: 750ms.
-pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
+pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE_TRANSITIONS);
 /// Text-dots ("Thinking…") cycle: 1.4s opacity wave, one dot every 0.2s.
-pub const TEXT_DOTS: MotionSpec = MotionSpec::new(1400, EASE);
+pub const TEXT_DOTS: MotionSpec = MotionSpec::new(1400, EASE_TRANSITIONS);
+/// Entries ⇄ Agent page transition: transitions.dev's page slide — 250ms
+/// over `cubic-bezier(0.22,1,0.36,1)` with an 8px offset and a 3px blur
+/// (GPUI has no element blur; the fade carries the softening).
+pub const PAGE_SLIDE: MotionSpec = MotionSpec::new(250, EASE_TRANSITIONS);
+/// aiCSS ThinkingState shimmer: 2.25s with holds at each end of the sweep.
+pub const THINKING_SHINE: MotionSpec = MotionSpec::new(2250, EASE_TRANSITIONS);
 /// Bobbing-dots (waiting-on-LLM) cycle: 1s bounce, one dot every 0.2s.
 pub const BOBBING_DOTS: MotionSpec = MotionSpec::new(1000, EASE_IN_OUT);
 /// Stagger between text/bobbing dots (fraction of period) — 0.2s at 1s period.
@@ -332,7 +361,7 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, FADE_IN.animation(), |el, t| {
-        el.relative().opacity(t).top(px(4.0 * (1.0 - t)))
+        el.relative().opacity(t).top(rems(0.25 * (1.0 - t)))
     })
 }
 
@@ -353,7 +382,7 @@ where
     element.with_animation(id, MENU_IN.animation(), |el, t| {
         el.relative()
             .opacity(0.3 + 0.7 * t)
-            .top(px(-2.0 * (1.0 - t)))
+            .top(rems(-0.125 * (1.0 - t)))
     })
 }
 
@@ -369,17 +398,7 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, MENU_OUT.animation(), move |el, _| {
-        el.relative().opacity(1.0 - t).top(px(-2.0 * t))
-    })
-}
-
-/// Dialog entrance over [`DIALOG_IN`] (scale approximated with fade + 2px rise).
-pub fn dialog_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
-where
-    E: Styled + IntoElement + 'static,
-{
-    element.with_animation(id, DIALOG_IN.animation(), |el, t| {
-        el.relative().opacity(t).top(px(2.0 * (1.0 - t)))
+        el.relative().opacity(1.0 - t).top(rems(-0.125 * t))
     })
 }
 
@@ -389,7 +408,7 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, SPLASH_OUT.animation(), |el, t| {
-        el.opacity(1.0 - t).top(px(-6.0 * t))
+        el.opacity(1.0 - t).top(rems(-0.375 * t))
     })
 }
 
@@ -486,19 +505,14 @@ pub fn text_dots(label: &str, delta: f32, color: Hsla) -> Div {
         .items_baseline()
         .text_color(color)
         .child(div().child(label.to_owned()))
-        .child(
+        .child(div().flex().flex_row().children((0..3).map(|index| {
+            let opacity = text_dot_opacity(delta, index);
             div()
-                .flex()
-                .flex_row()
-                .children((0..3).map(|index| {
-                    let opacity = text_dot_opacity(delta, index);
-                    div()
-                        .opacity(opacity)
-                        // Keep the label's baseline: collapsed line box.
-                        .line_height(relative(1.0))
-                        .child(".")
-                })),
-        )
+                .opacity(opacity)
+                // Keep the label's baseline: collapsed line box.
+                .line_height(relative(1.0))
+                .child(".")
+        })))
 }
 
 /// Three round dots bobbing in sequence (the `BobbingDots` web component) —
@@ -742,11 +756,11 @@ pub fn reduced_motion(cx: &App) -> bool {
 mod tests {
     #[test]
     fn eval_never_escapes_unit_interval_dense_sweep() {
-        // Regression: f32 rounding produced 1.000000119 near the tail of
-        // EASE_OUT_EXPO, tripping gpui's `delta ∈ [0,1]` assert (SIGABRT on
-        // the user's machine). Sweep densely, including the values right
-        // below 1.0 where Newton lands closest to the endpoint.
-        for curve in [EASE_OUT_EXPO, EASE_OUT, EASE, EASE_RESORT, EASE_IN_OUT] {
+        // Regression: f32 rounding once produced 1.000000119 near a curve's
+        // tail, tripping gpui's `delta ∈ [0,1]` assert (SIGABRT). Sweep
+        // densely, including the values right below 1.0 where Newton lands
+        // closest to the endpoint.
+        for curve in [EASE_TRANSITIONS, EASE_IN_OUT] {
             for i in 0..=100_000u32 {
                 let x = i as f32 / 100_000.0;
                 let y = curve.eval(x);
@@ -778,22 +792,17 @@ mod tests {
 
     #[test]
     fn bezier_known_values() {
-        // References computed independently with 80-step bisection.
-        let cases: [(&str, CubicBezier, [f32; 5]); 3] = [
+        // References computed independently with the UnitBezier solver.
+        let cases: [(&str, CubicBezier, [f32; 5]); 2] = [
             (
-                "expo",
-                EASE_OUT_EXPO,
-                [0.494391, 0.825622, 0.971779, 0.997677, 0.999878],
+                "transitions",
+                EASE_TRANSITIONS,
+                [0.401097, 0.764865, 0.961383, 0.996894, 0.999840],
             ),
             (
-                "ease-out",
-                EASE_OUT,
-                [0.160572, 0.378138, 0.684643, 0.906535, 0.982973],
-            ),
-            (
-                "ease",
-                EASE,
-                [0.094796, 0.408511, 0.802403, 0.960459, 0.994316],
+                "ease-in-out",
+                EASE_IN_OUT,
+                [0.019722, 0.129162, 0.500000, 0.870838, 0.980278],
             ),
         ];
         for (name, curve, expected) in cases {
@@ -805,7 +814,7 @@ mod tests {
 
     #[test]
     fn bezier_endpoints_and_clamping() {
-        for curve in [EASE_OUT_EXPO, EASE_OUT, EASE, EASE_RESORT, EASE_IN_OUT] {
+        for curve in [EASE_TRANSITIONS, EASE_IN_OUT] {
             assert_eq!(curve.eval(0.0), 0.0);
             assert_eq!(curve.eval(1.0), 1.0);
             assert_eq!(curve.eval(-0.5), 0.0);
@@ -815,7 +824,7 @@ mod tests {
 
     #[test]
     fn bezier_is_monotonic_for_catalog_curves() {
-        for curve in [EASE_OUT_EXPO, EASE_OUT, EASE, EASE_RESORT, EASE_IN_OUT] {
+        for curve in [EASE_TRANSITIONS, EASE_IN_OUT] {
             let mut last = 0.0;
             for i in 0..=100 {
                 let y = curve.eval(i as f32 / 100.0);
@@ -841,7 +850,7 @@ mod tests {
         // No-delay specs pass straight through the curve.
         assert_close(
             FADE_IN.progress(0.5),
-            EASE_OUT_EXPO.eval(0.5),
+            EASE_TRANSITIONS.eval(0.5),
             1e-6,
             "no-delay",
         );
@@ -852,7 +861,8 @@ mod tests {
         assert_eq!(FADE_IN.duration_ms, 500);
         assert_eq!(FADE_QUICK.duration_ms, 150);
         assert_eq!(MENU_IN.duration_ms, 140);
-        assert_eq!(DIALOG_IN.duration_ms, 180);
+        assert_eq!(MODAL_OPEN.duration_ms, 250);
+        assert_eq!(MODAL_CLOSE.duration_ms, 150);
         assert_eq!((SPLASH_OUT.duration_ms, SPLASH_OUT.delay_ms), (500, 150));
         assert_eq!(RESIZE.duration_ms, 200);
         assert_eq!(TAB_SLIDE.duration_ms, 150);
@@ -860,7 +870,7 @@ mod tests {
         assert_eq!(CHEVRON.duration_ms, 200);
         assert_eq!(ZERON_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
-        assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));
+        assert_eq!(EASE_TRANSITIONS, CubicBezier::new(0.22, 1.0, 0.36, 1.0));
     }
 
     #[test]
@@ -1020,10 +1030,10 @@ mod tests {
     }
 
     #[test]
-    fn hover_spec_matches_tailwind_transition_colors() {
+    fn hover_fade_uses_the_transitions_curve() {
         assert_eq!(HOVER_FADE.duration_ms, 150);
         assert_eq!(HOVER_FADE.delay_ms, 0);
-        assert_eq!(EASE_TAILWIND, CubicBezier::new(0.4, 0.0, 0.2, 1.0));
+        assert_eq!(HOVER_FADE.curve, EASE_TRANSITIONS);
     }
 
     #[test]
@@ -1058,7 +1068,10 @@ mod tests {
             for step in 0..=100 {
                 let delta = step as f32 / 100.0;
                 let opacity = text_dot_opacity(delta, i);
-                assert!((0.0..=1.0).contains(&opacity), "dot {i} at {delta}: {opacity}");
+                assert!(
+                    (0.0..=1.0).contains(&opacity),
+                    "dot {i} at {delta}: {opacity}"
+                );
             }
         }
     }

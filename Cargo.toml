@@ -23,6 +23,17 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
 
+# Debug builds are what developers run every day: optimize every dependency
+# (GPUI's layout/render path in particular) while keeping the workspace crates
+# unoptimized for fast, debuggable iteration. This is the same split Zed uses
+# so the debug app renders smoothly instead of dropping frames.
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
 # Keep shipped binaries small without affecting debug iteration speed.
 [profile.release]
 opt-level = "z"

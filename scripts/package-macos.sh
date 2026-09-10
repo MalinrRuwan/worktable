@@ -14,9 +14,9 @@ fi
 
 cd "$ROOT_DIR"
 
-# The AI agent is compiled into the binary via pi_agent_rust. There is no JS
-# worker, no Node, and no separate sidecar to bundle — one native binary is all
-# that ships.
+# The AI agent is compiled into the binary through rig (see
+# crates/worktable-ai). There is no JS worker, no Node, and no separate sidecar
+# to bundle — one native binary is all that ships.
 cargo build --release -p worktable-app
 
 rm -rf "$BUNDLE_DIR"
