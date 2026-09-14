@@ -71,6 +71,12 @@ fn sample_entries() -> Vec<WorktableEntry> {
 /// as `helix.json` *next to* the database (see `helix_path_for_sqlite`), so
 /// a shared directory would make parallel tests race on one graph file.
 fn seeded_db(entries: Vec<WorktableEntry>) -> String {
+    seeded_db_with_config(entries, true)
+}
+
+/// `seeded_db` with the first-run opt-out config controllable, so the tour can
+/// be exercised against a database that looks brand new.
+fn seeded_db_with_config(entries: Vec<WorktableEntry>, onboarding_done: bool) -> String {
     let dir = std::env::temp_dir().join(format!("worktable-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("worktable.db");
@@ -89,6 +95,11 @@ fn seeded_db(entries: Vec<WorktableEntry>) -> String {
         .unwrap();
     for entry in entries {
         rt.block_on(runtime.insert_entry(&entry)).unwrap();
+    }
+    // Tests drive the app UI directly; only first-run tests opt out of the
+    // tour.
+    if onboarding_done {
+        runtime.set_config("onboarding_completed", "1").unwrap();
     }
     drop(runtime);
 
@@ -111,6 +122,15 @@ fn setup_view_with_size(
     window_size: Size<gpui::Pixels>,
 ) -> (Entity<WorktableView>, WindowHandle<Root>) {
     let db = seeded_db(entries);
+    setup_view_with_db(cx, db, window_size)
+}
+
+/// Build a window over an existing database path (first-run config tests).
+fn setup_view_with_db(
+    cx: &mut TestAppContext,
+    db: String,
+    window_size: Size<gpui::Pixels>,
+) -> (Entity<WorktableView>, WindowHandle<Root>) {
     let service = Arc::new(WorktableService::new_for_test(&db).unwrap());
 
     // `WorktableService` runs its own real Tokio workers, which complete config /
@@ -471,6 +491,10 @@ fn composer_bar_submits_a_note(cx: &mut TestAppContext) {
         v.composer_body.read(cx).value().to_string().is_empty()
     });
     assert!(cleared, "the input should clear after adding the note");
+    assert!(
+        cx.read_entity(&view, |v, _| v.list_insert_at.is_some()),
+        "the new entry should arm the push-down entrance"
+    );
 }
 
 #[gpui::test]
@@ -736,7 +760,7 @@ fn first_card_center(cx: &mut VisualTestContext) -> Point<gpui::Pixels> {
     let y = cx.update(|window, _| {
         list.top()
             + design::to_pixels(design::SECTION_HEADER_HEIGHT, window)
-            + design::to_pixels(design::ENTRY_CARD_HEIGHT, window) / 2.0
+            + design::to_pixels(design::ENTRY_CARD_MIN_HEIGHT, window) / 2.0
     });
     point(list.center().x, y)
 }
@@ -772,6 +796,14 @@ fn wait_for_providers(cx: &mut VisualTestContext, view: &Entity<WorktableView>, 
 fn focus_view(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
     cx.update(|window, cx| {
         view.focus_handle(cx).focus(window, cx);
+    });
+    cx.run_until_parked();
+}
+
+/// Focus the note bar input the way a click does in the running app.
+fn focus_composer(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| this.focus_composer(window, cx));
     });
     cx.run_until_parked();
 }
@@ -1013,6 +1045,7 @@ fn nav_settings_tabs_switch_body(cx: &mut TestAppContext) {
         "Settings should open on the category list"
     );
     for (selector, tab) in [
+        ("settings-category-general", super::SettingsTab::General),
         (
             "settings-category-appearance",
             super::SettingsTab::Appearance,
@@ -1032,6 +1065,45 @@ fn nav_settings_tabs_switch_body(cx: &mut TestAppContext) {
             "Back on a category returns to the list"
         );
     }
+}
+
+/// General → "Keep running in the menu bar" defaults on and mirrors into the
+/// process-wide flag the window close handler reads.
+#[gpui::test]
+fn general_settings_toggle_background_mode(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // On by default, both in the view and the process mirror.
+    assert!(cx.read_entity(&view, |v, _| v.background_on_close));
+    assert!(crate::preferences::background_on_close());
+
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::General, cx)
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("background-on-close-switch").is_some(),
+        "the General page should offer the background toggle"
+    );
+
+    click_selector(&mut cx, "background-on-close-switch");
+    assert!(
+        !cx.read_entity(&view, |v, _| v.background_on_close),
+        "the switch should turn the preference off"
+    );
+    assert!(
+        !crate::preferences::background_on_close(),
+        "the close handler's mirror should follow the toggle"
+    );
+
+    click_selector(&mut cx, "background-on-close-switch");
+    assert!(cx.read_entity(&view, |v, _| v.background_on_close));
+    assert!(crate::preferences::background_on_close());
 }
 
 #[gpui::test]
@@ -1418,9 +1490,8 @@ fn nav_keyboard_shortcuts_cover_composer_and_search(cx: &mut TestAppContext) {
     settle(&mut cx);
     focus_view(&mut cx, &view);
 
-    // ⌘N focuses the note input; typing lands there and ⌘⏎ adds the note.
-    cx.simulate_keystrokes("cmd-n");
-    cx.run_until_parked();
+    // Typing into the note bar and pressing Enter adds the note.
+    focus_composer(&mut cx, &view);
     cx.simulate_input("quick capture");
     cx.simulate_keystrokes("enter");
     let ok = wait_for(&mut cx, 5, |cx| {
@@ -1428,7 +1499,7 @@ fn nav_keyboard_shortcuts_cover_composer_and_search(cx: &mut TestAppContext) {
             v.entries.iter().any(|e| e.content == "quick capture")
         })
     });
-    assert!(ok, "⌘N + typing + ⌘⏎ should add a note");
+    assert!(ok, "typing and Enter in the note bar should add a note");
 
     // ⌘F → search field focused: typing must land in the query.
     focus_view(&mut cx, &view);
@@ -1439,6 +1510,93 @@ fn nav_keyboard_shortcuts_cover_composer_and_search(cx: &mut TestAppContext) {
         cx.read_entity(&view, |v, _| v.query.clone()),
         "neg",
         "typing after ⌘F should filter the entry list"
+    );
+}
+
+/// A database without the completion flag opens the tour on first launch.
+#[gpui::test]
+fn onboarding_opens_for_a_fresh_database(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = seeded_db_with_config(vec![], false);
+    let (view, window) = setup_view_with_db(cx, db, TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // The config read is async; wait for it to resolve.
+    let opened = wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| v.onboarding.is_some())
+    });
+    assert!(opened, "a fresh database should open the first-run tour");
+    assert!(cx.debug_bounds("onboarding").is_some());
+
+    // Skipping persists the opt-out; a later config read must not re-open it.
+    click_selector(&mut cx, "onboarding-skip");
+    assert!(cx.read_entity(&view, |v, _| v.onboarding.is_none()));
+}
+
+#[gpui::test]
+fn onboarding_walks_all_steps_and_can_be_skipped(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, vec![]);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // The seed marks the tour completed, so the library opens directly.
+    assert!(cx.read_entity(&view, |v, _| v.onboarding.is_none()));
+
+    // First run (or Settings → Appearance → Replay) starts it.
+    view.update(&mut cx, |this, cx| this.start_onboarding(cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("onboarding").is_some());
+    assert!(
+        cx.debug_bounds("onboarding-kbd-cmd-f").is_some(),
+        "the keymap keycaps should render on the welcome step"
+    );
+    assert!(cx.debug_bounds("onboarding-next").is_some());
+
+    click_selector(&mut cx, "onboarding-next");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Accessibility),
+        "Continue should open the Accessibility step"
+    );
+    assert!(cx.debug_bounds("onboarding-accessibility-status").is_some());
+    assert!(cx.debug_bounds("onboarding-open-accessibility").is_some());
+
+    click_selector(&mut cx, "onboarding-next");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Provider)
+    );
+
+    // Back walks one page; the provider CTA lands in Settings → Providers.
+    click_selector(&mut cx, "onboarding-back");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Accessibility)
+    );
+    click_selector(&mut cx, "onboarding-next");
+    click_selector(&mut cx, "onboarding-provider");
+    assert!(cx.read_entity(&view, |v, _| v.onboarding.is_none()));
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.settings_tab),
+        Some(super::SettingsTab::Providers),
+        "the provider step should open the provider settings"
+    );
+
+    // Any step can be skipped outright.
+    view.update(&mut cx, |this, cx| {
+        this.show_entries(cx);
+        this.start_onboarding(cx);
+    });
+    cx.run_until_parked();
+    click_selector(&mut cx, "onboarding-skip");
+    assert!(
+        cx.read_entity(&view, |v, _| v.onboarding.is_none()),
+        "Skip should dismiss the tour"
     );
 }
 
@@ -1455,10 +1613,8 @@ fn note_bar_enter_and_backspace_stay_in_the_field(cx: &mut TestAppContext) {
     view.update(&mut cx, |this, _| this.select_at("test-1000".into(), false));
     let count_before = cx.read_entity(&view, |v, _| v.entries.len());
 
-    // ⌘N focuses the note input; Enter adds the note, never the detail view.
-    focus_view(&mut cx, &view);
-    cx.simulate_keystrokes("cmd-n");
-    cx.run_until_parked();
+    // Enter in the note bar adds the note, never the detail view.
+    focus_composer(&mut cx, &view);
     cx.simulate_input("note typed with enter");
     cx.simulate_keystrokes("enter");
     let added = wait_for(&mut cx, 5, |cx| {
@@ -1482,9 +1638,7 @@ fn note_bar_enter_and_backspace_stay_in_the_field(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    focus_view(&mut cx, &view);
-    cx.simulate_keystrokes("cmd-n");
-    cx.run_until_parked();
+    focus_composer(&mut cx, &view);
     cx.simulate_keystrokes("backspace");
     assert_eq!(
         cx.read_entity(&view, |v, cx| v.composer_body.read(cx).value().to_string()),
@@ -1684,10 +1838,8 @@ fn nav_cmd_enter_submits_the_composer(cx: &mut TestAppContext) {
     settle(&mut cx);
     no_splash(&mut cx, &view);
 
-    // Focus the note input with ⌘N, fill it, and submit with ⌘⏎.
-    focus_view(&mut cx, &view);
-    cx.simulate_keystrokes("cmd-n");
-    cx.run_until_parked();
+    // Focus the note input, fill it, and submit with ⌘⏎.
+    focus_composer(&mut cx, &view);
     cx.update(|window, cx| {
         view.update(cx, |this, cx| {
             let body = this.composer_body.clone();
@@ -1706,6 +1858,143 @@ fn nav_cmd_enter_submits_the_composer(cx: &mut TestAppContext) {
         })
     });
     assert!(ok, "⌘⏎ should submit the note bar");
+}
+
+/// The card context menu's Delete follows the selection: a right click on a
+/// selected card removes every selected entry; an unselected card deletes
+/// only itself.
+#[gpui::test]
+fn context_delete_respects_multi_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let ids = cx.read_entity(&view, |v, _| v.visible_entry_ids());
+    assert!(ids.len() >= 3, "need three entries for the selection check");
+
+    view.update(&mut cx, |this, _| {
+        this.select_at(ids[0].clone(), false);
+        this.select_at(ids[1].clone(), true);
+    });
+    assert_eq!(cx.read_entity(&view, |v, _| v.selected.len()), 2);
+
+    // Right-clicking inside the selection deletes both entries.
+    view.update(&mut cx, |this, cx| {
+        this.delete_context_target(ids[0].clone(), cx);
+    });
+    cx.run_until_parked();
+    let after_multi = cx.read_entity(&view, |v, _| v.visible_entry_ids());
+    assert_eq!(after_multi.len(), ids.len() - 2);
+    assert!(!after_multi.contains(&ids[0]) && !after_multi.contains(&ids[1]));
+
+    // An unselected target collapses the selection to itself and deletes.
+    view.update(&mut cx, |this, cx| {
+        this.delete_context_target(ids[2].clone(), cx);
+    });
+    cx.run_until_parked();
+    let after_single = cx.read_entity(&view, |v, _| v.visible_entry_ids());
+    assert_eq!(after_single.len(), ids.len() - 3);
+    assert!(!after_single.contains(&ids[2]));
+}
+
+/// Arrows move the list without focusing it first; while a text field owns
+/// the keyboard they stay with the field.
+/// The header search morphs into a circular button on the agent page; the
+/// button morphs back, lands on Entries, and focuses the field.
+#[gpui::test]
+fn agent_header_morphs_search_to_a_circle_button(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    assert!(cx.debug_bounds("library-search-input").is_some());
+    assert!(cx.debug_bounds("agent-search-button").is_none());
+
+    focus_view(&mut cx, &view);
+    cx.simulate_keystrokes("cmd-2");
+    cx.run_until_parked();
+    // Age the page clock past the morph span instead of sleeping, so the
+    // assertions are deterministic under parallel test load.
+    view.update(&mut cx, |this, cx| {
+        this.page_anim_at = Some(
+            std::time::Instant::now()
+                - worktable_ui::PAGE_SLIDE.total()
+                - std::time::Duration::from_millis(10),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
+    assert!(
+        cx.debug_bounds("agent-search-button").is_some(),
+        "the agent page shows the circular search button"
+    );
+    assert!(
+        cx.debug_bounds("library-search-input").is_none(),
+        "the full search field is not mounted on the agent page"
+    );
+
+    click_selector(&mut cx, "agent-search-button");
+    cx.run_until_parked();
+    view.update(&mut cx, |this, cx| {
+        this.page_anim_at = Some(
+            std::time::Instant::now()
+                - worktable_ui::PAGE_SLIDE.total()
+                - std::time::Duration::from_millis(10),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
+    assert!(cx.debug_bounds("library-search-input").is_some());
+    let focused = cx.update(|window, cx| window.focused(cx));
+    let search = view.read_with(&cx, |v, cx| v.search_input.read(cx).focus_handle(cx));
+    assert_eq!(
+        focused,
+        Some(search),
+        "morphing back should focus the search field"
+    );
+}
+
+#[gpui::test]
+fn arrows_move_selection_without_focusing_first(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // No focus_view: the global binding should still move the list.
+    cx.simulate_keystrokes("down");
+    let first = cx.read_entity(&view, |v, _| v.selected.iter().next().cloned());
+    assert!(
+        first.is_some(),
+        "↓ should select the first entry without focusing the list"
+    );
+    cx.simulate_keystrokes("down");
+    let second = cx.read_entity(&view, |v, _| v.selected.iter().next().cloned());
+    assert_ne!(first, second, "↓ should move to the next entry");
+    cx.simulate_keystrokes("up");
+    let back = cx.read_entity(&view, |v, _| v.selected.iter().next().cloned());
+    assert_eq!(back, first, "↑ should move back");
+
+    // While the note input owns the keyboard, arrows leave the list alone.
+    focus_composer(&mut cx, &view);
+    let before = cx.read_entity(&view, |v, _| v.selected.clone());
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.selected.clone()),
+        before,
+        "arrows must not move the list while typing"
+    );
 }
 
 #[gpui::test]
@@ -1870,14 +2159,112 @@ fn image_file_drop_adds_an_entry(cx: &mut TestAppContext) {
         paths: ExternalPaths([path.clone()].into_iter().collect()),
     });
     cx.simulate_event(FileDropEvent::Submit { position: center });
+    let media = cx.read_entity(&view, |v, _| v.service.media_dir().to_path_buf());
     let added = wait_for(&mut cx, 5, |cx| {
         cx.read_entity(&view, |v, _| {
-            v.entries
-                .iter()
-                .any(|entry| entry.content == path.to_string_lossy())
+            v.entries.iter().any(|entry| {
+                let stored = std::path::Path::new(&entry.content);
+                stored == media.join("worktable-drop-test.png") && stored.is_file()
+            })
         })
     });
-    assert!(added, "the dropped image becomes an image entry");
+    assert!(
+        added,
+        "the dropped image becomes an entry hard-linked into the media library"
+    );
+    assert!(
+        media.join("worktable-drop-test.png").is_file(),
+        "the media library should hold the linked file"
+    );
+}
+
+#[gpui::test]
+fn force_touch_does_not_retrigger_an_open_modal(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.open_entry_modal(
+            "test-1000",
+            Bounds::new(Point::default(), Size::default()),
+            cx,
+        );
+    });
+    let first_open = cx.read_entity(&view, |v, _| {
+        v.entry_modal
+            .as_ref()
+            .map(|modal| (modal.entry_id.clone(), modal.opened_at))
+    });
+    assert!(first_open.is_some());
+
+    // Simulate the pressure path opening another card behind the panel.
+    view.update(&mut cx, |this, cx| {
+        this.open_entry_modal(
+            "test-1001",
+            Bounds::new(Point::default(), Size::default()),
+            cx,
+        );
+    });
+    let after = cx.read_entity(&view, |v, _| {
+        v.entry_modal
+            .as_ref()
+            .map(|modal| (modal.entry_id.clone(), modal.opened_at))
+    });
+    assert_eq!(
+        after.as_ref().map(|(id, _)| id.clone()),
+        first_open.as_ref().map(|(id, _)| id.clone()),
+        "the open detail keeps its entry"
+    );
+    assert_eq!(
+        after.map(|(_, opened)| opened),
+        first_open.map(|(_, opened)| opened),
+        "and its morph clock is not restarted"
+    );
+}
+
+#[gpui::test]
+fn entry_detail_title_is_selectable_text(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let entries = vec![WorktableEntry {
+        id: "titled-1".to_owned(),
+        content: "High-performance markdown processing for the JS ecosystem".to_owned(),
+        title: Some("bruits/satteri".to_owned()),
+        source: "github-star".to_owned(),
+        created_at: 1_000,
+    }];
+    let (view, window) = setup_view(cx, entries);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.open_entry_modal(
+            "titled-1",
+            Bounds::new(Point::default(), Size::default()),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+
+    let title = cx
+        .debug_bounds("entry-modal-title")
+        .expect("the title should render");
+    let body = cx
+        .debug_bounds("entry-modal-scroll")
+        .expect("the body should render below the title");
+    assert!(
+        title.size.height <= px(32.),
+        "the title should be one line, got {}",
+        title.size.height
+    );
+    assert!(
+        body.origin.y >= title.origin.y + title.size.height - px(1.),
+        "the body must not be pushed off by the title's TextView"
+    );
 }
 
 #[gpui::test]
@@ -2510,7 +2897,109 @@ fn tool_citations_attach_to_the_answer(cx: &mut TestAppContext) {
     );
 }
 
-/// Switching pages records a transition; both pages are mounted mid-flight
+/// The real worker order: deltas stream first, then the collected citations,
+/// then RunCompleted. The citations must land on the streaming answer.
+#[gpui::test]
+fn citations_arriving_after_the_answer_attach(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.on_event(
+            &worktable_events::WorktableEvent::AiMessageDelta {
+                request_id: "req-1".to_owned(),
+                session_id: "wt-session".to_owned(),
+                delta: "That note exists in your library[1].".to_owned(),
+            },
+            cx,
+        );
+        // The tool finishes and the runtime emits the collected citations.
+        this.on_event(
+            &worktable_events::WorktableEvent::AiCitations {
+                request_id: "req-1".to_owned(),
+                session_id: "wt-session".to_owned(),
+                citations: vec![worktable_events::KnowledgeCitation {
+                    n: 1,
+                    entry_id: "test-1000".to_owned(),
+                    label: "Negation in inherited configs".to_owned(),
+                    snippet: "Negation in inherited configs.".to_owned(),
+                    host: "Worktable".to_owned(),
+                    url: String::new(),
+                }],
+            },
+            cx,
+        );
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFinished {
+                request_id: "req-1".to_owned(),
+                session_id: "wt-session".to_owned(),
+                run_id: "run-1".to_owned(),
+                state: "completed".to_owned(),
+            },
+            cx,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+
+    let citations = cx.read_entity(&view, |v, _| {
+        v.messages
+            .last()
+            .map(|message| message.citations.clone())
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        citations.len(),
+        1,
+        "citations emitted after the deltas must attach to the answer"
+    );
+    assert!(
+        cx.debug_bounds("msg-0-citations-cite-1").is_some(),
+        "the answer should render the marker as a chip"
+    );
+    assert!(
+        cx.debug_bounds("msg-0-citations-ref-1").is_some(),
+        "the source row should render under the answer"
+    );
+}
+
+/// Markers without collected sources still render through the citation
+/// component, so raw `[n]` brackets never reach the UI.
+#[gpui::test]
+fn citation_markers_without_sources_still_chip(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, vec![]);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.messages.push(crate::assistant::ChatMessage::assistant(
+            "An answer that cites nothing collected[1].",
+        ));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("assistant-citations").is_some(),
+        "a marker-bearing answer renders through InlineCitations"
+    );
+    assert!(
+        cx.debug_bounds("msg-0-citations-cite-1").is_some(),
+        "the bare marker becomes a chip"
+    );
+}
+
+/// Switching pages records a transition; both pages are mounted mid-flight/// Switching pages records a transition; both pages are mounted mid-flight
 /// and only the active one remains after it settles.
 #[gpui::test]
 fn library_pages_transition_between_entries_and_agent(cx: &mut TestAppContext) {
@@ -2680,8 +3169,7 @@ fn entry_modal_opens_from_the_keyboard(cx: &mut TestAppContext) {
     );
 }
 
-/// The entry view footer offers chips for detected content and no Done
-/// button.
+/// The entry view footer offers chips for detected content.
 #[gpui::test]
 fn entry_modal_offers_action_chips(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -2719,7 +3207,7 @@ fn entry_modal_offers_action_chips(cx: &mut TestAppContext) {
     }
     assert!(
         cx.debug_bounds("entry-modal-done").is_none(),
-        "the Done button is gone"
+        "the detail view has no Done button"
     );
 }
 

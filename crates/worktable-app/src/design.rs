@@ -31,8 +31,13 @@ pub const CONTENT_MAX_WIDTH: Rems = rems(45.);
 /// showing a phone-width sliver in the middle.
 pub const CONTENT_MAX_WIDTH_WIDE: Rems = rems(62.);
 
-/// Height of one entry card in the virtualized entries list.
-pub const ENTRY_CARD_HEIGHT: Rems = rems(6.75);
+/// Minimum height of one entry card in the virtualized entries list: fits the
+/// meta row plus a single body line.
+pub const ENTRY_CARD_MIN_HEIGHT: Rems = rems(6.75);
+
+/// Maximum height of one entry card. Longer bodies clamp their preview inside
+/// this bound, so a card never grows past it.
+pub const ENTRY_CARD_MAX_HEIGHT: Rems = rems(10.5);
 
 /// Vertical gap between entry cards, so repeated rows read as separate cards
 /// rather than one continuous surface.
@@ -48,6 +53,10 @@ pub const PROVIDER_DIALOG_WIDTH: Rems = rems(26.25);
 /// Width of the GitHub stars dialog: fits full repository names and the
 /// fetch/import controls on one row.
 pub const GITHUB_DIALOG_WIDTH: Rems = rems(30.0);
+
+/// Width of the first-run onboarding card: room for the shortcut rows without
+/// stretching to dialog width.
+pub const ONBOARDING_CARD_WIDTH: Rems = rems(34.0);
 
 /// Maximum height of the expanded thinking block; longer reasoning scrolls
 /// inside it (with `TextView::scrollable`).

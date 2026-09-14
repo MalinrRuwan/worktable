@@ -9,8 +9,6 @@ use gpui::actions;
 actions!(
     worktable,
     [
-        /// Create a new text note (⌘N)
-        NewNote,
         /// Focus the search field (⌘F)
         FocusSearch,
         /// Jump to the entries section (⌘1)

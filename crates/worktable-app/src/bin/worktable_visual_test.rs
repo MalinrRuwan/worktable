@@ -30,6 +30,8 @@ const DEMO_PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x
 
 #[path = "../actions.rs"]
 mod actions;
+#[path = "../assets.rs"]
+mod assets;
 #[path = "../assistant.rs"]
 mod assistant;
 #[path = "../design.rs"]
@@ -40,6 +42,8 @@ mod entry_actions;
 mod format;
 #[path = "../github.rs"]
 mod github;
+#[path = "../preferences.rs"]
+mod preferences;
 // The runner mirrors the app's modules but drives only the visual flow, so
 // production entry points (status-item install, capture commands) and some
 // view actions are intentionally unused here. The main binary build still
@@ -107,6 +111,24 @@ fn sample_entries() -> Vec<WorktableEntry> {
             950,
         ),
         entry("fda", 975),
+        // Layout stress: a title, an unbreakable URL, wide glyphs, and an
+        // image with a long filename must all stay inside their rows.
+        WorktableEntry {
+            id: "visual-titled".to_owned(),
+            content: "Short body under a title".to_owned(),
+            title: Some("Design decisions".to_owned()),
+            source: "Worktable".to_owned(),
+            created_at: 850,
+        },
+        entry(
+            "https://example.com/a/really/long/unbroken/path/segment/that/keeps/going/and/going/and/going/without/any/spaces/at/all?with=query&and=parameters",
+            825,
+        ),
+        entry("深色模式下的界面调整 — ノートのレイアウト確認 🎨✨", 812),
+        entry(
+            "/tmp/demo_photo_with_a_very_long_filename_for_layout_checking_worktable.png",
+            805,
+        ),
     ]
 }
 
@@ -125,6 +147,8 @@ fn seeded_db(entries: Vec<WorktableEntry>) -> String {
     for entry in entries {
         rt.block_on(runtime.insert_entry(&entry)).unwrap();
     }
+    // Captures drive the main UI; the tour has its own dedicated steps.
+    runtime.set_config("onboarding_completed", "1").unwrap();
     drop(runtime);
 
     path_str
@@ -142,13 +166,24 @@ fn load_worktable_theme(cx: &mut gpui::App) {
     if gpui_component::ThemeRegistry::global_mut(cx)
         .load_themes_from_str(&contents)
         .is_ok()
-        && let Some(theme) = gpui_component::ThemeRegistry::global(cx)
+    {
+        // Both variants: dark mode must use Ayu Dark, not the default dark
+        // palette (whose list selection is blue).
+        let light = gpui_component::ThemeRegistry::global(cx)
             .themes()
             .get("Ayu Light")
-            .cloned()
-    {
+            .cloned();
+        let dark = gpui_component::ThemeRegistry::global(cx)
+            .themes()
+            .get("Ayu Dark")
+            .cloned();
+        if let Some(light) = light {
+            gpui_component::Theme::global_mut(cx).apply_config(&light);
+        }
+        if let Some(dark) = dark {
+            gpui_component::Theme::global_mut(cx).apply_config(&dark);
+        }
         let mode = gpui_component::Theme::global(cx).mode;
-        gpui_component::Theme::global_mut(cx).apply_config(&theme);
         gpui_component::Theme::change(mode, None, cx);
         // Same Tahoe radius scale as `main::init_theme`.
         let t = gpui_component::Theme::global_mut(cx);
@@ -198,7 +233,7 @@ fn run_visual_tests() -> anyhow::Result<()> {
 
     let mut cx = VisualTestAppContext::with_asset_source(
         gpui_platform::current_platform(false),
-        Arc::new(gpui_component_assets::Assets),
+        Arc::new(assets::AppAssets),
     );
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -229,9 +264,33 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
 
     println!("— step 1: entries —");
-    assert_eq!(cx.read_entity(&view, |v, _| v.entries.len()), 5);
+    assert_eq!(cx.read_entity(&view, |v, _| v.entries.len()), 9);
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
     capture(&mut cx, handle, "worktable_entries")?;
+
+    println!("— step 1a: onboarding — welcome, accessibility, provider —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.start_onboarding(cx));
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    capture(&mut cx, handle, "worktable_onboarding")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.advance_onboarding(cx));
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    capture(&mut cx, handle, "worktable_onboarding_accessibility")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.advance_onboarding(cx));
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    capture(&mut cx, handle, "worktable_onboarding_provider")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.skip_onboarding(cx));
+    });
+    cx.run_until_parked();
 
     println!("— step 1b: entry detail morph —");
     cx.update(|cx| {
@@ -248,6 +307,8 @@ fn run_visual_tests() -> anyhow::Result<()> {
                     .map(|line| format!("line {line} of a long captured note"))
                     .collect::<Vec<_>>()
                     .join("\n");
+                // The detail capture also proves the selectable title box.
+                entry.title = Some("Design decisions".to_owned());
             }
             let origin = this.entry_origin(&id);
             this.open_entry_modal(&id, origin, cx);
@@ -264,6 +325,7 @@ fn run_visual_tests() -> anyhow::Result<()> {
                     "Negation in inherited configs. The moment a config can extend a base or \
                      preset, someone needs to remove an extension the..."
                         .to_owned();
+                entry.title = None;
             }
         });
     });
@@ -314,6 +376,24 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
     capture(&mut cx, handle, "worktable_settings")?;
+
+    println!("— step 3-general: General category — background toggle —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.show_settings_at(worktable_view::SettingsTab::General, cx)
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_settings_general")?;
+
+    println!("— step 3a: Appearance category — theme + welcome tour —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.show_settings_at(worktable_view::SettingsTab::Appearance, cx)
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_settings_appearance")?;
 
     println!("— step 3b: Data category → GitHub stars dialog —");
     // Same handler the category row calls (the runner only needs the capture).
@@ -444,6 +524,10 @@ fn run_visual_tests() -> anyhow::Result<()> {
 
     println!("— step 8: add photo (image entry) → knowledge topic —");
     let _ = std::fs::write("/tmp/demo_photo_sunset.png", DEMO_PNG);
+    let _ = std::fs::write(
+        "/tmp/demo_photo_with_a_very_long_filename_for_layout_checking_worktable.png",
+        DEMO_PNG,
+    );
     cx.update(|cx| {
         view.update(cx, |this, cx| {
             this.add_captured_image(
@@ -601,8 +685,9 @@ fn run_visual_tests() -> anyhow::Result<()> {
                 ChatMessage::user("Explain attention"),
                 ChatMessage {
                     role: assistant::Role::Assistant,
-                    text: "Transformers scale well with data and compute[1], though attention \
-                           is quadratic in sequence length[2]."
+                    text: "## Findings\n\nTransformers **scale well** with data and \
+                           compute[1], though attention is *quadratic* in sequence length[2].\n\n\
+                           - memory grows with `O(n²)`\n- long prompts need care"
                         .into(),
                     thinking: String::new(),
                     streaming: false,
@@ -810,6 +895,19 @@ fn run_visual_tests() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(500));
         capture(&mut cx, edge_handle, "worktable_edge_entries")?;
     }
+
+    println!("— step 14: dark-mode entries (selection + hover colors) —");
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        view.update(cx, |this, cx| {
+            this.show_entries(cx);
+            this.select_at("visual-1000".into(), false);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    capture(&mut cx, handle, "worktable_dark_entries")?;
 
     println!("\nAll visual steps passed.");
     Ok(())

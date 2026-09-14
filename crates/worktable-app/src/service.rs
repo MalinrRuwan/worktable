@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -29,7 +30,6 @@ pub type EmptyResult = Result<(), String>;
 pub enum AppCommand {
     ToggleWindow,
     OpenWindow,
-    NewNote,
     CaptureText(String),
     CaptureImage { path: String, mime_type: String },
     Quit,
@@ -56,6 +56,9 @@ pub struct WorktableService {
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
     /// In-memory config fallback when the database is unavailable.
     memory_config: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Internal media library: added images are hard-linked here (falling back
+    /// to a copy) so entries keep working when the original moves away.
+    media_dir: PathBuf,
     command_tx: mpsc::UnboundedSender<AppCommand>,
     command_rx: Option<std::sync::Mutex<Option<mpsc::UnboundedReceiver<AppCommand>>>>,
 }
@@ -81,11 +84,13 @@ impl WorktableService {
         // Start AI worker so the runtime is prompt-ready in tests (best-effort).
         start_ai_worker(&tokio, &runtime);
         let runtime = Some(Arc::new(runtime));
+        let media_dir = test_media_dir(db_path);
         let service = Self {
             tokio: tokio.clone(),
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(entries)),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            media_dir,
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -109,6 +114,7 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            media_dir: resolve_media_dir(),
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -133,6 +139,72 @@ impl WorktableService {
 
     pub fn take_command_receiver(&self) -> Option<mpsc::UnboundedReceiver<AppCommand>> {
         self.command_rx.as_ref()?.lock().ok()?.take()
+    }
+
+    /// The internal media library directory (`~/.worktable/media`).
+    pub fn media_dir(&self) -> &Path {
+        &self.media_dir
+    }
+
+    /// Hard-link an image into the media library and return its stored path.
+    ///
+    /// Re-adding the same file reuses the existing entry; a cross-device or
+    /// permission-limited link falls back to a copy. Hard links cost no extra
+    /// disk space and survive the original moving away.
+    pub fn import_image(&self, source: &Path) -> anyhow::Result<PathBuf> {
+        let media_dir = self.media_dir();
+        std::fs::create_dir_all(media_dir).map_err(|error| {
+            anyhow!(
+                "failed to create media directory {}: {error}",
+                media_dir.display()
+            )
+        })?;
+
+        let canonical = source
+            .canonicalize()
+            .unwrap_or_else(|_| source.to_path_buf());
+        if canonical.starts_with(media_dir) {
+            return Ok(canonical);
+        }
+
+        let file_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("image path has no file name: {}", source.display()))?;
+        let (stem, extension) = match file_name.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() => {
+                (stem.to_owned(), Some(extension.to_owned()))
+            }
+            _ => (file_name.clone(), None),
+        };
+        let source_size = source.metadata().ok().map(|meta| meta.len());
+
+        let mut target = media_dir.join(&file_name);
+        let mut suffix = 1;
+        while target.exists() {
+            // Same name and size: assume the same photo and reuse it instead
+            // of accumulating duplicates.
+            let same_size = target
+                .metadata()
+                .ok()
+                .map(|meta| meta.len())
+                .zip(source_size)
+                .is_some_and(|(a, b)| a == b);
+            if same_size {
+                return Ok(target);
+            }
+            suffix += 1;
+            let name = match &extension {
+                Some(extension) => format!("{stem}-{suffix}.{extension}"),
+                None => format!("{stem}-{suffix}"),
+            };
+            target = media_dir.join(name);
+        }
+
+        if std::fs::hard_link(source, &target).is_err() {
+            std::fs::copy(source, &target)?;
+        }
+        Ok(target)
     }
 
     pub fn database_path(&self) -> String {
@@ -600,6 +672,28 @@ fn bootstrap_runtime(
     start_ai_worker(tokio, &runtime);
 
     (Some(Arc::new(runtime)), Some(entries))
+}
+
+/// Internal media library for the real app: `WORKTABLE_MEDIA_DIR` or
+/// `~/.worktable/media`.
+fn resolve_media_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("WORKTABLE_MEDIA_DIR")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    Path::new(&home).join(".worktable").join("media")
+}
+
+/// Hermetic media library for tests: next to the temp database, so no test
+/// ever touches the user's real `~/.worktable`.
+#[cfg(any(test, feature = "visual-tests"))]
+fn test_media_dir(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .map(|parent| parent.join("media"))
+        .unwrap_or_else(|| std::env::temp_dir().join("worktable-media"))
 }
 
 /// Resolve the local database file path: `WORKTABLE_DB_PATH` or

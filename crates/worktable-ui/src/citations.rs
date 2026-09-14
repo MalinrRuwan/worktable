@@ -17,10 +17,12 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Div, ElementId, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement, Pixels, Point, Refineable as _, Render, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div, px, rems,
+    App, AppContext as _, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement, Pixels, Point, Refineable as _, Render, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div, px, rems,
 };
+
+use crate::markdown::{Block, Inline, needs_space, parse_blocks};
 
 /// Handler invoked when a citation is activated, receiving the click position
 /// so apps can morph in-app sources (e.g. a `worktable-entry:` URL) from
@@ -98,88 +100,6 @@ fn parse_marker(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
     }
 }
 
-/// A renderable inline piece: a word, a marker chip, or a paragraph break.
-/// Splitting prose into words is what lets chips flow inside wrapped text.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Atom {
-    Word(String),
-    Marker(u32),
-    Break,
-}
-
-/// Split prose into paragraphs (blank-line separated), preserving single
-/// line breaks inside each paragraph. Each paragraph renders as its own
-/// wrapping row, so the answer keeps its shape without full markdown.
-fn blocks(text: &str) -> Vec<Vec<Atom>> {
-    let mut blocks = Vec::new();
-    for paragraph in text.split("\n\n") {
-        let mut atoms = Vec::new();
-        let mut lines = paragraph.lines().filter(|line| !line.trim().is_empty());
-        if let Some(first) = lines.next() {
-            atoms.extend(line_atoms(first));
-        }
-        for line in lines {
-            atoms.push(Atom::Break);
-            atoms.extend(line_atoms(line));
-        }
-        if !atoms.is_empty() {
-            blocks.push(atoms);
-        }
-    }
-    blocks
-}
-
-fn line_atoms(line: &str) -> Vec<Atom> {
-    let mut atoms = Vec::new();
-    for segment in parse_citations(line) {
-        match segment {
-            CitationSegment::Text(text) => {
-                atoms.extend(
-                    text.split_whitespace()
-                        .map(|word| Atom::Word(word.to_owned())),
-                );
-            }
-            CitationSegment::Marker(n) => atoms.push(Atom::Marker(n)),
-        }
-    }
-    atoms
-}
-
-/// Flatten parsed segments into inline atoms (paragraphs joined by breaks).
-#[cfg(test)]
-fn atoms(text: &str) -> Vec<Atom> {
-    let mut atoms = Vec::new();
-    for (index, block) in blocks(text).into_iter().enumerate() {
-        if index > 0 {
-            atoms.push(Atom::Break);
-        }
-        atoms.extend(block);
-    }
-    atoms
-}
-
-/// Whether a space belongs between two adjacent atoms. Spaces sit between
-/// words, never before punctuation, and never inside a marker.
-fn needs_space(previous: &Atom, next: &Atom) -> bool {
-    let Atom::Word(next_word) = next else {
-        return false;
-    };
-    let Some(first) = next_word.chars().next() else {
-        return false;
-    };
-    if !first.is_alphanumeric() {
-        return false;
-    }
-    match previous {
-        Atom::Break => false,
-        Atom::Marker(_) => true,
-        Atom::Word(previous_word) => !matches!(
-            previous_word.chars().last(),
-            None | Some('(' | '[' | '{' | '"' | '\'' | '“' | '‘' | '—' | '–')
-        ),
-    }
-}
-
 /// Theme-derived colors for the citation chips, tooltip, and footer.
 #[derive(Clone, Copy, Debug)]
 pub struct CitationColors {
@@ -211,6 +131,8 @@ pub struct InlineCitations {
     refs: Vec<CitationRef>,
     colors: CitationColors,
     radius: Pixels,
+    /// Monospace family for code spans/blocks (the caller's theme owns it).
+    mono_font: Option<SharedString>,
     open: Option<CitationOpenHandler>,
     style: StyleRefinement,
 }
@@ -234,6 +156,7 @@ impl InlineCitations {
                 border: Hsla::default(),
             },
             radius: px(4.0),
+            mono_font: None,
             open: None,
             style: StyleRefinement::default(),
         }
@@ -250,11 +173,150 @@ impl InlineCitations {
         self
     }
 
+    /// Monospace family for code spans and fenced code blocks.
+    pub fn mono_font(mut self, family: impl Into<SharedString>) -> Self {
+        self.mono_font = Some(family.into());
+        self
+    }
+
     /// Route activation through `handler` instead of opening the URL. The
     /// handler receives the citation's URL (possibly an in-app scheme).
     pub fn on_open(mut self, handler: CitationOpenHandler) -> Self {
         self.open = Some(handler);
         self
+    }
+
+    /// One wrapping row of inline atoms: a paragraph, heading, or list body.
+    fn atom_row(&self, atoms: &[Inline]) -> Div {
+        let colors = self.colors;
+        let mut row = div().flex().flex_wrap().items_center().w_full().min_w_0();
+        for (index, atom) in atoms.iter().enumerate() {
+            let space_after = atoms
+                .get(index + 1)
+                .is_some_and(|next| needs_space(atom, next));
+            let element: gpui::AnyElement = match atom {
+                Inline::Marker(n) => self
+                    .chip("cite", *n, self.reference(*n), true)
+                    .into_any_element(),
+                Inline::Text(span) => {
+                    let mut text = div().min_w_0().child(span.text.clone());
+                    if span.bold {
+                        text = text.font_weight(FontWeight::SEMIBOLD);
+                    }
+                    if span.italic {
+                        text = text.italic();
+                    }
+                    if span.code {
+                        text = text
+                            .px_1()
+                            .py_0p5()
+                            .rounded(self.radius)
+                            .bg(colors.chip_background);
+                        if let Some(mono) = self.mono_font.clone() {
+                            text = text.font_family(mono);
+                        }
+                    }
+                    match &span.link {
+                        Some(url) => {
+                            let selector = format!("{}-link-{index}", self.id);
+                            let url = url.clone();
+                            let open = self.open.clone();
+                            text.id(ElementId::Name(selector.into()))
+                                .cursor_pointer()
+                                .underline()
+                                .on_click(move |event: &ClickEvent, window, cx| {
+                                    let position = event.position();
+                                    match &open {
+                                        Some(handler) => handler(&url, position, window, cx),
+                                        None => cx.open_url(&url),
+                                    }
+                                })
+                                .into_any_element()
+                        }
+                        None => text.into_any_element(),
+                    }
+                }
+            };
+            row = if space_after {
+                row.child(div().mr_1().child(element))
+            } else {
+                row.child(element)
+            };
+        }
+        row
+    }
+
+    /// Render one markdown block (paragraph, heading, list, quote, code).
+    fn render_block(&self, block: &Block) -> gpui::AnyElement {
+        let colors = self.colors;
+        match block {
+            Block::Paragraph(atoms) => self.atom_row(atoms).into_any_element(),
+            Block::Heading { level, content } => {
+                let mut heading = div().w_full().min_w_0().font_weight(FontWeight::SEMIBOLD);
+                heading = match level {
+                    1 => heading.text_lg(),
+                    2 => heading.text_base(),
+                    _ => heading.text_sm(),
+                };
+                heading.child(self.atom_row(content)).into_any_element()
+            }
+            Block::Bullet(atoms) => div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .child(div().flex_shrink_0().text_color(colors.muted).child("•"))
+                .child(self.atom_row(atoms))
+                .into_any_element(),
+            Block::Numbered { marker, content } => div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(colors.muted)
+                        .child(marker.clone()),
+                )
+                .child(self.atom_row(content))
+                .into_any_element(),
+            Block::Quote(atoms) => div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .self_stretch()
+                        .w(px(2.0))
+                        .rounded_full()
+                        .bg(colors.border),
+                )
+                .child(self.atom_row(atoms).italic())
+                .into_any_element(),
+            Block::Code(code) => {
+                let mut block = div()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .p_2()
+                    .rounded(self.radius)
+                    .bg(colors.chip_background)
+                    .text_xs();
+                if let Some(mono) = self.mono_font.clone() {
+                    block = block.font_family(mono);
+                }
+                block.child(code.clone()).into_any_element()
+            }
+        }
     }
 
     fn reference(&self, n: u32) -> Option<CitationRef> {
@@ -556,27 +618,16 @@ impl Styled for InlineCitations {
 
 impl RenderOnce for InlineCitations {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut root = div().flex().flex_col().gap_1().w_full().min_w_0();
-        for block in blocks(&self.text) {
-            let mut prose = div().flex().flex_wrap().items_center().w_full().min_w_0();
-            for (index, atom) in block.iter().enumerate() {
-                let space_after = block
-                    .get(index + 1)
-                    .is_some_and(|next| needs_space(atom, next));
-                let element: gpui::AnyElement = match atom {
-                    Atom::Word(word) => div().min_w_0().child(word.clone()).into_any_element(),
-                    Atom::Break => div().w_full().h_0().into_any_element(),
-                    Atom::Marker(n) => self
-                        .chip("cite", *n, self.reference(*n), true)
-                        .into_any_element(),
-                };
-                prose = if space_after {
-                    prose.child(div().mr_1().child(element))
-                } else {
-                    prose.child(element)
-                };
-            }
-            root = root.child(prose);
+        let colors = self.colors;
+        let mut root = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .text_color(colors.foreground);
+        for block in parse_blocks(&self.text) {
+            root = root.child(self.render_block(&block));
         }
         if !self.refs.is_empty() {
             let mut footer = div()
@@ -691,29 +742,23 @@ mod tests {
     }
 
     #[test]
-    fn atoms_keep_punctuation_tight_around_markers() {
-        // "compute[1], though": no space between the word and the chip, no
-        // space between the chip and the comma, a space after the comma.
-        let atoms = atoms("compute[1], though");
-        assert_eq!(
-            atoms,
-            vec![
-                Atom::Word("compute".to_owned()),
-                Atom::Marker(1),
-                Atom::Word(",".to_owned()),
-                Atom::Word("though".to_owned()),
-            ]
-        );
-        assert!(!needs_space(&atoms[0], &atoms[1]), "word → chip is tight");
-        assert!(!needs_space(&atoms[1], &atoms[2]), "chip → comma is tight");
-        assert!(
-            needs_space(&atoms[2], &atoms[3]),
-            "comma → word needs a space"
-        );
-        assert!(
-            needs_space(&Atom::Marker(1), &Atom::Word("word".to_owned())),
-            "chip → word needs a space"
-        );
-        assert!(!needs_space(&Atom::Word("(".to_owned()), &atoms[3]));
+    fn markdown_answers_keep_their_markers() {
+        // The block parser drives the component's layout; markers survive
+        // headings, list items, and emphasis without becoming literal text.
+        let blocks = parse_blocks("## Findings\n\n- compute[1], though\n- **bold** point");
+        assert!(matches!(blocks[0], Block::Heading { level: 2, .. }));
+        match &blocks[1] {
+            Block::Bullet(atoms) => {
+                assert!(atoms.contains(&Inline::Marker(1)));
+            }
+            other => panic!("expected a bullet, got {other:?}"),
+        }
+        match &blocks[2] {
+            Block::Bullet(atoms) => assert!(atoms.iter().any(|atom| matches!(
+                atom,
+                Inline::Text(text) if text.text == "bold" && text.bold
+            ))),
+            other => panic!("expected a bullet, got {other:?}"),
+        }
     }
 }

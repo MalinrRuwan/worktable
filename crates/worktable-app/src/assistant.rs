@@ -11,7 +11,10 @@ use gpui_component::text::TextView;
 use gpui_component::theme::Theme;
 use gpui_component::{Icon, IconName, h_flex, v_flex};
 use worktable_ui::citations::CitationOpenHandler;
-use worktable_ui::{CitationColors, CitationRef, InlineCitations, StreamingText, ThinkingState};
+use worktable_ui::{
+    CitationColors, CitationRef, CitationSegment, InlineCitations, StreamingText, ThinkingState,
+    parse_citations,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -284,10 +287,12 @@ pub fn render_message<'a>(
             .view(view)
             .text_sm()
             .into_any_element()
-        } else if !message.citations.is_empty() {
+        } else if !message.citations.is_empty() || contains_citation_markers(&message.text) {
             // The aiCSS-style inline citations: numbered marker chips in the
             // prose with a hover preview and a source footer. Chips click
-            // through to the same handler as the footer rows.
+            // through to the same handler as the footer rows. Answers that
+            // mention `[n]` without collected sources still render through the
+            // component, so raw brackets never reach the UI.
             let colors = CitationColors {
                 // `popover` and `border` keep the chips readable on the
                 // assistant bubble (`secondary`); Ayu Light gives
@@ -305,7 +310,8 @@ pub fn render_message<'a>(
                 message.citations.clone(),
             )
             .colors(colors)
-            .radius(theme.radius_tokens().sm);
+            .radius(theme.radius_tokens().sm)
+            .mono_font(theme.mono_font_family.clone());
             let citations = if let Some(handler) = citation_open {
                 citations.on_open(handler)
             } else {
@@ -374,4 +380,12 @@ pub fn render_message<'a>(
                 .py_2()
                 .child(bubble),
         )
+}
+
+/// Whether the answer text carries any `[n]` citation markers, with or
+/// without collected sources.
+fn contains_citation_markers(text: &str) -> bool {
+    parse_citations(text)
+        .iter()
+        .any(|segment| matches!(segment, CitationSegment::Marker(_)))
 }

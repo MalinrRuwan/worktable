@@ -26,12 +26,15 @@
 //! transformations), so `menu-in`/`dialog-in` approximate their scale component
 //! with fade + translate; see the module report in ARCHITECTURE §4 follow-ups.
 
+pub mod action;
 pub mod citations;
 pub mod loading;
+mod markdown;
 pub mod streaming;
 pub mod theme;
 pub mod thinking;
 
+pub use action::{ActionTone, CircleAction};
 pub use citations::{
     CitationColors, CitationFooter, CitationRef, CitationSegment, InlineCitations, parse_citations,
 };

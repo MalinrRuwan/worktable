@@ -6,6 +6,7 @@ APP_NAME=${APP_NAME:-Worktable}
 BUNDLE_DIR=${BUNDLE_DIR:-"$ROOT_DIR/dist/$APP_NAME.app"}
 BUNDLE_ID=${BUNDLE_ID:-com.worktable.app}
 VERSION=${VERSION:-0.1.0}
+DMG_PATH=${DMG_PATH:-"$ROOT_DIR/dist/$APP_NAME-$VERSION.dmg"}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "This script packages a macOS app and must run on macOS." >&2
@@ -27,6 +28,20 @@ mkdir -p \
 cp "$ROOT_DIR/target/release/worktable-app" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 cp -R "$ROOT_DIR/themes/." "$BUNDLE_DIR/Contents/Resources/themes/"
 
+# App icon: rasterise the source PNG into the .icns the bundle advertises.
+# The artwork already sits on Apple's 824/1024 grid, so every size scales it
+# with the standard mac inset.
+ICONSET=$(mktemp -d)/AppIcon.iconset
+mkdir -p "$ICONSET"
+ICON_SRC="$ROOT_DIR/crates/worktable-app/assets/app_icon.png"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  twice=$((size * 2))
+  sips -z "$twice" "$twice" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$BUNDLE_DIR/Contents/Resources/AppIcon.icns"
+rm -rf "$(dirname "$ICONSET")"
+
 cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -36,6 +51,8 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
   <string>$APP_NAME</string>
   <key>CFBundleExecutable</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -60,5 +77,19 @@ CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
 strip -S -x "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
 
+# Drag-to-Applications disk image.
+STAGING=$(mktemp -d)
+cp -R "$BUNDLE_DIR" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+rm -f "$DMG_PATH" "$DMG_PATH.sha256"
+hdiutil create \
+  -volname "$APP_NAME $VERSION" \
+  -srcfolder "$STAGING" \
+  -ov -format UDZO \
+  "$DMG_PATH"
+rm -rf "$STAGING"
+shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
+
 echo "Created $BUNDLE_DIR"
-du -sh "$BUNDLE_DIR" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
+echo "Created $DMG_PATH"
+du -sh "$BUNDLE_DIR" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" "$DMG_PATH"

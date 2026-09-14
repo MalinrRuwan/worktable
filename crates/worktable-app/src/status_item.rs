@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 use std::{
+    cell::RefCell,
     path::PathBuf,
     ptr::NonNull,
     sync::{Arc, Mutex},
@@ -23,10 +24,47 @@ use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, s
 use objc2_app_kit::{
     NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSImage, NSImageScaling, NSMenu,
     NSMenuItem, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
-    NSStatusBar,
+    NSStatusBar, NSStatusItem,
 };
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
 use objc2_foundation::{NSData, NSSize, NSString};
+
+/// The brand glyph as a menu-bar template (alpha only, so macOS tints it for
+/// light/dark menu bars).
+const MENU_ICON: &[u8] = include_bytes!("../assets/menu_icon.png");
+/// The "lit" glyph shown briefly after a triple-Shift capture.
+const MENU_ICON_LIT: &[u8] = include_bytes!("../assets/menu_icon_lit.png");
+/// The app icon shown in the Dock and the About panel.
+const APP_ICON: &[u8] = include_bytes!("../assets/app_icon.png");
+
+/// Menu-bar glyph size in points (the SVG is 861×692).
+const MENU_ICON_SIZE: NSSize = NSSize {
+    width: 18.0,
+    height: 14.5,
+};
+
+thread_local! {
+    /// The live status item, so capture feedback can swap its image.
+    static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
+}
+
+/// Whether the process is trusted for Accessibility (global capture and
+/// synthesized copy events need it). Reads the same system flag that gates the
+/// event tap below.
+pub(crate) fn accessibility_trusted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    unsafe { AXIsProcessTrusted() }
+}
+
+/// Open System Settings → Privacy & Security → Accessibility.
+pub(crate) fn open_accessibility_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn();
+}
 
 /// Show the standard macOS About panel (App menu → About Worktable).
 pub(crate) fn show_about_panel() {
@@ -78,8 +116,7 @@ define_class!(
             let command = match result {
                 0 => AppCommand::OpenWindow,
                 1 => AppCommand::ToggleWindow,
-                2 => AppCommand::NewNote,
-                3 => AppCommand::Quit,
+                2 => AppCommand::Quit,
                 _ => return,
             };
             self.ivars().sender.send(command);
@@ -123,9 +160,9 @@ pub fn install(sender: CommandSender) -> bool {
     item.setMenu(Some(&menu));
     item.setVisible(true);
 
-    // Keep the native item alive for the lifetime of the process. The status
-    // bar normally retains it too, but explicitly retaining it avoids the
-    // icon disappearing when the local handle is released.
+    // Keep the native item alive for the lifetime of the process (the status
+    // bar normally retains it too) and make it reachable for capture feedback.
+    STATUS_ITEM.with(|slot| *slot.borrow_mut() = Some(item.clone()));
     std::mem::forget(item);
     install_shift_capture_monitor(sender);
 
@@ -357,18 +394,6 @@ fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> 
         show.setTitle(&NSString::from_str("Show / Hide Worktable"));
         menu.addItem(&show);
 
-        let note = NSMenuItem::new(mtm);
-        note.setTitle(&NSString::from_str("New Note"));
-        note.setKeyEquivalent(&NSString::from_str("n"));
-        note.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
-        menu.addItem(&note);
-
-        let link = NSMenuItem::new(mtm);
-        link.setTitle(&NSString::from_str("New Link"));
-        link.setKeyEquivalent(&NSString::from_str("l"));
-        link.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
-        menu.addItem(&link);
-
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let quit = NSMenuItem::new(mtm);
@@ -379,7 +404,7 @@ fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> 
 
         // Tag each actionable item and point them at the target object.
         let target = MenuTarget::new(sender);
-        let items = [&open, &show, &note, &quit];
+        let items = [&open, &show, &quit];
         for (index, ns_item) in items.iter().enumerate() {
             ns_item.setTag(index as isize);
             ns_item.setTarget(Some(&*target));
@@ -392,17 +417,114 @@ fn build_menu(sender: CommandSender, mtm: MainThreadMarker) -> Retained<NSMenu> 
     menu
 }
 
-/// Build a monochrome (template) image from a named SF Symbol so it adapts to
-/// the menu-bar appearance.
-fn make_template_image() -> Option<Retained<NSImage>> {
-    // AppKit symbol lookup is main-thread-only; treat a missing marker as
-    // "no image" and fall back to the text title.
-    let _mtm = MainThreadMarker::new()?;
-    let symbol = NSString::from_str("square.grid.2x2");
-    let description = NSString::from_str("Worktable");
-    let image: Retained<NSImage> =
-        NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, Some(&description))?;
-    image.setTemplate(true);
-    image.setSize(NSSize::new(18.0, 18.0));
+/// Decode an embedded PNG into an `NSImage` of the given point size.
+fn embedded_image(bytes: &'static [u8], template: bool) -> Option<Retained<NSImage>> {
+    let data = NSData::with_bytes(bytes);
+    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
+    image.setTemplate(template);
+    image.setSize(MENU_ICON_SIZE);
     Some(image)
+}
+
+/// The monochrome template glyph: macOS tints it for the menu-bar appearance.
+fn make_template_image() -> Option<Retained<NSImage>> {
+    embedded_image(MENU_ICON, true)
+}
+
+/// The lit glyph (warm, with a halo) shown as capture feedback.
+fn make_lit_image() -> Option<Retained<NSImage>> {
+    embedded_image(MENU_ICON_LIT, false)
+}
+
+/// Show or hide the app's Dock presence. Closing the window in background
+/// mode switches to `Accessory` (menu bar only); opening the window restores
+/// `Regular`.
+pub(crate) fn set_dock_visible(visible: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = if visible {
+        objc2_app_kit::NSApplicationActivationPolicy::Regular
+    } else {
+        objc2_app_kit::NSApplicationActivationPolicy::Accessory
+    };
+    if !app.setActivationPolicy(policy) {
+        eprintln!("Worktable: failed to switch the activation policy (visible: {visible})");
+    }
+}
+
+/// Bring the app back from background mode: unhide first, activate, then
+/// restore the `Regular` policy. AppKit defers the Dock tile when the policy
+/// changes while the app is hidden, so the order matters — doing this before
+/// `activate` leaves the icon missing.
+// `NSApplication.activate()` is macOS 14+; the bundle targets 13.0, so keep
+// the availability-safe call (the same one GPUI itself makes).
+#[allow(deprecated)]
+pub(crate) fn restore_dock_and_unhide() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.unhide(None);
+    app.activateIgnoringOtherApps(true);
+    let _ = app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Regular);
+}
+
+/// Set the application icon (Dock, app switcher, About panel).
+pub(crate) fn set_app_icon() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(image) = embedded_image(APP_ICON, false) else {
+        return;
+    };
+    // 512pt is the customary app-icon point size; AppKit scales it for the
+    // Dock, app switcher, and About panel.
+    image.setSize(NSSize::new(512.0, 512.0));
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
+/// Swap the menu-bar image to the lit glyph (or back). Main thread only.
+fn set_status_image(lit: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_ITEM.with(|slot| {
+        let Ok(item) = slot.try_borrow() else {
+            return;
+        };
+        let Some(item) = item.as_ref() else {
+            return;
+        };
+        let Some(button) = item.button(mtm) else {
+            return;
+        };
+        let image = if lit {
+            make_lit_image()
+        } else {
+            make_template_image()
+        };
+        if let Some(image) = image {
+            button.setImage(Some(&image));
+        }
+    });
+}
+
+/// Feedback for a captured selection: blink the menu-bar glyph twice so the
+/// user sees the lap light up. Runs on the GPUI main thread; the timers keep
+/// frames/events flowing without touching AppKit from another thread.
+pub(crate) fn flash_capture_feedback(cx: &mut gpui::App) {
+    const ON: Duration = Duration::from_millis(130);
+    const OFF: Duration = Duration::from_millis(130);
+    cx.spawn(async move |cx| {
+        for _ in 0..2 {
+            set_status_image(true);
+            cx.background_executor().timer(ON).await;
+            set_status_image(false);
+            cx.background_executor().timer(OFF).await;
+        }
+    })
+    .detach();
 }

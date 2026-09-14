@@ -16,8 +16,13 @@ and keyboard-first.
 The three product surfaces:
 
 1. **Library** — Entries and Agent; the primary screen.
-2. **Settings** — a line-separated category list (Appearance, Data,
-   Providers); each category opens its own page.
+2. **Settings** — a line-separated category list (General, Appearance, Data,
+   Providers); each category opens its own page. General owns the
+   "Keep running in the menu bar" toggle: on (default), the close button
+   hides the window, drops the app from the Dock (`Accessory` activation
+   policy), and leaves the menu bar icon and capture shortcut running; the
+   menu bar's Open Window restores the Dock and the window. Off, closing the
+   window quits the app.
 3. **Settings sub-pages** — GitHub stars, entered from Settings and returning
    to it. Provider authentication opens as a modal dialog over Settings instead
    of replacing the page.
@@ -39,6 +44,13 @@ to Settings. Every destination is also reachable by keyboard (`⌘1` Entries,
 field, **Enter** runs the query as a prompt; **Tab**/⇧**Tab** move focus
 through the header controls, the cards, and the note bar. The native macOS menu
 bar mirrors those keybindings (Settings is the app menu's ⌘, item).
+
+On first launch a **three-step tour** covers the app: welcome with the keymap
+rendered as Kbd keycaps, the Accessibility permission step (skippable, with a
+status line and a System Settings deep link), and a provider step that can be
+skipped. The step badge sits above the title; Back/Skip/Continue wrap in the
+footer so a narrow window never clips the primary action, and every exit
+persists completion. Settings → Appearance → Replay brings it back.
 
 Long entries open in a **morphing detail overlay**: the panel's rect tweens
 between the entry card's real prepainted rect and the middle of the UI
@@ -63,8 +75,10 @@ other app that fades in. The note bar is always the input itself
 | --- | --- |
 | Colors, radii, typography, shadows | `gpui_component::Theme` (`cx.theme()`, `theme.radius_tokens()`) |
 | Responsive reading column | `design::content_column_width` (45–62rem, 72% of the viewport) |
+| Entry card heights | `design::ENTRY_CARD_MIN_HEIGHT` (6.75rem) … `ENTRY_CARD_MAX_HEIGHT` (10.5rem), computed per entry |
 | Measured geometry (row metrics, reading column, titlebar inset) | [`crates/worktable-app/src/design.rs`](crates/worktable-app/src/design.rs) |
 | Motion (specs, curves, loaders, hover fades) | [`crates/worktable-ui`](crates/worktable-ui) |
+| Brand glyph + app icon | `crates/worktable-app/assets` (SVG source, menu template/lit PNGs, app icon/logo) |
 | Agent UI components (orbs, streaming text, citations) | [`worktable-ui`](crates/worktable-ui/src): `loading`, `streaming`, `citations` — ports of the MIT-licensed [aiCSS](https://www.aicss.dev) components, color- and size-parameterized by the caller |
 
 Application code does not define raw colors or one-off pixel geometry. Spacing,
@@ -148,6 +162,8 @@ Do not add a shadow to every card to make it "pop"; use spacing and grouping.
 | Component | Where | Rules |
 | --- | --- | --- |
 | `Button` | Header, composer, providers, GitHub stars, entry detail | Default for ordinary commands; `primary` only for the commit of the current decision (Save, Send, Import, API-key save); `ghost` for quiet row/toolbar actions; `danger` reserved for destructive commits. Never a primary just because it is the only action. |
+| `CircleAction` (`worktable_ui::action`) | Note bar plus/tick, agent send/stop/build, page toggle, detail/viewer close | One circular button component: ghost/secondary/primary tone, icon or child content, tooltip, optional 40px header size. Never re-derive `.rounded_full()` chains at call sites. |
+| `Kbd` (`gpui_component::kbd`) | Onboarding shortcut rows | Keycaps read the live keymap (`Kbd::binding_for_action`) and are restyled to the app's chip treatment: `radius_tokens().sm`, `muted` surface, `foreground` text. |
 | `ButtonGroup` | Entries\|Agent, sort mode, settings tabs | Single-select segments. The selected segment is persistent, not hover-only. |
 | `Input` / `InputState` | Search, composer, assistant prompt, API key, login prompt, GitHub username | Placeholder or adjacent label always present. Disabled while a required setup step is missing. |
 | `ButtonGroup` (three icons) | Settings → Appearance theme mode | Light / dark / system; system follows the platform appearance. Icon-only segments carry tooltips. |
@@ -163,7 +179,7 @@ Do not add a shadow to every card to make it "pop"; use spacing and grouping.
 | `StreamingText` (`worktable_ui::streaming`) | Live assistant answers | Typewriter reveal with a steady caret while streaming; the finished answer swaps to markdown. |
 | Entry detail overlay | Long entries | Morphs from the card's real rect; body text is inset like the header; footer chips are Copy + detected Link/Email/Call, with *Edit* at the right end switching to a markdown `Textarea` code view (Save/Cancel). |
 | Boundary fades | Entries list | Top/bottom gradients soften the scroll cut; they hide when the list is at that edge. |
-| `InlineCitations` (`worktable_ui::citations`) | Cited assistant answers | aiCSS port: word-level `[n]` marker chips in the prose plus numbered source rows. The chip's hover preview carries the source label, a content snippet (delivered with `KnowledgeCitation`), and the host. Clicking a chip or row routes through the app's citation handler: tool citations always open the morphing entry view (the entry's own Link chip opens the external URL). Paragraph breaks are preserved as wrapping blocks. |
+| `InlineCitations` (`worktable_ui::citations`) | Cited assistant answers | aiCSS port: word-level `[n]` marker chips in prose that keeps its markdown structure (headings, lists, quotes, fenced code, bold/italic/code/links) via the `worktable-ui` block parser, plus numbered source rows. The chip's hover preview carries the source label, a content snippet (delivered with `KnowledgeCitation`), and the host. Clicking a chip or row routes through the app's citation handler: tool citations always open the morphing entry view (the entry's own Link chip opens the external URL). Paragraph breaks are preserved as wrapping blocks. |
 | `CitationFooter` (`worktable_ui::citations`) | Not used by the app | The standalone footer remains for callers that render their own prose; cited answers use `InlineCitations`. |
 | `Icon` | Throughout | Supplements a label; state-bearing icons are filled or colored only for their meaning. |
 
@@ -206,7 +222,7 @@ Sentence case, calm, concrete. Buttons name the result (`Save`, `Fetch stars`,
 Ellipses are the single character `…` and only on commands that need more
 input. Errors state what happened and how to recover ("GitHub API rate limit
 reached. Set GITHUB_TOKEN to raise it."). Empty states point at the next action
-("No entries yet — press ⌘N to create one."). One term per object everywhere:
+("No entries yet — add a note with the bar below."). One term per object everywhere:
 entry, provider, model, assistant, library, knowledge. Never surface engine
 names in UI copy: the graph is always "knowledge" (`Build knowledge`,
 `Knowledge is up to date`), never the storage engine behind it.

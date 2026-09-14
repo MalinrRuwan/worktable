@@ -22,6 +22,21 @@ revision in `Cargo.toml`; check the actual source/API docs before using a method
 from memory, and never translate an example from another UI framework by
 analogy.
 
+Brand assets live in `crates/worktable-app/assets`: `worktable.svg` is the
+source glyph, `menu_icon.png` is the menu-bar template (alpha only, tinted by
+macOS), and `menu_icon_lit.png` is the same lamp rendered lit — warm amber
+strokes, a soft halo, and a brighter bulb at the lamp head — used for the
+double blink after a capture,
+`app_icon.png` is the light badge (cream squircle, dark glyph) laid out on
+Apple's icon grid — the 824×824 artwork centered in a 1024×1024 canvas with
+the standard corner radius — for the Dock, About panel, and the `.icns` the
+packaging script builds; `logo.png` is the same badge full-bleed for the
+in-app splash and onboarding. `assets.rs` layers the logo over the component asset
+source; `status_item` owns the AppKit images and blinks the menu-bar glyph
+twice when a triple-Shift capture is delivered. The Entries|Agent toggle's
+sparkle is Lucide's `sparkles` SVG (`worktable-sparkles.svg`) served the same
+way, tinted through `text_color` (`currentColor`).
+
 The `karpathy-guidelines` agent skill is installed globally. Apply it while
 working here: think before coding, surface assumptions, make surgical changes,
 prefer the simplest code that solves the problem, and loop until a verifiable
@@ -88,15 +103,21 @@ composes features; it does not absorb their logic.
 
 ## Navigation
 
-The Library header owns the shell: the search field, the circular icon-only
-Entries ⇄ Agent toggle, and the library menu. There is no separate Ask agent
+The Library header owns the shell: a leading search slot, the circular
+icon-only Entries ⇄ Agent toggle, and the library menu. The slot **morphs**
+with the page transition: the full search field on Entries, a circular search
+button on Agent (where filtering the list means nothing). Clicking the circle
+switches back to Entries and focuses the field; ⌘F from any page lands on the
+Entries search the same way. The morph's width tween rides `PAGE_SLIDE`, so
+header and pages move together. There is no separate Ask agent
 button — the search field doubles as the prompt box: Enter sends the query to
 the agent (switching pages). The menu carries Settings, the sort modes (the
 checked item shows the active mode and direction; choosing it again flips
 direction), and Quit. A native macOS menu bar mirrors the keymap: the app menu
-(About, Settings ⌘,, Services, Hide/Hide Others/Show All, Quit), File
-(New Note), Edit (standard text actions), View (Entries, Assistant, Toggle
-Theme), and Window (Minimize, Zoom).
+(About, Settings ⌘,, Services, Hide/Hide Others/Show All, Quit), Edit
+(standard text actions), View (Entries, Assistant, Toggle Theme), and Window
+(Minimize, Zoom). There is no New Note command anywhere — the note bar is the
+only way to add a note, so no menu item or shortcut implies otherwise.
 
 List keyboard commands are **mode-scoped**: `open_selected`, `delete_selected`,
 copy/link commands, and arrow navigation only act on the Library page with no
@@ -113,11 +134,20 @@ and the middle of the UI over `MORPH_OPEN`/`MORPH_CLOSE`, with the content
 laid out at its target size and revealed by the growing panel; closing shrinks
 back into the same card. Triggers: double click, force click
 (`MousePressureEvent`), the card context menu's *View entry*, and Enter/Open.
-Escape, the backdrop, or Close dismiss it.
+Escape, the backdrop, or Close dismiss it. A title renders as selectable text
+(`TextView`) in a fixed one-line box, so it can be highlighted and copied like
+the body; the footer's Copy carries `title\ncontent` when a title exists.
 
 Agent answers that cite the knowledge base render through
-`worktable_ui::InlineCitations`: aiCSS-style `[n]` marker chips in the prose
-plus a sources footer. Hovering a chip shows the source preview (label,
+`worktable_ui::InlineCitations`, which now combines markdown structure with the
+aiCSS-style chips: its own block parser (`worktable-ui/src/markdown.rs`) renders
+headings, paragraphs, bullet/numbered lists, blockquotes, and fenced code, plus
+inline bold/italic/code/links, while `[n]` markers stay interactive chips with
+the sources footer. The `search_knowledge` tool's citations are emitted
+when the stream ends, *after* the answer deltas, so they are attached to the
+already-streaming message (and any leftover pending set lands on the last
+answer at run end); answers that mention `[n]` without collected sources still
+render through the component, so raw brackets never reach the UI. Hovering a chip shows the source preview (label,
 content snippet, host). Every tool citation is a library entry, so clicking a
 chip or footer row opens the same morphing entry view (from the card when the
 Library is mounted, else from the click point); the entry view's own Link chip
@@ -128,18 +158,87 @@ overflow.
 
 Tab moves focus between controls (GPUI Component `Root::on_action_tab` →
 `window.focus_next`); the search field no longer intercepts Tab. Up/Down move
-the entry selection, Enter opens the selected entry on the Library page.
+the entry selection and are bound globally, while the view takes keyboard
+focus at launch (and after overlays close / on card click) so navigation works
+before anything is focused; the handlers still yield to a focused text field.
+Enter opens the selected entry on the Library page.
+
+Entry cards have **dynamic heights within design bounds**
+(`ENTRY_CARD_MIN_HEIGHT`/`ENTRY_CARD_MAX_HEIGHT`): `entry_card_metrics`
+estimates the preview's wrapped line count from the available text width and
+the theme's 1.5rem line height, and the virtual list gets the per-row size
+before layout. Each card is two explicit blocks — a header row and a body
+(preview or image row) — top-aligned inside its row. The title shares the
+header row with the timestamp and topic chip (title left, metadata right), so
+titled and untitled cards keep the same structure; short notes read as a
+compact block and long ones stop at the maximum with the preview clamped.
+Cards must survive every content shape.
+`content_is_image` only accepts a local file that exists or an http(s) URL
+whose path carries an image extension — plain link entries render as text, not
+as broken thumbnails; broken decodes fall back to a gallery glyph. The meta
+row keeps the timestamp from shrinking and clamps the topic chip to one line,
+and the card itself clips overflow, so long URLs, titles, AI topics, and wide
+glyphs cannot push content into neighbouring rows.
+
+A force touch on a card outside an open detail panel must not restart the
+modal: `open_entry_modal` refuses to open while one is showing, the card's
+pressure handler checks the same guard, and the overlay's backdrop swallows
+pressure events so they never reach the list behind it.
+
+Right-clicking a selected card keeps the multi-selection; the context menu
+then labels its actions with the count (`Copy 3 entries`, `Delete 3 entries`)
+and `delete_context_target` removes the whole selection. Right-clicking an
+unselected card collapses the selection to that entry first. Commands are
+tested through `delete_context_target` because in-process menus cannot be
+opened at the pinned GPUI revision.
+
+A new entry enters from the top with the list's push-down entrance: the
+existing rows start one card higher (their pre-insert places) and glide down
+over `RESIZE` while the newcomer fades in over `FADE_IN` — both on the shared
+`EASE_TRANSITIONS` curve (`cubic-bezier(0.22,1,0.36,1)`). `mark_entry_inserted`
+arms the window; render reads it through `list_insert_at`/`recent_entry_id`.
 
 The note bar under the list is always the input itself — no first click opens
 a composer. It is `[＋ note input ✓]`: the plus opens the system image picker
-(`App::prompt_for_paths`) and the tick (or Enter/⌘⏎) adds the note. ⌘N focuses
-the input. Entry content has **no category attribute**: the legacy `kind`
+(`App::prompt_for_paths`) and the tick (or Enter/⌘⏎) adds the note. Entry content has **no category attribute**: the legacy `kind`
 column is dropped on migration, and images are recognized by content
-(`content_is_image`/`image_source_for`). Image entries show a thumbnail in the
+(`content_is_image`/`image_source_for`). Every added image is **hard-linked
+into the internal media library** (`WorktableService::import_image` →
+`~/.worktable/media`, falling back to a copy across devices) and the entry
+stores that path, so notes survive the original file moving away; re-adding
+the same file reuses the existing link. Image entries show a thumbnail in the
 card; the detail shows the image itself, with a hover download button
 (`prompt_for_new_path` → copy/fetch) and double click opening a borderless
 fullscreen `WindowKind::PopUp` viewer above every other app that fades in with
 `MODAL_OPEN` and closes on click or ⎋.
+
+Themes: `init_theme` applies **both** variants from the watched theme file —
+`apply_config` only stores the config matching its own mode, so loading just
+the light config left dark mode on gpui-component's default palette (whose
+list selection is blue). The Ayu dark variant is warmed to the app's palette
+(tan primary, warm `list.active`/`list.hover`, warm ring), so selection, hover,
+the check circle, and primary buttons read the same in both modes.
+
+Settings opens on a line-separated category list (General, Appearance, Data,
+Providers). General's "Keep running in the menu bar" toggle is on by default:
+the window close handler reads the process-wide mirror
+(`preferences::background_on_close`) synchronously, hides the window, and
+switches the app to the `Accessory` activation policy so it leaves the Dock
+while the menu bar item and capture shortcut keep running. The status menu's
+*Open Window* restores the app with `restore_dock_and_unhide`:
+unhide → activate → `Regular`, in that order — AppKit defers the Dock tile
+when the policy changes while the app is hidden, so restoring before unhiding
+leaves the icon missing. Turning the toggle off makes the close button quit
+the app.
+
+The first launch opens a **three-step tour** (`OnboardingState`): welcome with
+the keymap rendered as `gpui_component::kbd::Kbd` keycaps styled as our chips
+(keystrokes come from the live keymap via `Kbd::binding_for_action`), the
+macOS Accessibility permission for global capture (`AXIsProcessTrusted`,
+"Open System Settings", "Check again"), and a skippable provider step that
+deep-links to Settings → Providers. Every step can be skipped; completing it
+stores `onboarding_completed=1` in config, and Settings → Appearance has a
+*Replay* control. List key commands stay disabled while the tour is open.
 
 User message bubbles shrink to their text with an 85% max width; assistant
 bubbles keep a definite 85% measure because their selectable rich text needs a
@@ -216,8 +315,14 @@ they do:
   builds. Defaults to 1.5rem; the G2 globe fills its stage with the same dot
   weight as S1 so it reads at button sizes;
 - `streaming::StreamingText` — typewriter reveal with a caret for live answers;
-- `citations::InlineCitations` — `[n]` chips with hover previews and a
-  source footer for answers with references.
+- `citations::InlineCitations` — markdown structure plus `[n]` chips with
+  hover previews and a source footer for answers with references. It cannot use
+  `TextView`'s markdown renderer because the chips must flow inline, hence the
+  small block parser in `worktable-ui/src/markdown.rs`;
+- `action::CircleAction` — the circular action button (ghost/secondary/primary,
+  icon or child, tooltip, optional 40px header size) shared by the note bar's
+  plus/tick, the agent's send/stop/build controls, the page toggle, and the
+  detail/viewer close buttons.
 
 They are ports of the MIT-licensed [aiCSS](https://www.aicss.dev) components
 and stay theme-agnostic: callers pass colors from `cx.theme()` and rems, and
@@ -396,6 +501,19 @@ Debug-only first-run notes: themes are watched from `themes/` (override with
 (`WORKTABLE_DB_PATH` overrides it), and captures land in `~/.worktable/images`.
 Failures in optional services (menu-bar item, theme watcher, Helix) log and
 degrade gracefully; they must never panic or block the window.
+
+## Releases
+
+`scripts/package-macos.sh` builds the release bundle and its installer:
+
+```sh
+VERSION=0.1.0 sh scripts/package-macos.sh
+```
+
+It runs `cargo build --release -p worktable-app`, assembles
+`dist/Worktable.app` (binary + themes + `AppIcon.icns` from the Apple-grid
+asset), ad-hoc signs it, and writes a drag-to-Applications
+`dist/Worktable-<version>.dmg` plus a `.sha256`. `dist/` stays git-ignored.
 
 ## Commit hygiene
 

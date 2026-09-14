@@ -5,11 +5,13 @@
 //! commands to the main view.
 
 pub(crate) mod actions;
+pub(crate) mod assets;
 pub(crate) mod assistant;
 pub(crate) mod design;
 mod entry_actions;
 pub(crate) mod format;
 pub(crate) mod github;
+pub(crate) mod preferences;
 pub(crate) mod service;
 pub(crate) mod status_item;
 pub(crate) mod worktable_view;
@@ -24,8 +26,8 @@ use std::{
 
 use anyhow::Context as _;
 use gpui::{
-    App, AppContext as _, Application, AsyncApp, Bounds, Context, KeyBinding, Menu, MenuItem,
-    OsAction, SharedString, SystemMenuType, WindowBounds, WindowOptions, px, size,
+    App, AppContext as _, Application, AsyncApp, Bounds, KeyBinding, Menu, MenuItem, OsAction,
+    SharedString, SystemMenuType, WindowBounds, WindowOptions, px, size,
 };
 use gpui_component::{Root, Theme, ThemeRegistry};
 use tokio::runtime::Runtime;
@@ -45,13 +47,16 @@ fn main() -> anyhow::Result<()> {
     let service_for_reopen = service.clone();
     let visible_for_reopen = visible.clone();
     let application = Application::with_platform(gpui_platform::current_platform(false))
-        .with_assets(gpui_component_assets::Assets);
+        .with_assets(assets::AppAssets);
     application.on_reopen(move |cx| {
         open_window(cx, &visible_for_reopen, &service_for_reopen);
     });
 
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // The brand icon for the Dock, app switcher, and About panel.
+        #[cfg(target_os = "macos")]
+        status_item::set_app_icon();
         init_theme(cx);
         // The Tahoe radii must be applied once at startup too — the theme
         // watcher callback only fires when the theme files change on disk.
@@ -146,14 +151,25 @@ fn init_theme(cx: &mut App) {
     let theme_name = SharedString::from("Ayu Light");
     let themes_dir = resolve_themes_dir();
     if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, move |cx| {
-        if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
-            let mode = Theme::global(cx).mode;
-            Theme::global_mut(cx).apply_config(&theme);
-            // `apply_config` updates the component theme. Calling `change`
-            // also refreshes GPUI Base's semantic tokens and scrollbars.
-            Theme::change(mode, None, cx);
-            apply_tahoe_radius(cx);
+        // Apply both variants of the watched theme: `apply_config` only stores
+        // the config matching its own mode, so loading the light theme alone
+        // leaves dark mode on the default (blue) dark palette.
+        let light = ThemeRegistry::global(cx).themes().get(&theme_name).cloned();
+        let dark = ThemeRegistry::global(cx)
+            .themes()
+            .get(&SharedString::from("Ayu Dark"))
+            .cloned();
+        if let Some(light) = light {
+            Theme::global_mut(cx).apply_config(&light);
         }
+        if let Some(dark) = dark {
+            Theme::global_mut(cx).apply_config(&dark);
+        }
+        let mode = Theme::global(cx).mode;
+        // `apply_config` updates the component theme. Calling `change` also
+        // refreshes GPUI Base's semantic tokens and scrollbars.
+        Theme::change(mode, None, cx);
+        apply_tahoe_radius(cx);
     }) {
         eprintln!("Worktable: failed to watch themes directory: {error}");
     }
@@ -197,7 +213,6 @@ fn resolve_themes_dir() -> PathBuf {
 fn bindings() -> Vec<KeyBinding> {
     use crate::actions::*;
     vec![
-        KeyBinding::new("cmd-n", NewNote, None),
         KeyBinding::new("cmd-f", FocusSearch, None),
         KeyBinding::new("cmd-1", ShowEntries, None),
         KeyBinding::new("cmd-2", ShowAssistant, None),
@@ -206,8 +221,10 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("backspace", DeleteEntry, Some("worktable-list")),
         KeyBinding::new("enter", OpenEntry, Some("worktable-list")),
-        KeyBinding::new("up", SelectPrevious, Some("worktable-list")),
-        KeyBinding::new("down", SelectNext, Some("worktable-list")),
+        // Arrows are global so the list moves without first focusing it; the
+        // handlers still yield while a text field owns the keyboard.
+        KeyBinding::new("up", SelectPrevious, None),
+        KeyBinding::new("down", SelectNext, None),
         KeyBinding::new("cmd-c", CopyEntry, Some("worktable-list")),
         KeyBinding::new("cmd-shift-c", CopyLink, Some("worktable-list")),
         KeyBinding::new("escape", CancelComposer, None),
@@ -241,7 +258,6 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Quit Worktable", Quit),
         ]),
-        Menu::new("File").items(vec![MenuItem::action("New Note", NewNote)]),
         Menu::new("Edit").items(vec![
             MenuItem::os_action("Undo", InputUndo, OsAction::Undo),
             MenuItem::os_action("Redo", InputRedo, OsAction::Redo),
@@ -274,16 +290,18 @@ fn handle_command(
     match command {
         AppCommand::ToggleWindow => toggle_window(cx, visible, service),
         AppCommand::OpenWindow => open_window(cx, visible, service),
-        AppCommand::NewNote => {
-            let _ = dispatch_main_view(cx, |this, window, cx| this.focus_composer(window, cx));
-            cx.activate(true);
-        }
         AppCommand::CaptureText(text) => {
+            // Blink the menu-bar glyph twice so the triple-Shift capture is
+            // visibly acknowledged.
+            #[cfg(target_os = "macos")]
+            status_item::flash_capture_feedback(cx);
             if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
                 view.update(cx, |this, cx| this.add_captured_text(text, cx));
             }
         }
         AppCommand::CaptureImage { path, mime_type } => {
+            #[cfg(target_os = "macos")]
+            status_item::flash_capture_feedback(cx);
             if let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) {
                 view.update(cx, |this, cx| this.add_captured_image(path, mime_type, cx));
             }
@@ -303,12 +321,19 @@ fn toggle_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<Worktabl
     if currently_visible {
         cx.hide();
     } else {
+        // Showing from the status menu also comes back to the Dock.
+        #[cfg(target_os = "macos")]
+        status_item::restore_dock_and_unhide();
         visible.store(true, Ordering::SeqCst);
         cx.activate(true);
     }
 }
 
 fn open_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableService>) {
+    // Reopening from the menu bar restores the Dock presence before the
+    // window comes forward (unhide → activate → Regular policy).
+    #[cfg(target_os = "macos")]
+    status_item::restore_dock_and_unhide();
     if cx.windows().is_empty()
         && let Err(error) = open_main_window(cx, service.clone(), visible.clone())
     {
@@ -348,10 +373,19 @@ fn open_main_window(
             let visible_for_close = visible.clone();
             window.on_window_should_close(cx, move |_window, cx| {
                 visible_for_close.store(false, Ordering::SeqCst);
-                // Keep the process, menu-bar item, and global capture monitor
-                // alive. Dock activation or Open Window can show it again.
-                cx.hide();
-                false
+                if preferences::background_on_close() {
+                    // Keep the process, menu-bar item, and global capture
+                    // monitor alive, and step out of the Dock: Worktable
+                    // becomes a menu-bar app until the window is reopened.
+                    #[cfg(target_os = "macos")]
+                    status_item::set_dock_visible(false);
+                    cx.hide();
+                    false
+                } else {
+                    // The preference is off: closing the window quits.
+                    cx.quit();
+                    false
+                }
             });
 
             let view = cx.new(|cx| WorktableView::new(service.clone(), window, cx));
@@ -360,19 +394,4 @@ fn open_main_window(
         },
     )?;
     Ok(())
-}
-
-/// Run a closure against the main `WorktableView` (if the window exists).
-fn dispatch_main_view<R>(
-    cx: &mut App,
-    f: impl FnOnce(&mut WorktableView, &mut gpui::Window, &mut Context<WorktableView>) -> R,
-) -> Option<R> {
-    let view = cx.try_global::<MainView>()?.0.clone();
-    let window = cx.active_window()?;
-    let window = window.downcast::<Root>()?;
-    window
-        .update(cx, |_root, window, cx| {
-            view.update(cx, |this, cx| f(this, window, cx))
-        })
-        .ok()
 }
