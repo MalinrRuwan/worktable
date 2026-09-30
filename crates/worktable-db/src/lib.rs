@@ -91,8 +91,18 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     "#,
-    r#"
-    CREATE TABLE wt_chats (
+];
+
+/// Chat storage: the picker's transcripts and the model context behind them.
+///
+/// Created from `migrate` on every launch rather than from [`MIGRATIONS`],
+/// because a database can already carry a higher migration number than this
+/// array has entries (an experiment that was later removed leaves its version
+/// recorded). A versioned entry would then be skipped and leave the tables
+/// missing, which surfaces as "no such table: wt_ai_history" at the first
+/// prompt. `IF NOT EXISTS` makes the repair idempotent.
+const CHAT_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS wt_chats (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         messages_json TEXT NOT NULL,
@@ -100,12 +110,14 @@ const MIGRATIONS: &[&str] = &[
         revision INTEGER NOT NULL
     );
 
-    CREATE TABLE wt_ai_history (
+    CREATE INDEX IF NOT EXISTS wt_chats_updated_at_idx
+        ON wt_chats (updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wt_ai_history (
         session_id TEXT PRIMARY KEY,
         messages_json TEXT NOT NULL
     );
-    "#,
-];
+"#;
 
 /// Metadata for the chat picker; transcripts are loaded only on selection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,6 +351,12 @@ impl SqliteStore {
                 .execute("ALTER TABLE wt_entries DROP COLUMN kind", [])
                 .context("failed to drop the legacy entry kind column")?;
         }
+
+        // Chat storage is repaired on every launch, not versioned — see
+        // [`CHAT_SCHEMA`].
+        connection
+            .execute_batch(CHAT_SCHEMA)
+            .context("failed to ensure the chat schema")?;
 
         Ok(())
     }
@@ -1384,32 +1402,51 @@ mod tests {
         assert!(store.load_chat("c").unwrap().is_none());
     }
 
+    /// A database whose migration counter is already ahead of [`MIGRATIONS`]
+    /// (an experiment that was later removed leaves its version recorded) must
+    /// still get the chat tables. Pinning them to a version would skip them
+    /// here and fail the first prompt with "no such table: wt_ai_history".
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn chat_migration_preserves_existing_data_and_is_repeatable() {
+    fn chat_schema_is_repaired_on_a_database_whose_migration_counter_is_ahead() {
         let store = SqliteStore::connect(":memory:").unwrap();
         {
             let connection = store.connection.lock().unwrap();
-            for (ix, migration) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+            for (ix, migration) in MIGRATIONS.iter().enumerate() {
                 connection.execute_batch(migration).unwrap();
-                connection.execute(
-                    "INSERT INTO wt_schema_migrations (version, applied_at) VALUES (?, 'before chats')",
-                    [ix as i64 + 1],
-                ).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO wt_schema_migrations (version, applied_at)
+                         VALUES (?, 'before chats')",
+                        [ix as i64 + 1],
+                    )
+                    .unwrap();
             }
+            // The removed experiment: a recorded version with no chat tables.
+            connection
+                .execute(
+                    "INSERT INTO wt_schema_migrations (version, applied_at)
+                     VALUES (?, 'removed experiment')",
+                    [MIGRATIONS.len() as i64 + 1],
+                )
+                .unwrap();
+            connection
+                .execute_batch("CREATE TABLE wt_ai_chats (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+                .unwrap();
         }
-        store.set_config("active_provider", "existing").unwrap();
+
         store.migrate().unwrap();
+        // Repeatable: a second launch must not fail on the existing tables.
         store.migrate().unwrap();
-        assert_eq!(
-            store.get_config("active_provider").unwrap().as_deref(),
-            Some("existing")
-        );
         store.save_chat(&chat("saved", 10, 1)).unwrap();
         assert_eq!(
             store.load_chat("saved").unwrap(),
             Some(chat("saved", 10, 1))
         );
+        store
+            .save_session_history("saved", r#"[{"text":"context"}]"#)
+            .unwrap();
+        assert!(store.load_session_history("saved").unwrap().is_some());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
