@@ -136,6 +136,26 @@ fn sanitize_history(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
+fn session_history(
+    store: &SqliteStore,
+    memory: &HashMap<String, Vec<Message>>,
+    session_id: &str,
+) -> anyhow::Result<Vec<Message>> {
+    let messages = match memory.get(session_id) {
+        Some(messages) => messages.clone(),
+        None => store
+            .load_session_history(session_id)?
+            .map(|json| serde_json::from_str::<Vec<Message>>(&json))
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    let mut messages = sanitize_history(messages);
+    if messages.len() > MAX_HISTORY_MESSAGES {
+        messages.drain(0..messages.len() - MAX_HISTORY_MESSAGES);
+    }
+    Ok(messages)
+}
+
 /// Extract topics for `entries` with the active provider's model. Each batch
 /// is one model call; the graph is updated by the caller.
 pub(crate) async fn enrich_topics(
@@ -584,14 +604,20 @@ async fn run_prompt(
     };
 
     let prompt = Message::user(content.clone());
-    let prior: Vec<Message> = sanitize_history(
-        history
-            .lock()
-            .unwrap()
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_default(),
-    );
+    let prior = match session_history(&store, &history.lock().unwrap(), &session_id) {
+        Ok(messages) => messages,
+        Err(error) => {
+            fail(
+                &tx,
+                &active,
+                &cancel,
+                &request_id,
+                &session_id,
+                format!("Couldn't load this chat's context: {error}"),
+            );
+            return;
+        }
+    };
     let mut stream = agent.stream_chat(prompt.clone(), prior.clone()).await;
 
     let mut final_messages: Option<Vec<Message>> = None;
@@ -680,6 +706,20 @@ async fn run_prompt(
     if transcript.len() > MAX_HISTORY_MESSAGES {
         let excess = transcript.len() - MAX_HISTORY_MESSAGES;
         transcript.drain(0..excess);
+    }
+    let saved = serde_json::to_string(&transcript)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| store.save_session_history(&session_id, &json));
+    if let Err(error) = saved {
+        fail(
+            &tx,
+            &active,
+            &cancel,
+            &request_id,
+            &session_id,
+            format!("Couldn't save this chat's context: {error}"),
+        );
+        return;
     }
     history
         .lock()
@@ -1381,6 +1421,42 @@ mod tests {
             event.is_none(),
             "cancel with no active run must not fabricate a failure"
         );
+    }
+
+    #[test]
+    fn saved_context_restores_only_the_selected_chat_without_a_provider() {
+        let store = temp_store();
+        let first = vec![
+            Message::user("Remember: my project is called Atlas"),
+            Message::assistant("I'll remember Atlas."),
+        ];
+        let second = vec![Message::user("This is a separate chat")];
+        store
+            .save_session_history("a", &serde_json::to_string(&first).unwrap())
+            .unwrap();
+        store
+            .save_session_history("b", &serde_json::to_string(&second).unwrap())
+            .unwrap();
+        let empty_memory = HashMap::new();
+        let restored = session_history(&store, &empty_memory, "a").unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert_eq!(
+            session_history(&store, &empty_memory, "b").unwrap().len(),
+            1
+        );
+        assert!(
+            session_history(&store, &empty_memory, "new")
+                .unwrap()
+                .is_empty()
+        );
+        let mut memory = HashMap::new();
+        memory.insert("a".into(), vec![Message::user("Newer in-memory context")]);
+        assert_eq!(session_history(&store, &memory, "a").unwrap().len(), 1);
+        store.save_session_history("corrupt", "{}").unwrap();
+        assert!(session_history(&store, &empty_memory, "corrupt").is_err());
     }
 
     #[test]

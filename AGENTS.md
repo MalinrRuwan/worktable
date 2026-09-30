@@ -244,6 +244,19 @@ User message bubbles shrink to their text with an 85% max width; assistant
 bubbles keep a definite 85% measure because their selectable rich text needs a
 bounded frame.
 
+The conversation icon beside the assistant input opens **Chats**, a bottom
+sheet that rises from the window's bottom edge using `MODAL_OPEN`/`MODAL_CLOSE`.
+Its virtualized rows show the first prompt and last activity; the active row
+says *Current chat*. Selecting a row loads its saved transcript and closes the
+sheet; *New chat* starts an empty draft without storing an empty chat.
+Escape, Close, and the backdrop dismiss it, with focus restored; Tab stays
+inside the sheet. Switching waits for any answer or transcript save to finish,
+and failed saves expose Retry before switching is allowed. UI snapshots live
+in `wt_chats` with revision guards; rig's sanitized tool-call history lives
+separately in `wt_ai_history`, keyed by the same chat/session id, so reopening
+a chat after restart continues its actual model context. Older builds did not
+save chat transcripts, so only conversations made with this feature appear.
+
 The assistant transcript owns an explicit edge scrollbar and follows the
 stream. Reasoning streams into a **collapsible thinking block**: long thoughts
 render in a capped, scrollable body, and the run folds every block back to its

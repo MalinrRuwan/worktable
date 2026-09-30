@@ -27,8 +27,8 @@ use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::switch::Switch;
 use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, VirtualListScrollHandle,
-    WindowExt as _, h_flex, v_flex, v_virtual_list,
+    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Root, Selectable, Sizable,
+    VirtualListScrollHandle, WindowExt as _, h_flex, v_flex, v_virtual_list,
 };
 
 use crate::design;
@@ -48,6 +48,24 @@ use crate::assistant::{
     render_message, welcome_panel,
 };
 use crate::service::WorktableService;
+
+struct ChatRow {
+    id: String,
+    title: SharedString,
+    updated_at: i64,
+}
+
+enum ChatListState {
+    Loading,
+    Ready,
+    Failed(SharedString),
+}
+
+struct ChatSheet {
+    opened_at: Instant,
+    closing_at: Option<Instant>,
+    return_focus: Option<FocusHandle>,
+}
 
 #[cfg(test)]
 #[path = "worktable_view_tests.rs"]
@@ -283,6 +301,19 @@ pub struct WorktableView {
     // Assistant
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) assistant_busy: bool,
+    /// A chat id is allocated on the first prompt, not for an empty draft.
+    chat_id: Option<String>,
+    chat_revision: i64,
+    chat_save_pending: bool,
+    chat_save_error: Option<SharedString>,
+    chats: Vec<ChatRow>,
+    chats_state: ChatListState,
+    chat_loading: Option<String>,
+    chats_sheet: Option<ChatSheet>,
+    chats_focus: FocusHandle,
+    chats_scroll: VirtualListScrollHandle,
+    /// Reject list/transcript loads after dismissal or a newer selection.
+    chats_generation: u64,
     /// Scroll position of the assistant transcript (explicit scrollbar).
     assistant_scroll: ScrollHandle,
     /// Name of the tool currently executing, rendered as an orb status row.
@@ -415,6 +446,17 @@ impl WorktableView {
             assistant_input,
             messages: Vec::new(),
             assistant_busy: false,
+            chat_id: None,
+            chat_revision: 0,
+            chat_save_pending: false,
+            chat_save_error: None,
+            chats: Vec::new(),
+            chats_state: ChatListState::Ready,
+            chat_loading: None,
+            chats_sheet: None,
+            chats_focus: cx.focus_handle(),
+            chats_scroll: VirtualListScrollHandle::new(),
+            chats_generation: 0,
             assistant_scroll: ScrollHandle::new(),
             active_tool: None,
             pending_citations: Vec::new(),
@@ -1175,6 +1217,9 @@ impl WorktableView {
         if self.mode == mode {
             return;
         }
+        self.chats_sheet = None;
+        self.chat_loading = None;
+        self.chats_generation += 1;
         self.page_anim_at = if matches!(self.mode, AppMode::Entries | AppMode::Assistant)
             && matches!(mode, AppMode::Entries | AppMode::Assistant)
         {
@@ -1187,6 +1232,9 @@ impl WorktableView {
     }
 
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.chats_sheet = None;
+        self.chat_loading = None;
+        self.chats_generation += 1;
         self.mode = AppMode::Settings;
         self.settings_tab = None;
         if self.providers.is_empty() {
@@ -1197,6 +1245,9 @@ impl WorktableView {
 
     /// Show Settings opened on one of its category pages.
     pub fn show_settings_at(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        self.chats_sheet = None;
+        self.chat_loading = None;
+        self.chats_generation += 1;
         self.mode = AppMode::Settings;
         self.settings_tab = Some(tab);
         if self.providers.is_empty() {
@@ -1800,6 +1851,25 @@ impl WorktableView {
     }
 
     pub fn on_event(&mut self, event: &WorktableEvent, cx: &mut Context<Self>) {
+        let session_id = match event {
+            WorktableEvent::AiRunStarted { session_id, .. }
+            | WorktableEvent::AiThoughtDelta { session_id, .. }
+            | WorktableEvent::AiMessageDelta { session_id, .. }
+            | WorktableEvent::AiToolStarted { session_id, .. }
+            | WorktableEvent::AiToolFinished { session_id, .. }
+            | WorktableEvent::AiCitations { session_id, .. }
+            | WorktableEvent::AiRunFinished { session_id, .. }
+            | WorktableEvent::AiRunFailed { session_id, .. } => Some(session_id),
+            _ => None,
+        };
+        if self
+            .chat_id
+            .as_ref()
+            .zip(session_id)
+            .is_some_and(|(active, incoming)| active != incoming)
+        {
+            return;
+        }
         match event {
             WorktableEvent::AiRunStarted { .. } => {
                 self.assistant_busy = true;
@@ -1905,6 +1975,7 @@ impl WorktableView {
                         message.citations = refs;
                     }
                 }
+                self.save_current_chat(cx);
                 cx.notify();
             }
             WorktableEvent::AiRunFailed { error, .. } | WorktableEvent::AiWorkerError { error } => {
@@ -1928,6 +1999,7 @@ impl WorktableView {
                     self.messages
                         .push(ChatMessage::assistant(format!("⚠ {error}")));
                 }
+                self.save_current_chat(cx);
                 cx.notify();
             }
             WorktableEvent::AiProvidersSnapshot { snapshot } => {
@@ -2048,19 +2120,252 @@ impl WorktableView {
                 .is_some_and(|model| !model.is_empty())
     }
 
+    fn chat_switch_allowed(&self) -> bool {
+        !self.assistant_busy
+            && !self.chat_save_pending
+            && self.chat_save_error.is_none()
+            && self.chat_loading.is_none()
+    }
+
+    pub(crate) fn open_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .chats_sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.closing_at.is_none())
+        {
+            self.close_chats(window, cx);
+            return;
+        }
+        self.chats_sheet = Some(ChatSheet {
+            opened_at: Instant::now(),
+            closing_at: None,
+            return_focus: window.focused(cx),
+        });
+        self.chats_focus.focus(window, cx);
+        self.refresh_chats(cx);
+        cx.notify();
+    }
+
+    fn close_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sheet) = self.chats_sheet.as_mut() else {
+            return;
+        };
+        if sheet.closing_at.is_some() {
+            return;
+        }
+        sheet.closing_at = Some(Instant::now());
+        if let Some(focus) = sheet.return_focus.as_ref() {
+            focus.focus(window, cx);
+        }
+        self.chats_generation += 1;
+        self.chat_loading = None;
+        let generation = self.chats_generation;
+        let duration = if worktable_ui::reduced_motion(cx) {
+            Duration::ZERO
+        } else {
+            worktable_ui::MODAL_CLOSE.total()
+        };
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(duration).await;
+            let _ = view.update(cx, |this, cx| {
+                if this.chats_generation == generation {
+                    this.chats_sheet = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn refresh_chats(&mut self, cx: &mut Context<Self>) {
+        self.chats_generation += 1;
+        let generation = self.chats_generation;
+        self.chats_state = ChatListState::Loading;
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.list_chats().await;
+            let _ = view.update(cx, |this, cx| {
+                if this.chats_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(chats) => {
+                        this.chats = chats
+                            .into_iter()
+                            .map(|chat| ChatRow {
+                                id: chat.id,
+                                title: chat.title.into(),
+                                updated_at: chat.updated_at,
+                            })
+                            .collect();
+                        this.chats_state = ChatListState::Ready;
+                    }
+                    Err(error) => {
+                        this.chats_state = ChatListState::Failed(
+                            format!("Couldn't load chats: {error}. Try again.").into(),
+                        )
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_current_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.chat_id.clone() else {
+            return;
+        };
+        let Some(first_prompt) = self
+            .messages
+            .iter()
+            .find(|message| message.role == ChatRole::User)
+        else {
+            return;
+        };
+        let title = first_prompt
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title = if title.chars().count() > 64 {
+            format!("{}…", title.chars().take(64).collect::<String>())
+        } else {
+            title
+        };
+        let messages_json = match serde_json::to_string(&self.messages) {
+            Ok(json) => json,
+            Err(error) => {
+                self.chat_save_error =
+                    Some(format!("Couldn't save this chat: {error}. Try again.").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.chat_revision += 1;
+        let revision = self.chat_revision;
+        self.chat_save_pending = true;
+        self.chat_save_error = None;
+        let chat = worktable_db::StoredChat::new(
+            worktable_db::ChatSummary::new(
+                id.clone(),
+                title,
+                crate::service::unix_time_ms(),
+                revision,
+            ),
+            messages_json,
+        );
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.save_chat(chat).await;
+            let _ = view.update(cx, |this, cx| {
+                if this.chat_id.as_ref() != Some(&id) || this.chat_revision != revision {
+                    return;
+                }
+                this.chat_save_pending = false;
+                if let Err(error) = result {
+                    this.chat_save_error = Some(
+                        format!(
+                            "Couldn't save this chat: {error}. Try again before switching chats."
+                        )
+                        .into(),
+                    );
+                } else if this
+                    .chats_sheet
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.closing_at.is_none())
+                {
+                    this.refresh_chats(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_switch_allowed() {
+            return;
+        }
+        self.close_chats(window, cx);
+        self.chat_id = None;
+        self.chat_revision = 0;
+        self.messages.clear();
+        self.active_tool = None;
+        self.pending_citations.clear();
+        let input = self.assistant_input.clone();
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        self.assistant_scroll = ScrollHandle::new();
+        cx.notify();
+    }
+
+    fn load_chat(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_switch_allowed() {
+            return;
+        }
+        self.chats_generation += 1;
+        let generation = self.chats_generation;
+        self.chat_loading = Some(id.clone());
+        let service = Arc::clone(&self.service);
+        cx.spawn_in(window, async move |view, cx| {
+            let result = service.load_chat(&id).await.and_then(|chat| {
+                let chat = chat.ok_or_else(|| "This chat is no longer available.".to_owned())?;
+                let messages = serde_json::from_str::<Vec<ChatMessage>>(&chat.messages_json)
+                    .map_err(|error| format!("Couldn't read this chat: {error}. Try again."))?;
+                Ok((chat.summary, messages))
+            });
+            let _ = view.update_in(cx, |this, window, cx| {
+                if this.chats_generation != generation {
+                    return;
+                }
+                this.chat_loading = None;
+                match result {
+                    Ok((summary, mut messages)) => {
+                        for message in &mut messages {
+                            message.thinking_collapsed = true;
+                        }
+                        this.chat_id = Some(summary.id);
+                        this.chat_revision = summary.revision;
+                        this.messages = messages;
+                        this.active_tool = None;
+                        this.pending_citations.clear();
+                        this.assistant_scroll = ScrollHandle::new();
+                        this.assistant_scroll.scroll_to_bottom();
+                        this.close_chats(window, cx);
+                        let input = this.assistant_input.clone();
+                        input.update(cx, |state, cx| state.set_value("", window, cx));
+                        input.read(cx).focus_handle(cx).focus(window, cx);
+                    }
+                    Err(error) => this.chats_state = ChatListState::Failed(error.into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Abort the in-flight assistant run (the orb button while busy).
     pub fn cancel_assistant(&mut self, cx: &mut Context<Self>) {
         if !self.assistant_busy {
             return;
         }
         let service = Arc::clone(&self.service);
+        let session_id = self.chat_id.clone().unwrap_or_default();
         cx.spawn(async move |_view, _cx| {
-            let _ = service.cancel_prompt("wt-session").await;
+            let _ = service.cancel_prompt(&session_id).await;
         })
         .detach();
     }
 
     pub fn send_assistant(&mut self, cx: &mut Context<Self>) {
+        if self.assistant_busy || self.chat_loading.is_some() {
+            return;
+        }
         let text = self.assistant_input.read(cx).value().trim().to_owned();
         if text.is_empty() {
             return;
@@ -2086,40 +2391,48 @@ impl WorktableView {
     /// Submit one prompt: always shows the user's message, then either runs it
     /// or explains the (missing) provider setup.
     pub fn submit_assistant_prompt(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.assistant_busy {
+        if self.assistant_busy || self.chat_loading.is_some() {
             return;
         }
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;
         }
+        let session_id = self
+            .chat_id
+            .get_or_insert_with(crate::service::new_entry_id)
+            .clone();
         self.messages.push(ChatMessage::user(text.clone()));
         if !self.agent_ready() {
             self.messages.push(ChatMessage::assistant(
                 "The AI assistant isn't configured yet — pick a provider, add an API key, and choose a model in Settings.",
             ));
+            self.save_current_chat(cx);
             cx.notify();
             return;
         }
         self.assistant_busy = true;
         self.active_tool = None;
         self.pending_citations.clear();
+        self.save_current_chat(cx);
         cx.notify();
 
         let service = Arc::clone(&self.service);
         let request_id = crate::service::new_entry_id();
         cx.spawn(async move |view, cx| {
             let result = service
-                .submit_prompt(&request_id, "wt-session", &text)
+                .submit_prompt(&request_id, &session_id, &text)
                 .await;
             match result {
                 Err(error) => {
                     let _ = view.update(cx, |this, cx| {
+                        if this.chat_id.as_ref() != Some(&session_id) { return; }
                         this.assistant_busy = false;
                         if !this.messages.iter().any(|m| m.text.contains(&error)) {
                             this.messages
                                 .push(ChatMessage::assistant(format!("⚠ {error}")));
                         }
+                        this.save_current_chat(cx);
                         cx.notify();
                     });
                 }
@@ -2128,10 +2441,12 @@ impl WorktableView {
                 // forever with no feedback — the prompt silently vanishes.
                 Ok(None) => {
                     let _ = view.update(cx, |this, cx| {
+                        if this.chat_id.as_ref() != Some(&session_id) { return; }
                         this.assistant_busy = false;
                         this.messages.push(ChatMessage::assistant(
                             "⚠ Another prompt is still running for this session. Please wait for it to finish and try again.",
                         ));
+                        this.save_current_chat(cx);
                         cx.notify();
                     });
                 }
@@ -2632,7 +2947,11 @@ impl Render for WorktableView {
             .bg(theme.tokens.background)
             .text_color(theme.foreground)
             .text_size(theme.font_size)
-            .key_context("worktable-list")
+            .key_context(if self.list_actions_allowed() {
+                "worktable-list"
+            } else {
+                "worktable"
+            })
             .on_action(
                 cx.listener(|this, _: &crate::actions::SelectPrevious, window, cx| {
                     if !this.text_input_focused(window, cx) {
@@ -2699,8 +3018,12 @@ impl Render for WorktableView {
             )
             .on_action(
                 cx.listener(|this, _: &crate::actions::CancelComposer, window, cx| {
-                    this.cancel_composer(cx);
-                    this.focus_handle.focus(window, cx);
+                    if this.chats_sheet.is_some() {
+                        this.close_chats(window, cx);
+                    } else {
+                        this.cancel_composer(cx);
+                        this.focus_handle.focus(window, cx);
+                    }
                 }),
             )
             .on_action(
@@ -2722,6 +3045,7 @@ impl Render for WorktableView {
                     .justify_center()
                     .child(render_main(self, window, cx)),
             )
+            .children(render_chats_sheet(self, window, cx))
             .when(is_splash, |this| {
                 this.child(splash_out(
                     "worktable-splash",
@@ -5596,6 +5920,347 @@ fn trim_opt(value: &str) -> Option<String> {
 // AI Assistant pane
 // ---------------------------------------------------------------------------
 
+fn render_chats_sheet(
+    this: &mut WorktableView,
+    window: &mut Window,
+    cx: &mut Context<WorktableView>,
+) -> Option<gpui::AnyElement> {
+    let sheet = this.chats_sheet.as_ref()?;
+    if this.mode != AppMode::Assistant {
+        return None;
+    }
+    let (elapsed, spec, opening) = match sheet.closing_at {
+        Some(started) => (started.elapsed(), worktable_ui::MODAL_CLOSE, false),
+        None => (sheet.opened_at.elapsed(), worktable_ui::MODAL_OPEN, true),
+    };
+    let reduced = worktable_ui::reduced_motion(cx);
+    if !opening && (reduced || elapsed >= spec.total()) {
+        return None;
+    }
+    if !reduced && elapsed < spec.total() {
+        let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+    }
+    let progress = if reduced {
+        1.0
+    } else {
+        spec.progress(elapsed.as_secs_f32() / spec.total().as_secs_f32())
+    };
+    let t = if opening { progress } else { 1.0 - progress };
+    let theme = cx.theme().clone();
+    let viewport = window.viewport_size();
+    let width = design::content_column_width(window);
+    let height = design::to_pixels(design::CHATS_SHEET_HEIGHT, window).min(viewport.height * 0.72);
+    let allowed = this.chat_switch_allowed() && opening;
+
+    let mut body = v_flex().size_full().min_h_0().child(
+        h_flex()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Chats"),
+            )
+            .child(
+                Button::new("new-chat")
+                    .label("New chat")
+                    .icon(app_icon(IconName::Plus))
+                    .small()
+                    .ghost()
+                    .disabled(!allowed)
+                    .debug_selector(|| "new-chat".into())
+                    .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+            )
+            .child(
+                CircleAction::new("chats-close")
+                    .ghost()
+                    .icon(app_icon(IconName::Close))
+                    .tooltip("Close chats")
+                    .debug_selector("chats-close")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_chats(window, cx))),
+            ),
+    );
+
+    let status = if this.assistant_busy {
+        Some("Finish or stop the current answer before switching chats.")
+    } else if this.chat_save_pending {
+        Some("Saving chat")
+    } else if this.chat_loading.is_some() {
+        Some("Loading chat")
+    } else {
+        None
+    };
+    if let Some(status) = status {
+        body = body.child(
+            div()
+                .id("chats-status")
+                .px_4()
+                .py_2()
+                .role(Role::Status)
+                .aria_label(status)
+                .debug_selector(|| "chats-status".into())
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status),
+        );
+    }
+    if !this.service.has_ai_runtime() {
+        body = body.child(
+            div()
+                .id("chats-offline")
+                .px_4()
+                .py_2()
+                .role(Role::Status)
+                .aria_label("Local storage unavailable")
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Local storage is unavailable. Chats are kept only until you quit."),
+        );
+    }
+    if let Some(error) = this.chat_save_error.clone() {
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .child(
+                    div()
+                        .id("chats-save-error")
+                        .flex_1()
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+                .child(
+                    Button::new("chats-retry-save")
+                        .label("Retry")
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.save_current_chat(cx))),
+                ),
+        );
+    }
+    if let ChatListState::Failed(error) = &this.chats_state {
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .child(
+                    div()
+                        .id("chats-load-error")
+                        .flex_1()
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(error.clone()),
+                )
+                .child(
+                    Button::new("chats-retry")
+                        .label("Retry")
+                        .small()
+                        .ghost()
+                        .debug_selector(|| "chats-retry".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_chats(cx))),
+                ),
+        );
+    }
+    if this.chats.is_empty() {
+        body = body.child(
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .when(matches!(this.chats_state, ChatListState::Loading), |el| {
+                    el.child(
+                        Button::new("chats-loading")
+                            .label("Loading chats")
+                            .ghost()
+                            .loading(true)
+                            .disabled(true),
+                    )
+                })
+                .when(matches!(this.chats_state, ChatListState::Ready), |el| {
+                    el.debug_selector(|| "chats-empty".into())
+                        .child(
+                            svg()
+                                .path(crate::assets::CHATS_PATH)
+                                .size_8()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(div().text_sm().child("No chats yet"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Start a conversation and it will appear here."),
+                        )
+                }),
+        );
+    } else {
+        let row_h = design::to_pixels(design::CHAT_ROW_HEIGHT, window);
+        let row_sizes = Rc::new(vec![size(Pixels::ZERO, row_h); this.chats.len()]);
+        let list = v_virtual_list(
+            cx.entity(),
+            "chats-list",
+            row_sizes,
+            move |this, range, _, cx| {
+                let theme = cx.theme();
+                range
+                    .map(|ix| {
+                        let chat = &this.chats[ix];
+                        let id = chat.id.clone();
+                        let selector = format!("chat-row:{id}");
+                        let active = this.chat_id.as_ref() == Some(&id);
+                        div()
+                            .id(SharedString::from(format!("chat-item:{id}")))
+                            .h_full()
+                            .px_3()
+                            .py_1()
+                            .role(Role::ListItem)
+                            .aria_label(chat.title.clone())
+                            .aria_selected(active)
+                            .child(
+                                Button::new(SharedString::from(format!("chat:{id}")))
+                                    .ghost()
+                                    .selected(active)
+                                    .disabled(!allowed)
+                                    .w_full()
+                                    .h_full()
+                                    .justify_start()
+                                    .overflow_hidden()
+                                    .tooltip(chat.title.clone())
+                                    .debug_selector(move || selector.clone())
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .w_full()
+                                            .min_w_0()
+                                            .child(
+                                                svg()
+                                                    .path(crate::assets::CHATS_PATH)
+                                                    .size_4()
+                                                    .flex_shrink_0()
+                                                    .text_color(theme.muted_foreground),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .truncate()
+                                                            .child(chat.title.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(crate::format::relative_time(
+                                                                chat.updated_at,
+                                                            )),
+                                                    ),
+                                            )
+                                            .when(active, |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .flex_shrink_0()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Current chat"),
+                                                )
+                                            }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.load_chat(id.clone(), window, cx)
+                                    })),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            },
+        )
+        .size_full()
+        .track_scroll(&this.chats_scroll);
+        body = body.child(
+            div()
+                .id("saved-chats")
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .role(Role::List)
+                .aria_label("Saved chats")
+                .debug_selector(|| "chats-list".into())
+                .child(list)
+                .child(Scrollbar::vertical(&this.chats_scroll)),
+        );
+    }
+
+    // The pinned Sheet hard-codes its animation. Reuse its focus-trap behavior
+    // here, with the app's motion specs and a full-height rise from the bottom.
+    Some(
+        div()
+            .id("chats-host")
+            .absolute()
+            .inset_0()
+            .key_context("worktable-chats")
+            .track_focus(&this.chats_focus)
+            .focus_trap("chats", &this.chats_focus)
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CancelComposer, window, cx| {
+                    this.close_chats(window, cx)
+                }),
+            )
+            .child(
+                div()
+                    .id("chats-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .debug_selector(|| "chats-backdrop".into())
+                    .bg(theme.background.opacity(0.62 * t))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.close_chats(window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("chats-sheet")
+                    .absolute()
+                    .occlude()
+                    .role(Role::Dialog)
+                    .aria_label("Chats")
+                    .debug_selector(|| "chats-sheet".into())
+                    .left((viewport.width - width) / 2.0)
+                    .bottom(-height * (1.0 - t))
+                    .w(width)
+                    .h(height)
+                    .min_w_0()
+                    .overflow_hidden()
+                    .rounded_t(theme.radius_tokens().lg)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.tokens.popover)
+                    .shadow_lg()
+                    .child(body),
+            )
+            .into_any_element(),
+    )
+}
+
 fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let configured = this.agent_ready();
@@ -5665,7 +6330,10 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
             // Chat is append-only between clears, so the index is a stable
             // identity; keying on the streamed text length would restart the
             // entrance animation on every delta.
-            let id = SharedString::from(format!("msg-{idx}"));
+            let id = SharedString::from(format!(
+                "msg-{}-{idx}",
+                this.chat_id.as_deref().unwrap_or("draft")
+            ));
             // The thinking header toggles this message's block; long
             // reasoning is capped and scrolls instead of freezing layout.
             let toggle: Option<ToggleThinking> = {
@@ -5842,6 +6510,21 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                                         .text_color(theme.foreground),
                                 ),
                         )
+                        .child(
+                            CircleAction::new("assistant-chats")
+                                .ghost()
+                                .child(
+                                    svg()
+                                        .path(crate::assets::CHATS_PATH)
+                                        .size_4()
+                                        .text_color(theme.foreground),
+                                )
+                                .tooltip("Chats")
+                                .debug_selector("assistant-chats")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_chats(window, cx)),
+                                ),
+                        )
                         .child(knowledge_button)
                         .child({
                             let send: gpui::AnyElement = if this.assistant_busy {
@@ -5872,6 +6555,31 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                             send
                         }),
                 )
+                .when_some(this.chat_save_error.clone(), |el, error| {
+                    el.child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("chat-save-error")
+                                    .role(Role::Alert)
+                                    .aria_label(error.clone())
+                                    .text_xs()
+                                    .text_color(theme.danger)
+                                    .child(error),
+                            )
+                            .child(
+                                Button::new("retry-chat-save")
+                                    .label("Retry")
+                                    .small()
+                                    .ghost()
+                                    .debug_selector(|| "retry-chat-save".into())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.save_current_chat(cx)),
+                                    ),
+                            ),
+                    )
+                })
                 .child(knowledge_status),
         )
         .into_any_element()

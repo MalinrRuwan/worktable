@@ -64,6 +64,18 @@ impl WorktableRuntime {
         self.store.database_path()
     }
 
+    pub fn list_chats(&self) -> anyhow::Result<Vec<worktable_db::ChatSummary>> {
+        self.store.list_chats()
+    }
+
+    pub fn load_chat(&self, id: &str) -> anyhow::Result<Option<worktable_db::StoredChat>> {
+        self.store.load_chat(id)
+    }
+
+    pub fn save_chat(&self, chat: &worktable_db::StoredChat) -> anyhow::Result<()> {
+        self.store.save_chat(chat)
+    }
+
     pub async fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<worktable_db::Entry>> {
         self.store.list_entries(limit)
     }

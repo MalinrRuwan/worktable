@@ -91,7 +91,64 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     "#,
+    r#"
+    CREATE TABLE wt_chats (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        messages_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL
+    );
+
+    CREATE TABLE wt_ai_history (
+        session_id TEXT PRIMARY KEY,
+        messages_json TEXT NOT NULL
+    );
+    "#,
 ];
+
+/// Metadata for the chat picker; transcripts are loaded only on selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChatSummary {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+    pub revision: i64,
+}
+
+impl ChatSummary {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        updated_at: i64,
+        revision: i64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            updated_at,
+            revision,
+        }
+    }
+}
+
+/// A versioned UI transcript, separate from the model's tool-call history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StoredChat {
+    pub summary: ChatSummary,
+    pub messages_json: String,
+}
+
+impl StoredChat {
+    pub fn new(summary: ChatSummary, messages_json: String) -> Self {
+        Self {
+            summary,
+            messages_json,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -144,6 +201,92 @@ impl SqliteStore {
 
     pub fn database_path(&self) -> &str {
         &self.database_path
+    }
+
+    pub fn list_chats(&self) -> anyhow::Result<Vec<ChatSummary>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, title, updated_at, revision FROM wt_chats ORDER BY updated_at DESC, id",
+        )?;
+        let chats = statement.query_map([], |row| {
+            Ok(ChatSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated_at: row.get(2)?,
+                revision: row.get(3)?,
+            })
+        })?;
+        Ok(chats.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn load_chat(&self, id: &str) -> anyhow::Result<Option<StoredChat>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        Ok(connection
+            .query_row(
+                "SELECT id, title, updated_at, revision, messages_json FROM wt_chats WHERE id = ?",
+                [id],
+                |row| {
+                    Ok(StoredChat {
+                        summary: ChatSummary {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            updated_at: row.get(2)?,
+                            revision: row.get(3)?,
+                        },
+                        messages_json: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn save_chat(&self, chat: &StoredChat) -> anyhow::Result<()> {
+        serde_json::from_str::<serde_json::Value>(&chat.messages_json)
+            .context("invalid chat transcript")?;
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection.execute(
+            "INSERT INTO wt_chats (id, title, updated_at, revision, messages_json)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 title = excluded.title, updated_at = excluded.updated_at,
+                 revision = excluded.revision, messages_json = excluded.messages_json
+             WHERE excluded.revision >= wt_chats.revision",
+            params![
+                chat.summary.id,
+                chat.summary.title,
+                chat.summary.updated_at,
+                chat.summary.revision,
+                chat.messages_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_session_history(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        Ok(connection
+            .query_row(
+                "SELECT messages_json FROM wt_ai_history WHERE session_id = ?",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_session_history(
+        &self,
+        session_id: &str,
+        messages_json: &str,
+    ) -> anyhow::Result<()> {
+        serde_json::from_str::<serde_json::Value>(messages_json)
+            .context("invalid assistant history")?;
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        connection.execute(
+            "INSERT INTO wt_ai_history (session_id, messages_json) VALUES (?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET messages_json = excluded.messages_json",
+            params![session_id, messages_json],
+        )?;
+        Ok(())
     }
 
     pub fn migrate(&self) -> anyhow::Result<()> {
@@ -612,6 +755,8 @@ struct WasmInner {
     entries: Vec<Entry>,
     credentials: std::collections::HashMap<String, ProviderCredential>,
     config: std::collections::HashMap<String, String>,
+    chats: std::collections::HashMap<String, StoredChat>,
+    history: std::collections::HashMap<String, String>,
     sessions: std::collections::HashMap<String, (String, i64)>, // session_id -> (state, updated_at)
     runs: std::collections::HashMap<String, String>,            // run_id -> state
     leases: std::collections::HashMap<String, (String, String, i64)>, // session_id -> (owner_id, run_id, lease_until)
@@ -631,6 +776,73 @@ impl SqliteStore {
 
     pub fn database_path(&self) -> &str {
         &self.database_path
+    }
+
+    pub fn list_chats(&self) -> anyhow::Result<Vec<ChatSummary>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        let mut chats: Vec<_> = inner
+            .chats
+            .values()
+            .map(|chat| chat.summary.clone())
+            .collect();
+        chats.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(chats)
+    }
+
+    pub fn load_chat(&self, id: &str) -> anyhow::Result<Option<StoredChat>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("wasm lock poisoned")
+            .chats
+            .get(id)
+            .cloned())
+    }
+
+    pub fn save_chat(&self, chat: &StoredChat) -> anyhow::Result<()> {
+        serde_json::from_str::<serde_json::Value>(&chat.messages_json)
+            .context("invalid chat transcript")?;
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        if inner
+            .chats
+            .get(&chat.summary.id)
+            .is_none_or(|existing| chat.summary.revision >= existing.summary.revision)
+        {
+            inner.chats.insert(chat.summary.id.clone(), chat.clone());
+        }
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn load_session_history(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("wasm lock poisoned")
+            .history
+            .get(session_id)
+            .cloned())
+    }
+
+    pub fn save_session_history(
+        &self,
+        session_id: &str,
+        messages_json: &str,
+    ) -> anyhow::Result<()> {
+        serde_json::from_str::<serde_json::Value>(messages_json)
+            .context("invalid assistant history")?;
+        self.inner
+            .lock()
+            .expect("wasm lock poisoned")
+            .history
+            .insert(session_id.to_owned(), messages_json.to_owned());
+        self.save_to_storage();
+        Ok(())
     }
 
     pub fn migrate(&self) -> anyhow::Result<()> {
@@ -893,6 +1105,18 @@ impl SqliteStore {
                             {
                                 inner.config = cfg;
                             }
+                            if let Some(chats) = saved
+                                .get("chats")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.chats = chats;
+                            }
+                            if let Some(history) = saved
+                                .get("history")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.history = history;
+                            }
                         }
                     }
                 }
@@ -910,6 +1134,8 @@ impl SqliteStore {
                         "entries": inner.entries,
                         "credentials": inner.credentials,
                         "config": inner.config,
+                        "chats": inner.chats,
+                        "history": inner.history,
                     });
                     if let Ok(json) = serde_json::to_string(&payload) {
                         let _ = storage.set_item("worktable-db", &json);
@@ -1119,5 +1345,114 @@ mod tests {
         );
         store.delete_config("active_provider").unwrap();
         assert_eq!(store.get_config("active_provider").unwrap(), None);
+    }
+
+    fn chat(id: &str, updated_at: i64, revision: i64) -> StoredChat {
+        StoredChat {
+            summary: ChatSummary {
+                id: id.into(),
+                title: format!("Chat {id}"),
+                updated_at,
+                revision,
+            },
+            messages_json: format!(r#"[{{"text":"revision {revision}"}}]"#),
+        }
+    }
+
+    #[test]
+    fn chats_roundtrip_order_and_reject_stale_saves() {
+        let store = store();
+        assert!(store.list_chats().unwrap().is_empty());
+        assert!(store.load_chat("missing").unwrap().is_none());
+        store.save_chat(&chat("a", 10, 1)).unwrap();
+        store.save_chat(&chat("b", 20, 1)).unwrap();
+        store.save_chat(&chat("a", 30, 3)).unwrap();
+        store.save_chat(&chat("a", 40, 2)).unwrap();
+        assert_eq!(store.load_chat("a").unwrap(), Some(chat("a", 30, 3)));
+        assert_eq!(
+            store
+                .list_chats()
+                .unwrap()
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let mut invalid = chat("c", 40, 1);
+        invalid.messages_json = "broken JSON".into();
+        assert!(store.save_chat(&invalid).is_err());
+        assert!(store.load_chat("c").unwrap().is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn chat_migration_preserves_existing_data_and_is_repeatable() {
+        let store = SqliteStore::connect(":memory:").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            for (ix, migration) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+                connection.execute_batch(migration).unwrap();
+                connection.execute(
+                    "INSERT INTO wt_schema_migrations (version, applied_at) VALUES (?, 'before chats')",
+                    [ix as i64 + 1],
+                ).unwrap();
+            }
+        }
+        store.set_config("active_provider", "existing").unwrap();
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+        assert_eq!(
+            store.get_config("active_provider").unwrap().as_deref(),
+            Some("existing")
+        );
+        store.save_chat(&chat("saved", 10, 1)).unwrap();
+        assert_eq!(
+            store.load_chat("saved").unwrap(),
+            Some(chat("saved", 10, 1))
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn chats_and_model_context_survive_reopening_the_database() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("worktable-chat-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chats.db").to_string_lossy().into_owned();
+        {
+            let store = SqliteStore::connect(&path).unwrap();
+            store.migrate().unwrap();
+            store.save_chat(&chat("a", 10, 1)).unwrap();
+            store
+                .save_session_history("a", r#"[{"text":"context A"}]"#)
+                .unwrap();
+            store
+                .save_session_history("b", r#"[{"text":"context B"}]"#)
+                .unwrap();
+        }
+        let reopened = SqliteStore::connect(&path).unwrap();
+        reopened.migrate().unwrap();
+        assert_eq!(reopened.load_chat("a").unwrap(), Some(chat("a", 10, 1)));
+        assert!(
+            reopened
+                .load_session_history("a")
+                .unwrap()
+                .unwrap()
+                .contains("context A")
+        );
+        assert!(
+            reopened
+                .load_session_history("b")
+                .unwrap()
+                .unwrap()
+                .contains("context B")
+        );
+        assert!(reopened.load_session_history("missing").unwrap().is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

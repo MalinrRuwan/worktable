@@ -3589,3 +3589,375 @@ fn citation_chip_opens_the_source(cx: &mut TestAppContext) {
         "the source row renders under the answer"
     );
 }
+
+fn db_with_chats() -> String {
+    let db = seeded_db(Vec::new());
+    let store = worktable_db::SqliteStore::connect(&db).unwrap();
+    store.migrate().unwrap();
+    let mut answer = crate::assistant::ChatMessage::assistant("Your notes mention Rust[1].");
+    answer.thinking = "I searched the notes.".into();
+    answer.citations.push(worktable_ui::CitationRef {
+        n: 1,
+        label: "Rust note".into(),
+        snippet: "A saved Rust note".into(),
+        host: "Library".into(),
+        url: "worktable-entry:rust".into(),
+    });
+    for (id, timestamp, messages) in [
+        (
+            "older",
+            10,
+            vec![
+                crate::assistant::ChatMessage::user("An older conversation"),
+                crate::assistant::ChatMessage::assistant("Older answer"),
+            ],
+        ),
+        (
+            "recent",
+            20,
+            vec![
+                crate::assistant::ChatMessage::user("Find my Rust notes"),
+                answer,
+            ],
+        ),
+    ] {
+        store
+            .save_chat(&worktable_db::StoredChat::new(
+                worktable_db::ChatSummary::new(id, messages[0].text.clone(), timestamp, 1),
+                serde_json::to_string(&messages).unwrap(),
+            ))
+            .unwrap();
+    }
+    db
+}
+
+fn open_chat_picker(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
+    view.update(cx, |this, cx| this.show_assistant(cx));
+    settle_strip(cx);
+    force_frame(cx);
+    click_selector(cx, "assistant-chats");
+    assert!(wait_for(cx, 5, |cx| {
+        cx.read_entity(view, |v, _| {
+            !matches!(v.chats_state, super::ChatListState::Loading)
+        })
+    }));
+    settle_strip(cx);
+    force_frame(cx);
+}
+
+#[gpui::test]
+fn chats_sheet_opens_at_the_bottom_and_dismisses_with_focus_restored(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    open_chat_picker(&mut cx, &view);
+    let sheet = cx
+        .debug_bounds("chats-sheet")
+        .expect("the icon opens a sheet");
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert_eq!(
+        sheet.bottom(),
+        viewport.height,
+        "the sheet sits on the screen's bottom edge"
+    );
+    assert!(sheet.top() > viewport.height * 0.25);
+    assert!(cx.debug_bounds("chats-empty").is_some());
+    for _ in 0..12 {
+        let before = cx.update(|window, cx| window.focused(cx));
+        cx.simulate_keystrokes("tab");
+        let after = cx.update(|window, cx| window.focused(cx));
+        assert_ne!(
+            before, after,
+            "Tab must move focus to a control inside the sheet"
+        );
+        assert!(
+            cx.update(|window, cx| view.read(cx).chats_focus.contains_focused(window, cx)),
+            "Tab cannot leave the sheet"
+        );
+    }
+    cx.simulate_keystrokes("escape");
+    assert!(
+        cx.read_entity(&view, |v, _| v
+            .chats_sheet
+            .as_ref()
+            .is_none_or(|sheet| sheet.closing_at.is_some())),
+        "Escape must start the close transition"
+    );
+    cx.background_executor
+        .advance_clock(worktable_ui::MODAL_CLOSE.total());
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("chats-sheet").is_none());
+    assert!(cx.read_entity(&view, |v, _| v.chats_sheet.is_none()));
+    assert!(cx.update(|window, cx| view.read(cx).focus_handle.is_focused(window)));
+
+    open_chat_picker(&mut cx, &view);
+    let backdrop = cx.debug_bounds("chats-backdrop").unwrap();
+    cx.simulate_click(
+        point(backdrop.center().x, backdrop.top() + px(40.)),
+        Modifiers::default(),
+    );
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("chats-sheet").is_none());
+}
+
+#[gpui::test]
+fn chats_select_a_saved_transcript_and_new_chat_keeps_the_previous_one(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = db_with_chats();
+    let (view, window) = setup_view_with_db(cx, db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    open_chat_picker(&mut cx, &view);
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect::<Vec<_>>()),
+        ["recent", "older"]
+    );
+    click_selector(&mut cx, "chat-row:recent");
+    assert!(wait_for(&mut cx, 5, |cx| cx
+        .read_entity(&view, |v, _| v.chat_id.as_deref()
+            == Some("recent"))));
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("chats-sheet").is_none());
+    assert!(
+        cx.debug_bounds("assistant-citations").is_some(),
+        "loaded sources remain interactive"
+    );
+    cx.read_entity(&view, |v, _| {
+        assert_eq!(v.messages[0].text, "Find my Rust notes");
+        assert!(v.messages[1].thinking_collapsed);
+        assert!(!v.messages[1].streaming);
+        assert_eq!(v.messages[1].citations[0].label.as_ref(), "Rust note");
+    });
+    open_chat_picker(&mut cx, &view);
+    click_selector(&mut cx, "new-chat");
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.read_entity(&view, |v, _| v.messages.is_empty() && v.chat_id.is_none()));
+    assert!(cx.debug_bounds("chats-sheet").is_none());
+    let store = worktable_db::SqliteStore::connect(&db).unwrap();
+    assert_eq!(
+        store.list_chats().unwrap().len(),
+        2,
+        "empty drafts do not create extra rows"
+    );
+    assert!(store.load_chat("recent").unwrap().is_some());
+}
+
+#[gpui::test]
+fn chats_rows_load_from_the_keyboard(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view_with_db(cx, db_with_chats(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    open_chat_picker(&mut cx, &view);
+    // Visual order: New chat, Close, then the newest conversation.
+    for _ in 0..3 {
+        cx.simulate_keystrokes("tab");
+        force_frame(&mut cx);
+    }
+    cx.simulate_keystrokes("enter");
+    // At this GPUI revision simulate_keystrokes emits only key-down. Buttons
+    // commit their keyboard click on key-up, as the native event loop does.
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |v, _| v.chat_loading.is_some()
+            || v.chat_id.is_some()),
+        "Enter must activate the chat row, not another control (sheet closing: {})",
+        cx.read_entity(&view, |v, _| v
+            .chats_sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.closing_at.is_some()))
+    );
+    assert!(wait_for(&mut cx, 5, |cx| cx
+        .read_entity(&view, |v, _| v.chat_id.as_deref()
+            == Some("recent"))));
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("chats-sheet").is_none());
+    assert_eq!(cx.read_entity(&view, |v, _| v.messages.len()), 2);
+}
+
+#[gpui::test]
+fn chats_switching_is_disabled_during_an_answer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view_with_db(cx, db_with_chats(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.messages
+            .push(crate::assistant::ChatMessage::user("Answer in progress"));
+        this.assistant_busy = true;
+        cx.notify();
+    });
+    open_chat_picker(&mut cx, &view);
+    assert!(cx.debug_bounds("chats-status").is_some());
+    click_selector(&mut cx, "chat-row:recent");
+    click_selector(&mut cx, "new-chat");
+    assert!(cx.read_entity(&view, |v, _| v.chat_id.is_none()
+        && v.messages[0].text == "Answer in progress"));
+    assert!(cx.debug_bounds("chats-sheet").is_some());
+    click_selector(&mut cx, "chats-close");
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("chats-sheet").is_none(),
+        "browsing can still be dismissed while busy"
+    );
+}
+
+#[gpui::test]
+fn chats_save_finished_answers_and_ignore_other_sessions(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.submit_assistant_prompt("A durable conversation".into(), cx)
+    });
+    assert!(wait_for(&mut cx, 5, |cx| cx
+        .read_entity(&view, |v, _| !v.chat_save_pending)));
+    let id = cx.read_entity(&view, |v, _| v.chat_id.clone().unwrap());
+    view.update(&mut cx, |this, cx| {
+        this.on_event(
+            &worktable_events::WorktableEvent::AiMessageDelta {
+                request_id: "wrong".into(),
+                session_id: "another-chat".into(),
+                delta: "Must not appear".into(),
+            },
+            cx,
+        );
+        this.on_event(
+            &worktable_events::WorktableEvent::AiMessageDelta {
+                request_id: "right".into(),
+                session_id: id.clone(),
+                delta: "Saved answer".into(),
+            },
+            cx,
+        );
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFinished {
+                request_id: "right".into(),
+                session_id: id.clone(),
+                run_id: "run".into(),
+                state: "completed".into(),
+            },
+            cx,
+        );
+    });
+    assert!(wait_for(&mut cx, 5, |cx| cx
+        .read_entity(&view, |v, _| !v.chat_save_pending)));
+    let db = cx.read_entity(&view, |v, _| v.service.database_path());
+    let saved = worktable_db::SqliteStore::connect(&db)
+        .unwrap()
+        .load_chat(&id)
+        .unwrap()
+        .unwrap();
+    assert!(saved.messages_json.contains("Saved answer"));
+    assert!(!saved.messages_json.contains("Must not appear"));
+    open_chat_picker(&mut cx, &view);
+    assert_eq!(cx.read_entity(&view, |v, _| v.chats.len()), 1);
+}
+
+#[gpui::test]
+fn chats_corrupt_transcript_shows_retry_without_replacing_current_messages(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let db = db_with_chats();
+    let store = worktable_db::SqliteStore::connect(&db).unwrap();
+    let mut bad = store.load_chat("recent").unwrap().unwrap();
+    bad.messages_json = "{}".into();
+    bad.summary.revision += 1;
+    store.save_chat(&bad).unwrap();
+    let (view, window) = setup_view_with_db(cx, db, TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.messages
+            .push(crate::assistant::ChatMessage::user("Keep this visible"));
+        cx.notify();
+    });
+    open_chat_picker(&mut cx, &view);
+    click_selector(&mut cx, "chat-row:recent");
+    assert!(wait_for(&mut cx, 5, |cx| cx.read_entity(&view, |v, _| {
+        matches!(v.chats_state, super::ChatListState::Failed(_))
+    })));
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("chats-retry").is_some());
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.messages[0].text.clone()),
+        "Keep this visible"
+    );
+    click_selector(&mut cx, "chat-row:older");
+    assert!(wait_for(&mut cx, 5, |cx| cx
+        .read_entity(&view, |v, _| v.chat_id.as_deref()
+            == Some("older"))));
+}
+
+#[gpui::test]
+fn chats_reduced_motion_and_dismissal_reject_a_pending_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| worktable_ui::set_reduced_motion(cx, true));
+    let (view, window) = setup_view_with_db(cx, db_with_chats(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.messages
+            .push(crate::assistant::ChatMessage::user("Keep this draft"));
+    });
+    force_frame(&mut cx);
+    click_selector(&mut cx, "assistant-chats");
+    force_frame(&mut cx);
+    let sheet = cx.debug_bounds("chats-sheet").unwrap();
+    assert_eq!(
+        sheet.bottom(),
+        cx.update(|window, _| window.viewport_size().height),
+        "reduced motion goes straight to the bottom-aligned final position"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.load_chat("recent".into(), window, cx);
+            this.close_chats(window, cx);
+        });
+    });
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(1));
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("chats-sheet").is_none(),
+        "reduced motion dismisses immediately"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.messages[0].text.clone()),
+        "Keep this draft"
+    );
+    assert!(cx.read_entity(&view, |v, _| v.chat_id.is_none()));
+}

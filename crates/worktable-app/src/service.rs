@@ -56,6 +56,7 @@ pub struct WorktableService {
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
     /// In-memory config fallback when the database is unavailable.
     memory_config: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    memory_chats: tokio::sync::Mutex<HashMap<String, worktable_db::StoredChat>>,
     /// Internal media library: added images are hard-linked here (falling back
     /// to a copy) so entries keep working when the original moves away.
     media_dir: PathBuf,
@@ -90,6 +91,7 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(entries)),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir,
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
@@ -114,6 +116,7 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir: resolve_media_dir(),
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
@@ -287,6 +290,53 @@ impl WorktableService {
         let mut memory = self.memory.lock().await;
         memory.retain(|entry| entry.id != id);
         Ok(())
+    }
+
+    pub async fn list_chats(&self) -> Result<Vec<worktable_db::ChatSummary>, String> {
+        if self.runtime.is_some() {
+            self.run_on_tokio(|runtime| async move { runtime.list_chats() })
+                .await
+        } else {
+            let mut chats: Vec<_> = self
+                .memory_chats
+                .lock()
+                .await
+                .values()
+                .map(|chat| chat.summary.clone())
+                .collect();
+            chats.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            Ok(chats)
+        }
+    }
+
+    pub async fn load_chat(&self, id: &str) -> Result<Option<worktable_db::StoredChat>, String> {
+        if self.runtime.is_some() {
+            let id = id.to_owned();
+            self.run_on_tokio(move |runtime| async move { runtime.load_chat(&id) })
+                .await
+        } else {
+            Ok(self.memory_chats.lock().await.get(id).cloned())
+        }
+    }
+
+    pub async fn save_chat(&self, chat: worktable_db::StoredChat) -> EmptyResult {
+        if self.runtime.is_some() {
+            self.run_on_tokio(move |runtime| async move { runtime.save_chat(&chat) })
+                .await
+        } else {
+            let mut chats = self.memory_chats.lock().await;
+            if chats
+                .get(&chat.summary.id)
+                .is_none_or(|existing| chat.summary.revision >= existing.summary.revision)
+            {
+                chats.insert(chat.summary.id.clone(), chat);
+            }
+            Ok(())
+        }
     }
 
     /// Submit a prompt to the AI worker and return the run info.

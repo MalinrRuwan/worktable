@@ -1,4 +1,4 @@
-//! The AI assistant pane: a chat interface backed by the embedded Pi agent.
+//! The AI assistant pane: conversation transcripts and message presentation.
 
 use std::rc::Rc;
 
@@ -10,19 +10,21 @@ use gpui::{
 use gpui_component::text::TextView;
 use gpui_component::theme::Theme;
 use gpui_component::{Icon, IconName, h_flex, v_flex};
+use serde::{Deserialize, Serialize};
 use worktable_ui::citations::CitationOpenHandler;
 use worktable_ui::{
     CitationColors, CitationRef, CitationSegment, InlineCitations, StreamingText, ThinkingState,
     parse_citations,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub text: String,
@@ -30,14 +32,63 @@ pub struct ChatMessage {
     /// Rendered as a muted, collapsible block above `text`. Empty if the model
     /// did not emit thinking.
     pub thinking: String,
+    #[serde(skip)]
     pub streaming: bool,
     /// Sources for `[n]` markers in `text`, rendered as inline citation
     /// chips and a source footer.
+    #[serde(default, with = "saved_citations")]
     pub citations: Vec<CitationRef>,
     /// Whether the thinking block is collapsed to its header. The run clears
     /// this when the answer completes so long reasoning does not dominate the
     /// transcript; the header stays clickable.
+    #[serde(skip)]
     pub thinking_collapsed: bool,
+}
+
+/// Persist citations without making the theme-agnostic UI crate depend on serde.
+mod saved_citations {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    struct SavedCitation {
+        n: u32,
+        label: String,
+        snippet: String,
+        host: String,
+        url: String,
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        citations: &[CitationRef],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        citations
+            .iter()
+            .map(|citation| SavedCitation {
+                n: citation.n,
+                label: citation.label.to_string(),
+                snippet: citation.snippet.to_string(),
+                host: citation.host.to_string(),
+                url: citation.url.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<CitationRef>, D::Error> {
+        Ok(Vec::<SavedCitation>::deserialize(deserializer)?
+            .into_iter()
+            .map(|citation| CitationRef {
+                n: citation.n,
+                label: citation.label.into(),
+                snippet: citation.snippet.into(),
+                host: citation.host.into(),
+                url: citation.url.into(),
+            })
+            .collect())
+    }
 }
 
 /// How long reasoning may get before the block switches to a fixed-height

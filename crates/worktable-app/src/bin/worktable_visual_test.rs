@@ -457,6 +457,48 @@ fn run_visual_tests() -> anyhow::Result<()> {
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
     capture(&mut cx, handle, "worktable_assistant")?;
 
+    println!("— step 4b: saved chats rise from the bottom —");
+    // Hermetic transcripts: visual tests never need to call a provider.
+    let store = worktable_db::SqliteStore::connect(&db)?;
+    let now = service::unix_time_ms();
+    for (ix, title) in [
+        "Summarize my notes from this week",
+        "Find the repositories I saved about Rust",
+        "Ideas for the weekend project",
+    ]
+    .iter()
+    .enumerate()
+    {
+        store.save_chat(&worktable_db::StoredChat::new(
+            worktable_db::ChatSummary::new(
+                format!("visual-chat-{ix}"),
+                *title,
+                now - ix as i64 * 60_000,
+                1,
+            ),
+            serde_json::to_string(&vec![
+                assistant::ChatMessage::user(*title),
+                assistant::ChatMessage::assistant("Here is a summary of your saved notes."),
+            ])?,
+        ))?;
+    }
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| this.open_chats(window, cx));
+    })?;
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_chats")?;
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    });
+    capture(&mut cx, handle, "worktable_chats_dark")?;
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| this.open_chats(window, cx));
+    })?;
+    cx.run_until_parked();
+
     println!("— step 5: ⌘1 back to entries, page toggle → assistant —");
     cx.update_window(handle, |_, window, cx| {
         let fh = view.read(cx).focus_handle.clone();

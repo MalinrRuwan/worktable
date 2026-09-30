@@ -15,6 +15,9 @@ pub const LOGO_PATH: &str = "worktable-logo.png";
 /// Asset path of the Lucide `sparkles` glyph used by the Entries|Agent toggle.
 pub const SPARKLES_PATH: &str = "worktable-sparkles.svg";
 
+/// Lucide-style conversation glyph for the saved chat picker.
+pub const CHATS_PATH: &str = "worktable-chats.svg";
+
 /// The app's asset source.
 pub struct AppAssets;
 
@@ -27,6 +30,9 @@ impl AssetSource for AppAssets {
             return Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/sparkles.svg"
             ))));
+        }
+        if path == CHATS_PATH {
+            return Ok(Some(Cow::Borrowed(include_bytes!("../assets/chats.svg"))));
         }
         gpui_component_assets::Assets.load(path)
     }

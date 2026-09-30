@@ -62,6 +62,12 @@ pub const ONBOARDING_CARD_WIDTH: Rems = rems(34.0);
 /// inside it (with `TextView::scrollable`).
 pub const THINKING_MAX_HEIGHT: Rems = rems(10.0);
 
+/// The chat picker rises from the bottom edge, capped to the window at render.
+pub const CHATS_SHEET_HEIGHT: Rems = rems(26.0);
+
+/// Two lines per saved-chat row: title and last activity.
+pub const CHAT_ROW_HEIGHT: Rems = rems(4.0);
+
 /// Entries ⇄ Agent page offset — transitions.dev's `--page-slide-distance`
 /// (8px). The outgoing page exits toward it, the incoming page enters from it.
 pub const PAGE_SLIDE_DISTANCE: Rems = rems(0.5);
