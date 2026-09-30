@@ -39,8 +39,8 @@ use worktable_events::{
 };
 use worktable_ui::citations::CitationOpenHandler;
 use worktable_ui::{
-    CircleAction, CitationRef, Orb, OrbVariant, TEXT_DOTS, fade_in, fade_quick, hover_blend,
-    hover_fades_active, hover_listener, pulse_delta, splash_out,
+    CircleAction, CitationRef, Orb, OrbVariant, TEXT_DOTS, fade_in, fade_quick, pulse_delta,
+    splash_out,
 };
 
 use crate::assistant::{
@@ -2927,9 +2927,6 @@ impl Focusable for WorktableView {
 
 impl Render for WorktableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if hover_fades_active() {
-            window.refresh();
-        }
         if let Some(start) = self.splash_start
             && start.elapsed() > Duration::from_millis(650)
         {
@@ -3861,11 +3858,18 @@ fn render_library_header(
         }
     };
     let width = full + (circle - full) * progress;
+    // The slot dissolves between its two states instead of swapping at one
+    // instant: the field fades out over the first half of the morph (while it
+    // is still shrinking), the circle fades in over the second. Each side is
+    // invisible at the hand-off, so nothing pops.
     let show_input = progress < 0.5;
+    let field_opacity = (1.0 - progress * 2.0).clamp(0.0, 1.0);
+    let circle_opacity = (progress * 2.0 - 1.0).clamp(0.0, 1.0);
     let slot: gpui::AnyElement = if show_input {
         div()
             .w(width)
             .min_w_0()
+            .opacity(field_opacity)
             .debug_selector(|| "library-search-input".into())
             .child(
                 Input::new(&this.search_input)
@@ -3886,11 +3890,19 @@ fn render_library_header(
         div()
             .w(width)
             .min_w_0()
+            .opacity(circle_opacity)
             .debug_selector(|| "agent-search-slot".into())
             .child(
                 CircleAction::new("agent-search")
                     .secondary()
-                    .icon(app_icon(IconName::Search))
+                    // Same glyph and colour as the field's prefix icon: the
+                    // field collapses into its own search icon, so the swap
+                    // must not change the glyph's tone.
+                    .icon(
+                        Icon::new(IconName::Search)
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    )
                     .tooltip("Search entries")
                     .debug_selector("agent-search-button")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -5371,7 +5383,9 @@ async fn run_blocking<T: Send + 'static>(
     rx.await.map_err(|error| error.to_string())
 }
 
-/// Report a knowledge-build failure through the shared status line.
+/// Report a knowledge-build failure. Progress lives on the button's orb, so
+/// the only text a failed pass owes the user is the failure itself — it lands
+/// in the transcript with the rest of the run feedback.
 fn report_knowledge_status(
     view: gpui::WeakEntity<WorktableView>,
     cx: &mut gpui::AsyncApp,
@@ -5379,7 +5393,15 @@ fn report_knowledge_status(
 ) {
     let _ = view.update(cx, |this, cx| {
         this.knowledge_building = false;
-        this.knowledge_status = Some(status);
+        this.knowledge_status = Some(status.clone());
+        if !this
+            .messages
+            .iter()
+            .any(|message| message.text.contains(&status))
+        {
+            this.messages
+                .push(ChatMessage::assistant(format!("⚠ {status}")));
+        }
         cx.notify();
     });
 }
@@ -5800,18 +5822,12 @@ fn render_entry_card(
         card
     };
 
-    let hover_key = format!("entry-hover:{}", entry.id);
-    let card = card
-        .on_hover(hover_listener(hover_key.clone()))
-        .bg(hover_blend(
-            &hover_key,
-            if is_selected {
-                *theme.tokens.list_active
-            } else {
-                theme.popover
-            },
-            *theme.tokens.list_hover,
-        ));
+    // Hover is a paint-time style, not a colour captured when the card was
+    // built: GPUI resolves it from the live hit test on every paint, so the
+    // tint cannot lag the pointer, stick to a card the pointer already left,
+    // or depend on how many frames a row happens to be rebuilt in.
+    let hover_background = *theme.tokens.list_hover;
+    let card = card.hover(move |style| style.bg(hover_background));
 
     // Right-click selects the row (if not already selected); the menu offers
     // copy / open-link / delete like before.
@@ -6452,29 +6468,6 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
         button
     };
 
-    let knowledge_status: gpui::AnyElement =
-        if this.knowledge_building || this.knowledge_status.is_some() {
-            let mut row = h_flex()
-                .id("knowledge-status")
-                .debug_selector(|| "knowledge-status".into())
-                .gap_2()
-                .items_center();
-            if let Some(status) = this.knowledge_status.as_deref() {
-                row = row.child(
-                    div()
-                        .id("knowledge-status-text")
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .role(Role::Status)
-                        .aria_label(status.to_owned())
-                        .child(status.to_owned()),
-                );
-            }
-            row.into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
     v_flex()
         .flex_1()
         .min_h_0()
@@ -6583,8 +6576,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                                     ),
                             ),
                     )
-                })
-                .child(knowledge_status),
+                }),
         )
         .into_any_element()
 }

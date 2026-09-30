@@ -14,6 +14,7 @@
 //! Components are theme-agnostic: the caller passes [`CitationColors`] and a
 //! radius from the active theme.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use gpui::{
@@ -135,6 +136,10 @@ pub struct InlineCitations {
     mono_font: Option<SharedString>,
     open: Option<CitationOpenHandler>,
     style: StyleRefinement,
+    /// Markers emitted so far in this render. A sentence can cite the same
+    /// source twice (`[1] … [1]`), and two elements sharing one id also share
+    /// their tooltip state — the second marker would then show no preview.
+    marker_seq: Cell<usize>,
 }
 
 impl InlineCitations {
@@ -159,6 +164,7 @@ impl InlineCitations {
             mono_font: None,
             open: None,
             style: StyleRefinement::default(),
+            marker_seq: Cell::new(0),
         }
     }
 
@@ -194,10 +200,18 @@ impl InlineCitations {
             let space_after = atoms
                 .get(index + 1)
                 .is_some_and(|next| needs_space(atom, next));
+            // Adjacent markers read as one cluster: the later chip tucks under
+            // the earlier one instead of sitting a gap apart.
+            let grouped = matches!(atom, Inline::Marker(_))
+                && index > 0
+                && matches!(atoms.get(index - 1), Some(Inline::Marker(_)));
             let element: gpui::AnyElement = match atom {
-                Inline::Marker(n) => self
-                    .chip("cite", *n, self.reference(*n), true)
-                    .into_any_element(),
+                Inline::Marker(n) => {
+                    let occurrence = self.marker_seq.get();
+                    self.marker_seq.set(occurrence + 1);
+                    self.chip("cite", *n, occurrence, self.reference(*n), true, grouped)
+                        .into_any_element()
+                }
                 Inline::Text(span) => {
                     let mut text = div().min_w_0().child(span.text.clone());
                     if span.bold {
@@ -327,11 +341,21 @@ impl InlineCitations {
         &self,
         suffix: &str,
         n: u32,
+        occurrence: usize,
         reference: Option<CitationRef>,
         superscript: bool,
+        grouped: bool,
     ) -> impl IntoElement {
         let colors = self.colors;
-        let selector = format!("{}-{suffix}-{n}", self.id);
+        // Only the first mention of a source keeps the plain selector, so an
+        // answer that never repeats a marker has the same element ids as
+        // before; repeats get their own identity (and therefore their own
+        // tooltip) from the occurrence counter.
+        let selector = if occurrence == 0 {
+            format!("{}-{suffix}-{n}", self.id)
+        } else {
+            format!("{}-{suffix}-{n}-{occurrence}", self.id)
+        };
         let mut chip = div()
             .id(ElementId::Name(selector.clone().into()))
             .debug_selector(move || selector)
@@ -347,9 +371,21 @@ impl InlineCitations {
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .line_height(rems(0.5625))
             .child(n.to_string());
+        if grouped {
+            // Overlap the previous chip by a hair; the ring keeps the two
+            // readable as separate chips where they meet.
+            chip = chip
+                .ml(rems(-0.125))
+                .border_1()
+                .border_color(colors.background)
+                .relative()
+                .top(rems(0.0625));
+        }
         if superscript {
             // The reference raises the marker like a superscript.
-            chip = chip.relative().top(rems(-0.25));
+            chip = chip
+                .relative()
+                .top(rems(if grouped { -0.1875 } else { -0.25 }));
         }
         let Some(reference) = reference else {
             return chip;
@@ -422,7 +458,7 @@ impl InlineCitations {
                     None => cx.open_url(&url),
                 }
             })
-            .child(self.chip("ref", reference.n, None, false))
+            .child(self.chip("ref", reference.n, 0, None, false, false))
             .child(
                 div()
                     .min_w_0()
@@ -662,11 +698,17 @@ struct CitationTooltip {
 
 impl Render for CitationTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // A preview is a hint, not the source: every line is clamped to the
+        // tooltip's measure, so a long label, an unbreakable URL, or a wall of
+        // snippet text can never paint outside the card (or grow it to the
+        // window width).
         let mut card = div()
             .flex()
             .flex_col()
             .gap_1()
             .max_w(rems(16.0))
+            .min_w_0()
+            .overflow_hidden()
             .px_2()
             .py_1p5()
             .rounded(self.radius)
@@ -677,21 +719,27 @@ impl Render for CitationTooltip {
             .text_xs()
             .child(
                 div()
+                    .min_w_0()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .line_clamp(2)
                     .child(self.label.clone()),
             );
         if !self.snippet.is_empty() {
             card = card.child(
                 div()
+                    .min_w_0()
                     .text_color(self.colors.muted)
+                    .line_clamp(4)
                     .child(self.snippet.clone()),
             );
         }
         if !self.host.is_empty() {
             card = card.child(
                 div()
+                    .min_w_0()
                     .text_color(self.colors.muted)
                     .opacity(0.8)
+                    .line_clamp(1)
                     .child(self.host.clone()),
             );
         }
