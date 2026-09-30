@@ -1431,7 +1431,9 @@ mod tests {
                 )
                 .unwrap();
             connection
-                .execute_batch("CREATE TABLE wt_ai_chats (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+                .execute_batch(
+                    "CREATE TABLE wt_ai_chats (id TEXT PRIMARY KEY, title TEXT NOT NULL)",
+                )
                 .unwrap();
         }
 

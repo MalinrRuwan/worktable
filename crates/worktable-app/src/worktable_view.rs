@@ -5719,6 +5719,10 @@ fn render_entry_card(
     });
     let card = h_flex()
         .id(format!("entry:{}", entry.id))
+        .debug_selector({
+            let selector = format!("entry:{}", entry.id);
+            move || selector.clone()
+        })
         .role(Role::ListItem)
         .aria_label(card_label)
         .aria_selected(is_selected)
