@@ -141,6 +141,50 @@ pub(crate) struct EntryModalState {
     pub(crate) origin: Bounds<Pixels>,
     pub(crate) opened_at: Instant,
     pub(crate) closing_at: Option<Instant>,
+    /// Everything the panel needs from the entry, prepared once when it opens.
+    /// A multi-megabyte note must not be re-cloned, re-scanned for action
+    /// chips, or re-joined for Copy on every frame of the morph and every
+    /// scroll tick — that per-frame work is what made big previews stutter.
+    pub(crate) content: SharedString,
+    pub(crate) copy_text: SharedString,
+    pub(crate) title: Option<SharedString>,
+    pub(crate) source: SharedString,
+    pub(crate) created_at: i64,
+    pub(crate) actions: Vec<crate::entry_actions::EntryAction>,
+}
+
+impl EntryModalState {
+    /// Snapshot one entry for the detail panel (`None` while it is missing).
+    fn open(entry: &WorktableEntry, origin: Bounds<Pixels>, now: Instant) -> Self {
+        let content: SharedString = entry.content.as_str().into();
+        let copy_text: SharedString = match entry.title.as_deref() {
+            Some(title) => format!("{title}\n{}", entry.content).into(),
+            None => content.clone(),
+        };
+        Self {
+            entry_id: entry.id.clone(),
+            origin,
+            opened_at: now,
+            closing_at: None,
+            content,
+            copy_text,
+            title: entry.title.clone().map(SharedString::from),
+            source: entry.source.as_str().into(),
+            created_at: entry.created_at,
+            actions: crate::entry_actions::detect_actions(&entry.content),
+        }
+    }
+
+    /// Re-snapshot the stored text after the editor saves.
+    fn update_content(&mut self, entry: &WorktableEntry) {
+        let content: SharedString = entry.content.as_str().into();
+        self.copy_text = match entry.title.as_deref() {
+            Some(title) => format!("{title}\n{}", entry.content).into(),
+            None => content.clone(),
+        };
+        self.content = content;
+        self.actions = crate::entry_actions::detect_actions(&entry.content);
+    }
 }
 
 /// Fixed heights for the virtualized lists live in [`crate::design`] as rems
@@ -1694,12 +1738,17 @@ impl WorktableView {
         }
         self.entry_editing = false;
         self.entry_edit_status = None;
-        self.entry_modal = Some(EntryModalState {
-            entry_id: id.to_owned(),
-            origin,
-            opened_at: Instant::now(),
-            closing_at: None,
-        });
+        let snapshot = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| {
+                EntryModalState::open(entry, origin, Instant::now())
+            });
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        self.entry_modal = Some(snapshot);
         cx.notify();
     }
 
@@ -1768,6 +1817,10 @@ impl WorktableView {
                             this.entries.iter_mut().find(|entry| entry.id == saved.id)
                         {
                             *entry = saved.clone();
+                        }
+                        // The open panel renders the snapshot, not the list.
+                        if let Some(modal) = this.entry_modal.as_mut() {
+                            modal.update_content(&saved);
                         }
                         // The graph topic for this entry is stale; let the
                         // local extraction (or the next build) take over.
@@ -3506,11 +3559,15 @@ fn render_entry_modal(
     cx: &mut Context<WorktableView>,
 ) -> Option<gpui::AnyElement> {
     let modal = this.entry_modal.as_ref()?;
-    let entry = this
+    // The panel renders from the snapshot taken when it opened; looking the
+    // entry up again (and cloning it) would copy the whole text every frame.
+    if !this
         .entries
         .iter()
-        .find(|entry| entry.id == modal.entry_id)?
-        .clone();
+        .any(|entry| entry.id == modal.entry_id)
+    {
+        return None;
+    }
     let theme = cx.theme().clone();
     let viewport = window.viewport_size();
     let pane_w = design::content_column_width(window);
@@ -3565,16 +3622,12 @@ fn render_entry_modal(
 
     let meta = format!(
         "{} · {}",
-        entry.source,
-        crate::format::relative_time(entry.created_at)
+        modal.source,
+        crate::format::relative_time(modal.created_at)
     );
     let close_view = cx.entity();
-    let copy_text = entry
-        .title
-        .as_deref()
-        .map(|title| format!("{title}\n{}", entry.content))
-        .unwrap_or_else(|| entry.content.clone());
-    let actions = crate::entry_actions::detect_actions(&entry.content);
+    let copy_text = modal.copy_text.clone();
+    let actions = modal.actions.clone();
     let editing = this.entry_editing;
 
     // Header: metadata + close.
@@ -3610,7 +3663,7 @@ fn render_entry_modal(
         );
 
     let mut body = v_flex().size_full().min_h_0().child(header);
-    if let Some(title) = entry.title.clone() {
+    if let Some(title) = modal.title.clone() {
         // The title is selectable text (copyable via selection) like the body.
         // `TextView`'s root is height-100%, so it lives in a fixed one-line
         // wrapper; an unconstrained child would take the whole panel. The
@@ -3626,7 +3679,7 @@ fn render_entry_modal(
                     .debug_selector(|| "entry-modal-title".into())
                     .child(
                         TextView::markdown(
-                            SharedString::from(format!("entry-modal-title:{}", entry.id)),
+                            SharedString::from(format!("entry-modal-title:{}", modal.entry_id)),
                             title,
                         )
                         .selectable(true),
@@ -3649,7 +3702,7 @@ fn render_entry_modal(
                         .bordered(true),
                 ),
         );
-    } else if let Some(source) = image_source_for(&entry.content) {
+    } else if let Some(source) = image_source_for(modal.content.as_ref()) {
         body = body.child(
             div()
                 .flex_1()
@@ -3658,7 +3711,7 @@ fn render_entry_modal(
                 .debug_selector(|| "entry-modal-image".into())
                 .child(render_entry_image(
                     source,
-                    entry.content.clone(),
+                    modal.content.to_string(),
                     &theme,
                     cx,
                 )),
@@ -3678,8 +3731,8 @@ fn render_entry_modal(
                 .debug_selector(|| "entry-modal-scroll".into())
                 .child(
                     TextView::markdown(
-                        SharedString::from(format!("entry-modal-body:{}", entry.id)),
-                        entry.content.clone(),
+                        SharedString::from(format!("entry-modal-body:{}", modal.entry_id)),
+                        modal.content.clone(),
                     )
                     .selectable(true)
                     .scrollable(true),
@@ -3700,7 +3753,7 @@ fn render_entry_modal(
             "Copy",
             Some(IconName::Copy),
             move |_window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()));
             },
         ))
         .children(actions.into_iter().map(|action| match action {

@@ -1,6 +1,6 @@
 [package]
 name = "worktable-helix"
-version = "0.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "HelixDB parallel knowledge base for Worktable — graph store mirroring SQLite entries for AI semantic search"
 license = "MIT"
