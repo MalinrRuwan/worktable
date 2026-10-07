@@ -3794,6 +3794,10 @@ fn chats_rows_load_from_the_keyboard(cx: &mut TestAppContext) {
         .read_entity(&view, |v, _| v.chat_id.as_deref()
             == Some("recent"))));
     settle_strip(&mut cx);
+    // The sheet unmounts on the close span's timer.
+    cx.background_executor
+        .advance_clock(worktable_ui::MODAL_CLOSE.total());
+    cx.run_until_parked();
     force_frame(&mut cx);
     assert!(cx.debug_bounds("chats-sheet").is_none());
     assert_eq!(cx.read_entity(&view, |v, _| v.messages.len()), 2);

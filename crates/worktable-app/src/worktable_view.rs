@@ -27,7 +27,7 @@ use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::switch::Switch;
 use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Selectable, Sizable,
     VirtualListScrollHandle, WindowExt as _, h_flex, v_flex, v_virtual_list,
 };
 
@@ -159,7 +159,7 @@ impl EntryModalState {
         let content: SharedString = entry.content.as_str().into();
         let copy_text: SharedString = match entry.title.as_deref() {
             Some(title) => format!("{title}\n{}", entry.content).into(),
-            None => content.clone(),
+            None => entry.content.as_str().into(),
         };
         Self {
             entry_id: entry.id.clone(),
@@ -177,12 +177,11 @@ impl EntryModalState {
 
     /// Re-snapshot the stored text after the editor saves.
     fn update_content(&mut self, entry: &WorktableEntry) {
-        let content: SharedString = entry.content.as_str().into();
         self.copy_text = match entry.title.as_deref() {
             Some(title) => format!("{title}\n{}", entry.content).into(),
-            None => content.clone(),
+            None => entry.content.as_str().into(),
         };
-        self.content = content;
+        self.content = entry.content.as_str().into();
         self.actions = crate::entry_actions::detect_actions(&entry.content);
     }
 }
@@ -1742,9 +1741,7 @@ impl WorktableView {
             .entries
             .iter()
             .find(|entry| entry.id == id)
-            .map(|entry| {
-                EntryModalState::open(entry, origin, Instant::now())
-            });
+            .map(|entry| EntryModalState::open(entry, origin, Instant::now()));
         let Some(snapshot) = snapshot else {
             return;
         };
@@ -3157,9 +3154,26 @@ fn render_main(
 
     let body: gpui::AnyElement = match this.mode {
         AppMode::Entries | AppMode::Assistant => {
-            // Build both panes sequentially (separate mutable borrows).
-            let entries_pane = render_entries_pane(this, window, cx).into_any_element();
-            let assistant_pane = render_assistant(this, cx).into_any_element();
+            // Build only the page on screen (plus the outgoing one while the
+            // slide is still running). The hidden page would otherwise rebuild
+            // its whole tree every frame — for a long transcript that alone
+            // costs more than a frame budget and makes anything else on screen,
+            // including the entry detail panel, stutter.
+            let is_assistant = this.mode == AppMode::Assistant;
+            let sliding = this
+                .page_anim_at
+                .is_some_and(|started| started.elapsed() < worktable_ui::PAGE_SLIDE.total());
+            let placeholder = || div().into_any_element();
+            let entries_pane = if !is_assistant || sliding {
+                render_entries_pane(this, window, cx).into_any_element()
+            } else {
+                placeholder()
+            };
+            let assistant_pane = if is_assistant || sliding {
+                render_assistant(this, cx).into_any_element()
+            } else {
+                placeholder()
+            };
             v_flex()
                 .id("slide-shell")
                 .flex_1()
@@ -3221,9 +3235,8 @@ fn render_main(
         // covers it, and dialogs stack above everything.
         .children(render_entry_modal(this, window, cx))
         .children(render_onboarding(this, window, cx))
-        // Modal dialogs live in the window's dialog layer, which must be
-        // rendered by the view tree; Root only stores the active dialog.
-        .children(Root::render_dialog_layer(window, cx))
+    // Dialogs, sheets, and notifications are Root's own layers now (0.7):
+    // it renders them above the app content and no manual mount is needed.
 }
 
 /// The morphing entry view: the panel's rect tweens from the trigger's rect
@@ -3561,11 +3574,7 @@ fn render_entry_modal(
     let modal = this.entry_modal.as_ref()?;
     // The panel renders from the snapshot taken when it opened; looking the
     // entry up again (and cloning it) would copy the whole text every frame.
-    if !this
-        .entries
-        .iter()
-        .any(|entry| entry.id == modal.entry_id)
-    {
+    if !this.entries.iter().any(|entry| entry.id == modal.entry_id) {
         return None;
     }
     let theme = cx.theme().clone();

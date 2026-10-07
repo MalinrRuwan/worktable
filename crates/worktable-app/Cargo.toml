@@ -23,7 +23,7 @@ tokio.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
-gpui-component-assets.workspace = true
+gpui-kit-assets.workspace = true
 worktable-ai = { path = "../worktable-ai" }
 worktable-db = { path = "../worktable-db" }
 worktable-events = { path = "../worktable-events" }

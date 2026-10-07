@@ -1,7 +1,7 @@
 //! Application asset source: the Worktable brand logo layered over the
 //! component library's icons and fonts.
 //!
-//! `gpui_component_assets::Assets` stays authoritative for component assets;
+//! `gpui_kit_assets::Assets` stays authoritative for component assets;
 //! this wrapper only answers for the brand paths so `img(LOGO_PATH)` works
 //! anywhere in the app (and in the visual runner, which uses the same source).
 
@@ -34,10 +34,10 @@ impl AssetSource for AppAssets {
         if path == CHATS_PATH {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/chats.svg"))));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_kit_assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        gpui_component_assets::Assets.list(path)
+        gpui_kit_assets::Assets.list(path)
     }
 }

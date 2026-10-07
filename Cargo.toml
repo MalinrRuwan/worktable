@@ -18,10 +18,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # every Zed dependency to a single commit, which the committed Cargo.lock pins
 # for reproducibility. Pinning a workspace `rev` here would instead produce two
 # incompatible `gpui` crates in the same graph.
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b1e78a515716b232a7d731cc092bdc25f3bfd787" }
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit", "runtime_shaders"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "c0bebdc8a8cf9a74f9f52feaca278a52a9cfcca2" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-component", rev = "c0bebdc8a8cf9a74f9f52feaca278a52a9cfcca2" }
 
 # Debug builds are what developers run every day: optimize every dependency
 # (GPUI's layout/render path in particular) while keeping the workspace crates
