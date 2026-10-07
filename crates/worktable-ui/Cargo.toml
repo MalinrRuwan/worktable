@@ -1,6 +1,6 @@
 [package]
 name = "worktable-ui"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 description = "Worktable UI kit — motion catalog and interaction helpers over gpui"
 license = "MIT"

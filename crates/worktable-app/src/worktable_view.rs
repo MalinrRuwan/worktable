@@ -3925,8 +3925,10 @@ fn render_library_header(
     // is still shrinking), the circle fades in over the second. Each side is
     // invisible at the hand-off, so nothing pops.
     let show_input = progress < 0.5;
-    let field_opacity = (1.0 - progress * 2.0).clamp(0.0, 1.0);
-    let circle_opacity = (progress * 2.0 - 1.0).clamp(0.0, 1.0);
+    // The windows overlap: the field is still fading while the circle starts
+    // to appear, so the slot never shows a blank beat between the two.
+    let field_opacity = (1.0 - progress * 1.7).clamp(0.0, 1.0);
+    let circle_opacity = (progress * 1.7 - 0.7).clamp(0.0, 1.0);
     let slot: gpui::AnyElement = if show_input {
         div()
             .w(width)
@@ -4289,52 +4291,64 @@ fn render_settings(
         .gap_5()
         .p_4()
         .child(
-            v_flex()
-                .gap_2()
-                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Theme"))
+            // Label and control on one line, like every other settings row:
+            // the control is the label's control, not a block under it.
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_4()
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Light, dark, or follow the system appearance"),
+                    v_flex()
+                        // The label column gives way, so the control keeps its
+                        // place at the row's trailing edge instead of being
+                        // pushed past the window.
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Theme"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Light, dark, or follow the system appearance"),
+                        ),
                 )
                 .child(
-                    h_flex().w_full().justify_end().child(
-                        ButtonGroup::new("theme-mode-group")
-                            .compact()
-                            .outline()
-                            .child(
-                                Button::new("theme-light")
-                                    .icon(app_icon(IconName::Sun))
-                                    .tooltip("Light")
-                                    .debug_selector(|| "theme-light".into())
-                                    .selected(is_light),
-                            )
-                            .child(
-                                Button::new("theme-dark")
-                                    .icon(app_icon(IconName::Moon))
-                                    .tooltip("Dark")
-                                    .debug_selector(|| "theme-dark".into())
-                                    .selected(is_dark),
-                            )
-                            .child(
-                                Button::new("theme-system")
-                                    .icon(app_icon(IconName::Cpu))
-                                    .tooltip("System")
-                                    .debug_selector(|| "theme-system".into())
-                                    .selected(is_system),
-                            )
-                            .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
-                                let mode = match selected.first() {
-                                    Some(0) => AppThemeMode::Light,
-                                    Some(1) => AppThemeMode::Dark,
-                                    _ => AppThemeMode::System,
-                                };
-                                if mode != this.theme_mode {
-                                    this.set_theme_mode(mode, window, cx);
-                                }
-                            })),
-                    ),
+                    ButtonGroup::new("theme-mode-group")
+                        .compact()
+                        .outline()
+                        .child(
+                            Button::new("theme-light")
+                                .icon(app_icon(IconName::Sun))
+                                .tooltip("Light")
+                                .debug_selector(|| "theme-light".into())
+                                .selected(is_light),
+                        )
+                        .child(
+                            Button::new("theme-dark")
+                                .icon(app_icon(IconName::Moon))
+                                .tooltip("Dark")
+                                .debug_selector(|| "theme-dark".into())
+                                .selected(is_dark),
+                        )
+                        .child(
+                            Button::new("theme-system")
+                                .icon(app_icon(IconName::Cpu))
+                                .tooltip("System")
+                                .debug_selector(|| "theme-system".into())
+                                .selected(is_system),
+                        )
+                        .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
+                            let mode = match selected.first() {
+                                Some(0) => AppThemeMode::Light,
+                                Some(1) => AppThemeMode::Dark,
+                                _ => AppThemeMode::System,
+                            };
+                            if mode != this.theme_mode {
+                                this.set_theme_mode(mode, window, cx);
+                            }
+                        })),
                 ),
         )
         .child(
@@ -6218,7 +6232,10 @@ fn render_chats_sheet(
                                     .selected(active)
                                     .disabled(!allowed)
                                     .w_full()
-                                    .h_full()
+                                    // A control height inside the taller row:
+                                    // a ghost hover filling the whole row reads
+                                    // as a slab, not as a control.
+                                    .h(rems(2.5))
                                     .justify_start()
                                     .overflow_hidden()
                                     .tooltip(chat.title.clone())
@@ -6517,15 +6534,33 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
             })
             .debug_selector("build-knowledge")
             .on_click(cx.listener(|this, _, _, cx| this.build_knowledge(cx)));
+        // Both states occupy the same box, so starting a build cannot shift
+        // the row, and both are tinted with the same theme role: the globe
+        // used to swap in for a foreground-coloured glyph and read as a
+        // different colour for the same button.
         if this.knowledge_building {
             button = button.child(
-                Orb::new("knowledge-building", OrbVariant::G2)
-                    .view(cx.entity_id())
+                div()
                     .size(rems(1.5))
-                    .color(theme.primary),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Orb::new("knowledge-building", OrbVariant::G2)
+                            .view(cx.entity_id())
+                            .size(rems(1.5))
+                            .color(theme.primary),
+                    ),
             );
         } else {
-            button = button.icon(app_icon(IconName::HardDrive));
+            button = button.child(
+                div()
+                    .size(rems(1.5))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(app_icon(IconName::HardDrive).text_color(theme.primary)),
+            );
         }
         button
     };

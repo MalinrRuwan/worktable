@@ -373,19 +373,16 @@ impl InlineCitations {
             .child(n.to_string());
         if grouped {
             // Overlap the previous chip by a hair; the ring keeps the two
-            // readable as separate chips where they meet.
+            // readable as separate chips where they meet. No vertical offset:
+            // a cluster must stay on the text's baseline, never stepping down.
             chip = chip
                 .ml(rems(-0.125))
                 .border_1()
-                .border_color(colors.background)
-                .relative()
-                .top(rems(0.0625));
+                .border_color(colors.background);
         }
         if superscript {
             // The reference raises the marker like a superscript.
-            chip = chip
-                .relative()
-                .top(rems(if grouped { -0.1875 } else { -0.25 }));
+            chip = chip.relative().top(rems(-0.25));
         }
         let Some(reference) = reference else {
             return chip;
@@ -706,7 +703,8 @@ impl Render for CitationTooltip {
             .flex()
             .flex_col()
             .gap_1()
-            .max_w(rems(16.0))
+            .w(rems(16.0))
+            .max_w_full()
             .min_w_0()
             .overflow_hidden()
             .px_2()
