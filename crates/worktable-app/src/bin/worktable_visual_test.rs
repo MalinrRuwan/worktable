@@ -42,6 +42,8 @@ mod entry_actions;
 mod format;
 #[path = "../github.rs"]
 mod github;
+#[path = "../model_picker.rs"]
+mod model_picker;
 #[path = "../preferences.rs"]
 mod preferences;
 // The runner mirrors the app's modules but drives only the visual flow, so
@@ -154,41 +156,10 @@ fn seeded_db(entries: Vec<WorktableEntry>) -> String {
     path_str
 }
 
-/// Load `themes/ayu.json` into the component theme registry, mirroring
-/// `main::init_theme` but synchronously (the runner resolves the path relative
-/// to the manifest dir, not the process CWD).
+/// Use the same startup palette and focus treatment as the app.
 fn load_worktable_theme(cx: &mut gpui::App) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/ayu.json");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        eprintln!("visual test: themes/ayu.json not found, using default theme");
-        return;
-    };
-    if gpui_component::ThemeRegistry::global_mut(cx)
-        .load_themes_from_str(&contents)
-        .is_ok()
-    {
-        // Both variants: dark mode must use Ayu Dark, not the default dark
-        // palette (whose list selection is blue).
-        let light = gpui_component::ThemeRegistry::global(cx)
-            .themes()
-            .get("Ayu Light")
-            .cloned();
-        let dark = gpui_component::ThemeRegistry::global(cx)
-            .themes()
-            .get("Ayu Dark")
-            .cloned();
-        if let Some(light) = light {
-            gpui_component::Theme::global_mut(cx).apply_config(&light);
-        }
-        if let Some(dark) = dark {
-            gpui_component::Theme::global_mut(cx).apply_config(&dark);
-        }
-        let mode = gpui_component::Theme::global(cx).mode;
-        gpui_component::Theme::change(mode, None, cx);
-        // Same Tahoe radius scale as `main::init_theme`.
-        let t = gpui_component::Theme::global_mut(cx);
-        t.radius = px(10.);
-        t.radius_lg = px(14.);
+    if let Err(error) = design::load_theme(cx) {
+        eprintln!("visual test: failed to load the Worktable theme: {error}");
     }
 }
 
@@ -428,6 +399,7 @@ fn run_visual_tests() -> anyhow::Result<()> {
         });
     });
     cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_model_settings")?;
     let provider_id = cx.read_entity(&view, |v, _| v.providers.first().map(|p| p.id.clone()));
     if let Some(provider_id) = provider_id {
         cx.update_window(handle, |_, window, cx| {
@@ -443,6 +415,24 @@ fn run_visual_tests() -> anyhow::Result<()> {
             .ok();
         cx.run_until_parked();
     }
+
+    // Exercise the real combobox's keyboard path and catalog-owned Zen heading.
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.set_provider_group("opencode-go", "zen", true, cx);
+        });
+    });
+    capture(&mut cx, handle, "worktable_model_services_enabled")?;
+    cx.update_window(handle, |_, window, cx| {
+        let picker = view.read(cx).model_picker.clone();
+        picker.update(cx, |picker, cx| picker.focus(window, cx));
+    })?;
+    cx.simulate_keystrokes(handle, "down");
+    cx.run_until_parked();
+    cx.simulate_input(handle, "Zen");
+    capture(&mut cx, handle, "worktable_model_picker_zen")?;
+    cx.simulate_keystrokes(handle, "escape");
+    cx.run_until_parked();
 
     println!("— step 4: ⌘2 jumps to the assistant —");
     // Ensure the worktable view is focused so global keybindings resolve (Settings contains inputs).
@@ -728,7 +718,7 @@ fn run_visual_tests() -> anyhow::Result<()> {
                 ChatMessage {
                     role: assistant::Role::Assistant,
                     text: "## Findings\n\nTransformers **scale well** with data and \
-                           compute[1], though attention is *quadratic* in sequence length[2].\n\n\
+                           compute[1], though attention is *quadratic* in sequence length[2][12][12].\n\n\
                            - memory grows with `O(n²)`\n- long prompts need care"
                         .into(),
                     thinking: String::new(),
@@ -748,6 +738,15 @@ fn run_visual_tests() -> anyhow::Result<()> {
                             host: "arxiv.org".into(),
                             url: "https://arxiv.org/abs/2009.06732".into(),
                         },
+                        worktable_ui::CitationRef {
+                            n: 12,
+                            label: "A longer source title for the multi-digit marker".into(),
+                            snippet: "Source previews stay bounded even for a long passage. "
+                                .repeat(20)
+                                .into(),
+                            host: "library".into(),
+                            url: "worktable-entry:visual-1000".into(),
+                        },
                     ],
                     thinking_collapsed: false,
                 },
@@ -758,6 +757,25 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(300));
     capture(&mut cx, handle, "worktable_agent_citations")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.assistant_busy = true;
+            this.knowledge_building = true;
+            cx.notify();
+        });
+    });
+    capture(&mut cx, handle, "worktable_agent_controls_active")?;
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    });
+    capture(&mut cx, handle, "worktable_agent_controls_active_dark")?;
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+        view.update(cx, |this, cx| {
+            this.knowledge_building = false;
+            cx.notify();
+        });
+    });
 
     println!("— step 11e: markdown answer —");
     cx.update(|cx| {

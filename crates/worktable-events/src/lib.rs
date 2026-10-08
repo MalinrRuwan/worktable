@@ -23,6 +23,23 @@ use tokio::sync::broadcast;
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
+    /// Optional catalog-owned service heading, such as OpenCode Go or Zen.
+    /// Presentation metadata only: `id` remains the provider's dispatch id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// API-advertised protocol metadata; never inferred from a model's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+}
+
+/// A selectable subset of a provider's models. OpenCode, for example, offers
+/// its Go subscription catalog and its Zen pay-as-you-go catalog from one
+/// key; providers without model groups send an empty list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderGroup {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
 }
 
 /// A provider known to the Pi worker, with its auth capabilities and models.
@@ -34,7 +51,16 @@ pub struct ProviderInfo {
     pub supports_oauth: bool,
     pub api_key_set: bool,
     pub oauth_set: bool,
+    /// Model groups the user can enable or disable (empty for most providers).
+    #[serde(default)]
+    pub groups: Vec<ProviderGroup>,
+    /// The models this provider currently offers (already filtered by the
+    /// enabled groups).
     pub models: Vec<ModelInfo>,
+    #[serde(default)]
+    pub models_loading: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_error: Option<String>,
 }
 
 /// A snapshot of every provider (sent in response to `ListProviders`).
@@ -213,7 +239,30 @@ impl EventBus {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::{EventBus, WorktableEvent};
+    use super::{EventBus, ModelInfo, WorktableEvent};
+
+    #[test]
+    fn model_groups_are_optional_and_keep_dispatch_ids_intact() {
+        let old: ModelInfo =
+            serde_json::from_str(r#"{"id":"gpt-5-mini","name":"GPT-5 mini"}"#).unwrap();
+        assert!(old.group.is_none());
+        assert!(
+            !serde_json::to_value(&old)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("group")
+        );
+
+        let grouped: ModelInfo = serde_json::from_str(
+            r#"{"id":"gpt-5-mini","name":"GPT-5 mini","group":"OpenCode Zen"}"#,
+        )
+        .unwrap();
+        assert_eq!(grouped.id, old.id);
+        let restored: ModelInfo =
+            serde_json::from_str(&serde_json::to_string(&grouped).unwrap()).unwrap();
+        assert_eq!(restored.group.as_deref(), Some("OpenCode Zen"));
+    }
 
     #[tokio::test]
     async fn extensions_can_receive_typed_events() {

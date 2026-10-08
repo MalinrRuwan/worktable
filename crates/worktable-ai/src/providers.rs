@@ -1,91 +1,60 @@
-//! The AI provider catalog, backed by rig.
-//!
-//! With `pi_agent_rust` removed, Worktable no longer inherits a provider
-//! registry from the embedded agent. This module is the single owner of:
-//!
-//! - which providers the Settings UI offers and what they are called;
-//! - the model ids each provider serves (curated from the provider's own
-//!   catalog so the UI never offers an id the client cannot send);
-//! - the [`ProviderKind`] the runtime matches on to construct the right rig
-//!   client for a prompt.
-//!
-//! Worktable's own database remains the credential owner; rig's
-//! `ProviderClient::from_env` is only a fallback path.
+//! Provider identities and rig client families; models come from APIs/cache.
 
-use crate::opencode_go;
+use crate::{chatgpt, opencode};
 
-/// Which rig client family a provider uses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProviderKind {
-    /// The custom OpenCode Go provider (OpenAI-compatible Chat Completions).
-    OpenCodeGo,
-    /// OpenAI's Responses API.
+    OpenCode,
     OpenAi,
-    /// Anthropic's Messages API.
+    ChatGpt,
     Anthropic,
-    /// DeepSeek's OpenAI-compatible API.
     DeepSeek,
 }
 
-/// One provider entry: identity, client family, and model catalog.
+/// Provider identity and client family, independent of discovered models.
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub kind: ProviderKind,
-    /// `(model_id, display_name)` pairs, in catalog order.
-    pub models: &'static [(&'static str, &'static str)],
 }
 
-/// OpenAI's current models (curated; ids match rig's `openai` constants).
-const OPENAI_MODELS: &[(&str, &str)] = &[
-    ("gpt-5.6-luna", "GPT-5.6 Luna"),
-    ("gpt-5.6", "GPT-5.6"),
-    ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.2", "GPT-5.2"),
-    ("gpt-5-mini", "GPT-5 mini"),
-];
+impl ProviderSpec {
+    pub fn supports_api_key(&self) -> bool {
+        self.kind != ProviderKind::ChatGpt
+    }
 
-/// Anthropic's current Claude models.
-const ANTHROPIC_MODELS: &[(&str, &str)] = &[
-    ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
-    ("claude-opus-4-5", "Claude Opus 4.5"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5"),
-];
-
-/// DeepSeek's models (ids match rig's `deepseek` constants).
-const DEEPSEEK_MODELS: &[(&str, &str)] = &[
-    ("deepseek-v4-pro", "DeepSeek V4 Pro"),
-    ("deepseek-v4-flash", "DeepSeek V4 Flash"),
-    ("deepseek-reasoner", "DeepSeek Reasoner"),
-    ("deepseek-chat", "DeepSeek Chat"),
-];
+    pub fn supports_oauth(&self) -> bool {
+        self.kind == ProviderKind::ChatGpt
+    }
+}
 
 /// Every provider Worktable can prompt through, in Settings order.
 pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
-        id: opencode_go::ID,
-        name: opencode_go::NAME,
-        kind: ProviderKind::OpenCodeGo,
-        models: opencode_go::MODELS,
+        id: opencode::ID,
+        name: opencode::NAME,
+        kind: ProviderKind::OpenCode,
     },
     ProviderSpec {
         id: "openai",
         name: "OpenAI",
         kind: ProviderKind::OpenAi,
-        models: OPENAI_MODELS,
+    },
+    ProviderSpec {
+        id: chatgpt::ID,
+        name: chatgpt::NAME,
+        kind: ProviderKind::ChatGpt,
     },
     ProviderSpec {
         id: "anthropic",
         name: "Anthropic",
         kind: ProviderKind::Anthropic,
-        models: ANTHROPIC_MODELS,
     },
     ProviderSpec {
         id: "deepseek",
         name: "DeepSeek",
         kind: ProviderKind::DeepSeek,
-        models: DEEPSEEK_MODELS,
     },
 ];
 
@@ -94,49 +63,29 @@ pub fn spec(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|provider| provider.id == id)
 }
 
-/// Whether `model_id` belongs to `provider_id`'s catalog.
-pub fn model_known(provider_id: &str, model_id: &str) -> bool {
-    spec(provider_id).is_some_and(|provider| {
-        provider
-            .models
-            .iter()
-            .any(|(id, _)| id.eq_ignore_ascii_case(model_id))
-    })
-}
-
-/// The provider's first model id, used to auto-select after an API key is
-/// saved so a configured provider can immediately serve a prompt.
-pub fn first_model(provider_id: &str) -> Option<&'static str> {
-    spec(provider_id)?.models.first().map(|(id, _)| *id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn catalog_is_consistent_and_contains_opencode_go() {
-        assert!(
-            spec(opencode_go::ID).is_some(),
-            "opencode-go must be in the catalog"
-        );
+    fn provider_identities_are_unique_and_resolvable() {
+        let mut ids = std::collections::HashSet::new();
         for provider in PROVIDERS {
             assert!(!provider.id.is_empty());
             assert!(!provider.name.is_empty());
-            assert!(!provider.models.is_empty(), "{} has no models", provider.id);
-            let mut ids: Vec<&str> = provider.models.iter().map(|(id, _)| *id).collect();
-            let before = ids.len();
-            ids.sort_unstable();
-            ids.dedup();
-            assert_eq!(ids.len(), before, "{} has duplicate model ids", provider.id);
+            assert!(ids.insert(provider.id));
+            assert_eq!(spec(provider.id).unwrap().kind, provider.kind);
         }
+        assert_eq!(spec(opencode::ID).unwrap().kind, ProviderKind::OpenCode);
+        assert!(spec("missing-provider").is_none());
     }
 
     #[test]
-    fn model_lookup_is_case_insensitive() {
-        assert!(model_known("opencode-go", "GLM-5.3"));
-        assert!(!model_known("opencode-go", "not-a-model"));
-        assert!(!model_known("missing-provider", "glm-5.3"));
-        assert_eq!(first_model("opencode-go"), Some("glm-5.3"));
+    fn credential_capabilities_follow_the_client_family() {
+        for provider in PROVIDERS {
+            let subscription = provider.kind == ProviderKind::ChatGpt;
+            assert_eq!(provider.supports_oauth(), subscription);
+            assert_eq!(provider.supports_api_key(), !subscription);
+        }
     }
 }

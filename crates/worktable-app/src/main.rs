@@ -11,6 +11,7 @@ pub(crate) mod design;
 mod entry_actions;
 pub(crate) mod format;
 pub(crate) mod github;
+pub(crate) mod model_picker;
 pub(crate) mod preferences;
 pub(crate) mod service;
 pub(crate) mod status_item;
@@ -27,9 +28,9 @@ use std::{
 use anyhow::Context as _;
 use gpui::{
     App, AppContext as _, Application, AsyncApp, Bounds, KeyBinding, Menu, MenuItem, OsAction,
-    SharedString, SystemMenuType, WindowBounds, WindowOptions, px, size,
+    SystemMenuType, WindowBounds, WindowOptions, px, size,
 };
-use gpui_component::{Root, Theme, ThemeRegistry};
+use gpui_component::{Root, ThemeRegistry};
 use tokio::runtime::Runtime;
 use worktable_view::WorktableView;
 
@@ -58,9 +59,6 @@ fn main() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         status_item::set_app_icon();
         init_theme(cx);
-        // The Tahoe radii must be applied once at startup too — the theme
-        // watcher callback only fires when the theme files change on disk.
-        apply_tahoe_radius(cx);
 
         // Keep the quit hook alive for the lifetime of the app.
         let tokio_for_quit = tokio.clone();
@@ -148,40 +146,13 @@ fn main() -> anyhow::Result<()> {
 /// Load the application's theme files and keep the active theme in sync with
 /// changes made while the app is running.
 fn init_theme(cx: &mut App) {
-    let theme_name = SharedString::from("Ayu Light");
+    if let Err(error) = design::load_theme(cx) {
+        eprintln!("Worktable: failed to load the bundled theme: {error}");
+    }
     let themes_dir = resolve_themes_dir();
-    if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, move |cx| {
-        // Apply both variants of the watched theme: `apply_config` only stores
-        // the config matching its own mode, so loading the light theme alone
-        // leaves dark mode on the default (blue) dark palette.
-        let light = ThemeRegistry::global(cx).themes().get(&theme_name).cloned();
-        let dark = ThemeRegistry::global(cx)
-            .themes()
-            .get(&SharedString::from("Ayu Dark"))
-            .cloned();
-        if let Some(light) = light {
-            Theme::global_mut(cx).apply_config(&light);
-        }
-        if let Some(dark) = dark {
-            Theme::global_mut(cx).apply_config(&dark);
-        }
-        let mode = Theme::global(cx).mode;
-        // `apply_config` updates the component theme. Calling `change` also
-        // refreshes GPUI Base's semantic tokens and scrollbars.
-        Theme::change(mode, None, cx);
-        apply_tahoe_radius(cx);
-    }) {
+    if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, design::apply_registered_theme) {
         eprintln!("Worktable: failed to watch themes directory: {error}");
     }
-}
-
-/// macOS Tahoe (Liquid Glass) radius scale for every component control:
-/// buttons/inputs/switches at 10px, dialogs/popovers at 14px. Applied after
-/// any theme config load, which resets radii to the theme's own defaults.
-pub(crate) fn apply_tahoe_radius(cx: &mut App) {
-    let theme = Theme::global_mut(cx);
-    theme.radius = px(10.);
-    theme.radius_lg = px(14.);
 }
 
 fn resolve_themes_dir() -> PathBuf {

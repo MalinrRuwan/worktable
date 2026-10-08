@@ -48,7 +48,6 @@ pub struct CircleAction {
     child: Option<AnyElement>,
     tooltip: Option<SharedString>,
     disabled: bool,
-    large: bool,
     on_click: Option<ClickHandler>,
     debug_selector: Option<SharedString>,
 }
@@ -63,7 +62,6 @@ impl CircleAction {
             child: None,
             tooltip: None,
             disabled: false,
-            large: false,
             on_click: None,
             debug_selector: None,
         }
@@ -114,12 +112,6 @@ impl CircleAction {
         self
     }
 
-    /// The 40px header size; the default is the 36px control size.
-    pub fn large(mut self) -> Self {
-        self.large = true;
-        self
-    }
-
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -136,15 +128,22 @@ impl CircleAction {
 
 impl RenderOnce for CircleAction {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut button = Button::new(self.id).rounded_full().flex_shrink_0();
+        // One square footprint for icon, label, and child alike: a button that
+        // sizes to its contents jumps the moment its content changes (the send
+        // button's orb, the knowledge button's globe) and leaves the row's gaps
+        // uneven.
+        let mut button = Button::new(self.id)
+            .rounded_full()
+            .flex_shrink_0()
+            .size_9()
+            // Child buttons otherwise inherit horizontal label padding. That
+            // leaves too little room for an orb inside the same square.
+            .p_0();
         button = match self.tone {
             ActionTone::Primary => button.primary(),
             ActionTone::Secondary => button.secondary(),
             ActionTone::Ghost => button.ghost(),
         };
-        if self.large {
-            button = button.size_10();
-        }
         if let Some(icon) = self.icon {
             button = button.icon(icon);
         }
@@ -155,7 +154,7 @@ impl RenderOnce for CircleAction {
             button = button.child(child);
         }
         if let Some(tooltip) = self.tooltip {
-            button = button.tooltip(tooltip);
+            button = button.accessibility_label(tooltip.clone()).tooltip(tooltip);
         }
         if self.disabled {
             button = button.disabled(true);

@@ -212,12 +212,14 @@ card; the detail shows the image itself, with a hover download button
 fullscreen `WindowKind::PopUp` viewer above every other app that fades in with
 `MODAL_OPEN` and closes on click or ⎋.
 
-Themes: `init_theme` applies **both** variants from the watched theme file —
-`apply_config` only stores the config matching its own mode, so loading just
-the light config left dark mode on gpui-component's default palette (whose
-list selection is blue). The Ayu dark variant is warmed to the app's palette
-(tan primary, warm `list.active`/`list.hover`, warm ring), so selection, hover,
-the check circle, and primary buttons read the same in both modes.
+Themes: `design::load_theme` installs **both** bundled Ayu variants before
+the first frame; `init_theme` watches the disk copy for development overrides.
+GPUI Kit 0.7's `apply_config` also switches mode, so
+`design::apply_registered_theme` preserves the current mode before loading
+either variant. List and text selection use the warm palette in both modes.
+`design::apply_control_style` disables the outside focus halo, not focus:
+inputs keep the component's 1px theme-ring edge. Do not turn off input borders
+or focus treatment to make the stroke thinner.
 
 Settings opens on a line-separated category list (General, Appearance, Data,
 Providers). General's "Keep running in the menu bar" toggle is on by default:
@@ -240,9 +242,9 @@ deep-links to Settings → Providers. Every step can be skipped; completing it
 stores `onboarding_completed=1` in config, and Settings → Appearance has a
 *Replay* control. List key commands stay disabled while the tour is open.
 
-User message bubbles shrink to their text with an 85% max width; assistant
-bubbles keep a definite 85% measure because their selectable rich text needs a
-bounded frame.
+User message bubbles shrink to their text with an 85% max width. Assistant
+answers are plain documents on the transcript surface, with no bubble fill,
+radius, or padding; they keep an 85% measure for selectable rich text.
 
 The conversation icon beside the assistant input opens **Chats**, a bottom
 sheet that rises from the window's bottom edge using `MODAL_OPEN`/`MODAL_CLOSE`.
@@ -331,11 +333,23 @@ they do:
 - `citations::InlineCitations` — markdown structure plus `[n]` chips with
   hover previews and a source footer for answers with references. It cannot use
   `TextView`'s markdown renderer because the chips must flow inline, hence the
-  small block parser in `worktable-ui/src/markdown.rs`;
+  small block parser in `worktable-ui/src/markdown.rs`. All numbered chips
+  share one sizing/stroke rule, growing into pills for multi-digit numbers;
+  grouped markers overlap slightly without changing their baseline. Prose and
+  streaming text use one native window-scoped selection participant per answer,
+  so Cmd+C preserves text across spans/blocks without copying the caret. Every
+  assistant answer also has Copy for the full original text and citation markers;
 - `action::CircleAction` — the circular action button (ghost/secondary/primary,
-  icon or child, tooltip, optional 40px header size) shared by the note bar's
+  icon or child, tooltip and accessible name, fixed 2.25rem square) shared by the note bar's
   plus/tick, the agent's send/stop/build controls, the page toggle, and the
-  detail/viewer close buttons.
+  detail/viewer close buttons. Child/orb content has no label padding, so
+  activity never changes the footprint. Ordinary ghost commands use `h_9`
+  too; the assistant composer keeps one `gap_1` before each action. Build
+  knowledge and activity indicators use theme `foreground`; Send/Stop share
+  the note bar's primary circle fill and footprint, with Arrow up instead of Check.
+  Send's arrow and loading orb both use `primary_foreground` in either theme.
+  Two-line chat-picker rows fill their virtual row with `px_3`/`py_2` padding;
+  they do not use the one-line toolbar height.
 
 They are ports of the MIT-licensed [aiCSS](https://www.aicss.dev) components
 and stay theme-agnostic: callers pass colors from `cx.theme()` and rems, and
@@ -355,8 +369,11 @@ Module ownership:
 
 | File | Owns |
 | --- | --- |
-| `providers.rs` | the provider catalog: id, display name, `ProviderKind`, and the curated model list the UI may offer |
-| `opencode_go.rs` | the custom `opencode-go` provider (OpenCode Go's OpenAI-compatible Chat Completions gateway; sets the required `x-opencode-session` routing header) |
+| `providers.rs` | provider identities, display names, client kinds, and authentication capabilities; no model lists |
+| `model_catalog.rs` | authenticated API model discovery, pagination, service grouping, and safe errors |
+| `model_state.rs` | cached API models and revision guards; never credentials or curated fallbacks |
+| `chatgpt.rs` | ChatGPT subscription OAuth and noninteractive refresh, backed by Worktable credentials |
+| `opencode.rs` | enabled services, API-advertised dialect routing, and clients; keeps the legacy `opencode-go` provider id |
 | `agent_runtime.rs` | request dispatch, rig agent construction, streaming → `WorkerEvent` translation, session history, cancellation |
 | `helix_tool.rs` | the `search_knowledge` tool for the Helix graph (native only) |
 | `worker_protocol.rs` | the JSON request/event contract shared with the app |
@@ -364,25 +381,37 @@ Module ownership:
 
 Provider rules:
 
-- **One catalog owner.** `providers::PROVIDERS` is authoritative. The UI must
-  never offer a model id the runtime cannot send; keep ids in sync with the
-  provider's own endpoint docs.
-- **Custom providers follow the rig docs.** `opencode-go` is built on rig's
-  documented path for OpenAI-compatible endpoints: an
-  `openai::CompletionsClient` with `base_url("https://opencode.ai/zen/go/v1")`
-  and a stable per-conversation `x-opencode-session` header (the gateway
-  rejects requests without it).
-  Models served only through other API dialects (OpenAI Responses,
-  Anthropic Messages) stay out of `MODELS` until the provider routes per model;
-  listing them would fail at the first prompt.
+- **API-owned model catalogs.** `providers::PROVIDERS` owns provider identities,
+  not model ids. Offer all models returned by authenticated discovery or its
+  cache; never hardcode lists or intersect API responses with bundled ids.
+  Fetch outside the UI thread, invalidate on credential/service changes, and
+  reject stale results by revision. The searchable Settings combobox groups by
+  provider and the optional `ModelInfo.group` heading, never by guessed id
+  prefixes. It includes only configured providers (`api_key_set || oauth_set`)
+  and their snapshot models from authenticated API discovery; the UI neither
+  fetches models nor fills in catalog fallbacks. A selection carries both
+  provider id and the unchanged model id.
+- **OpenCode routes per service and dialect.** `opencode::route` owns Go/Zen
+  dispatch from the cached row's endpoint-owned group and optional `api`
+  metadata, never model-id guesses. Without protocol metadata, `/v1` uses
+  Chat Completions. Shared advertisements prefer Go. Missing model endpoints
+  show fetch failures instead of invented offerings. Configure → Model services changes the offered catalog, without
+  removing the saved key. Go clients send the stable per-conversation
+  `x-opencode-session` header.
 - **Adding a provider** means: a `ProviderSpec` in `providers.rs`, a client arm
   in `AgentRuntime::build_agent`, and a credential handled through
   `SqliteStore` (Worktable's database owns credentials; env vars are only a
   fallback). Read the rig provider docs and the source before writing the arm —
   do not infer signatures from examples.
 - **Keys and models stay consistent.** Saving a key activates the provider and
-  auto-selects the catalog's first model when none valid is selected, so a
-  configured provider can prompt immediately.
+  fetches its models; only a successful API result can auto-select the first
+  model. Loading and failure copy stays beside the picker, with Refresh models.
+- **ChatGPT subscription is separate from OpenAI API keys.** Sign-in is an
+  explicit device OAuth action through pinned Rig's public `authorize` and
+  `on_device_code` APIs. Worktable's database is the sole persistent credential
+  owner; Rig's file adapter uses a disposable 0600 file outside the repository.
+  Refresh before prompts, enrichment, and discovery is noninteractive; expired
+  authorization asks the user to sign in again. Never read another app's tokens.
 - **Builds are self-healing.** A build re-syncs entries whose graph copy is
   missing or stale (imports can add a description after the first mirror;
   edits change content) and drops their AI enrichment so the next pass renames

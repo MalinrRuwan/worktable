@@ -28,6 +28,14 @@ pub enum WorkerRequest {
         provider_id: String,
         model_id: String,
     },
+    /// Enable or disable one of a provider's model groups (e.g. OpenCode Go
+    /// or Zen). The worker re-invalidates the active selection and emits a
+    /// fresh snapshot.
+    SetProviderGroup {
+        provider_id: String,
+        group_id: String,
+        enabled: bool,
+    },
     /// Remove the stored credential for a provider.
     Logout {
         provider_id: String,
@@ -129,7 +137,7 @@ pub fn decode_event(line: &[u8]) -> serde_json::Result<WorkerEvent> {
 #[cfg(test)]
 mod tests {
     use super::{WorkerEvent, WorkerRequest, decode_event, encode_request};
-    use worktable_events::{ModelInfo, ProviderInfo, ProvidersSnapshot};
+    use worktable_events::{ModelInfo, ProviderGroup, ProviderInfo, ProvidersSnapshot};
 
     #[test]
     fn worker_request_round_trips_as_json() {
@@ -143,6 +151,22 @@ mod tests {
         let decoded: WorkerRequest = serde_json::from_str(&encoded).expect("request should decode");
 
         assert!(matches!(decoded, WorkerRequest::Prompt { .. }));
+    }
+
+    #[test]
+    fn provider_group_request_round_trips() {
+        let request = WorkerRequest::SetProviderGroup {
+            provider_id: "opencode-go".to_owned(),
+            group_id: "zen".to_owned(),
+            enabled: false,
+        };
+        let encoded = encode_request(&request).expect("request should encode");
+        let decoded: WorkerRequest = serde_json::from_str(&encoded).expect("request should decode");
+        assert!(matches!(
+            decoded,
+            WorkerRequest::SetProviderGroup { provider_id, group_id, enabled: false }
+                if provider_id == "opencode-go" && group_id == "zen"
+        ));
     }
 
     #[test]
@@ -162,10 +186,15 @@ mod tests {
                 supports_oauth: true,
                 api_key_set: true,
                 oauth_set: false,
+                groups: Vec::new(),
                 models: vec![ModelInfo {
                     id: "claude-sonnet-4-5".to_owned(),
                     name: "Claude Sonnet 4.5".to_owned(),
+                    group: None,
+                    api: None,
                 }],
+                models_loading: false,
+                models_error: None,
             }],
             active_provider: Some("anthropic".to_owned()),
             active_model: Some("claude-sonnet-4-5".to_owned()),
@@ -185,5 +214,36 @@ mod tests {
             }
             _ => panic!("expected providers snapshot"),
         }
+    }
+
+    #[test]
+    fn grouped_snapshot_round_trips_and_old_snapshots_default_to_no_groups() {
+        let old = decode_event(
+            br#"{"type":"providers_snapshot","snapshot":{"providers":[{"id":"opencode-go","name":"OpenCode Go","supports_api_key":true,"supports_oauth":false,"api_key_set":true,"oauth_set":false,"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}],"active_provider":"opencode-go","active_model":"glm-5.3"}}"#,
+        )
+        .expect("old snapshot decodes");
+        let WorkerEvent::ProvidersSnapshot { mut snapshot } = old else {
+            panic!("expected snapshot");
+        };
+        assert!(snapshot.providers[0].groups.is_empty());
+        assert!(snapshot.providers[0].models[0].group.is_none());
+        snapshot.providers[0].groups = vec![ProviderGroup {
+            id: "go".to_owned(),
+            name: "OpenCode Go".to_owned(),
+            enabled: true,
+        }];
+        snapshot.providers[0].models[0].group = Some("OpenCode Go".to_owned());
+        let encoded = serde_json::to_vec(&WorkerEvent::ProvidersSnapshot { snapshot }).unwrap();
+        let WorkerEvent::ProvidersSnapshot { snapshot } = decode_event(&encoded).unwrap() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.providers[0].id, "opencode-go");
+        assert_eq!(snapshot.providers[0].models[0].id, "glm-5.3");
+        assert_eq!(
+            snapshot.providers[0].models[0].group.as_deref(),
+            Some("OpenCode Go")
+        );
+        assert_eq!(snapshot.providers[0].groups[0].id, "go");
+        assert!(snapshot.providers[0].groups[0].enabled);
     }
 }

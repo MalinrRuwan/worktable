@@ -1,6 +1,6 @@
 [package]
 name = "worktable-ui"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 description = "Worktable UI kit — motion catalog and interaction helpers over gpui"
 license = "MIT"
@@ -9,3 +9,7 @@ license = "MIT"
 anyhow.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
+gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "c0bebdc8a8cf9a74f9f52feaca278a52a9cfcca2" }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

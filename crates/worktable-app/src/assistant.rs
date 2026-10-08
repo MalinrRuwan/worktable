@@ -3,10 +3,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClickEvent, EntityId, InteractiveElement as _, IntoElement as _,
+    AnyElement, ClickEvent, ClipboardItem, EntityId, InteractiveElement as _, IntoElement as _,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder, relative,
+    relative,
 };
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::text::TextView;
 use gpui_component::theme::Theme;
 use gpui_component::{Icon, IconName, h_flex, v_flex};
@@ -188,15 +189,21 @@ pub fn render_message<'a>(
     } = options;
     let is_user = message.role == Role::User;
     // User bubbles are a light primary wash so the dark "sent" treatment does
-    // not dominate the transcript; assistant bubbles keep the muted secondary.
-    let (background, foreground) = if is_user {
-        (theme.primary.opacity(0.16), theme.foreground)
-    } else {
-        (theme.secondary, theme.secondary_foreground)
-    };
+    // not dominate the transcript; assistant answers use the page foreground.
+    let background = theme.primary.opacity(0.16);
+    let foreground = theme.foreground;
 
-    // Build the bubble's inner vertical stack.
-    let mut bubble = v_flex().gap_2().w_full().min_w_0().max_w_full();
+    let content_selector = if is_user {
+        format!("user-bubble:{index}")
+    } else {
+        format!("assistant-answer:{index}")
+    };
+    let mut bubble = v_flex()
+        .gap_2()
+        .w_full()
+        .min_w_0()
+        .max_w_full()
+        .debug_selector(move || content_selector.clone());
 
     // Thinking block — shown only when the user enabled reasoning in
     // Settings → UI. While the model is still reasoning the label shimmers
@@ -212,7 +219,7 @@ pub fn render_message<'a>(
                 "Thinking",
             )
             .view(view)
-            .color(theme.muted_foreground)
+            .color(theme.foreground)
             .text_xs()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .into_any_element()
@@ -345,14 +352,10 @@ pub fn render_message<'a>(
             // mention `[n]` without collected sources still render through the
             // component, so raw brackets never reach the UI.
             let colors = CitationColors {
-                // `popover` and `border` keep the chips readable on the
-                // assistant bubble (`secondary`); Ayu Light gives
-                // `muted` and `secondary` the same value.
                 foreground,
                 muted: theme.muted_foreground,
                 chip_background: theme.popover,
                 chip_hover_background: theme.border,
-                background: theme.background,
                 border: theme.border,
             };
             let citations = InlineCitations::new(
@@ -383,6 +386,27 @@ pub fn render_message<'a>(
             .into_any_element()
         };
         bubble = bubble.child(div().w_full().min_w_0().text_sm().child(body));
+        if !is_user {
+            // Copy uses the same complete text for every answer renderer,
+            // including interactive citations and a live partial answer.
+            let text = message.text.clone();
+            let selector = format!("copy-answer:{index}");
+            bubble = bubble.child(
+                h_flex().child(
+                    Button::new(SharedString::from(format!("copy-answer:{index}")))
+                        .label("Copy")
+                        .icon(Icon::new(IconName::Copy).size_4())
+                        .ghost()
+                        .h_9()
+                        .tooltip("Copy answer")
+                        .accessibility_label("Copy answer")
+                        .debug_selector(move || selector.clone())
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                        }),
+                ),
+            );
+        }
     } else if message.streaming {
         // Empty while streaming — show a subtle placeholder so the bubble has
         // height.
@@ -406,31 +430,44 @@ pub fn render_message<'a>(
         );
     }
 
-    h_flex()
-        .w_full()
+    let selector = {
+        let selector = format!("bubble-{index}");
+        move || selector.clone()
+    };
+
+    if is_user {
+        // The user's words sit in a bubble so the turn boundary is obvious.
+        return h_flex()
+            .w_full()
+            .min_w_0()
+            .justify_end()
+            .child(
+                div()
+                    // Bubbles shrink to their text, capped at 85% of the row.
+                    .max_w(relative(0.85))
+                    .debug_selector(selector)
+                    .min_w_0()
+                    .overflow_hidden()
+                    .rounded(theme.radius_lg)
+                    .bg(background)
+                    .text_color(foreground)
+                    .px_3()
+                    .py_2()
+                    .child(bubble),
+            )
+            .into_any_element();
+    }
+
+    // The answer is the document the transcript is about: it reads as the
+    // page itself, not as a reply card. It keeps a definite measure so the
+    // selectable rich text has a bounded frame to lay out in.
+    div()
+        .w(relative(0.85))
         .min_w_0()
-        .when(is_user, |this| this.justify_end())
-        .when(!is_user, |this| this.justify_start())
-        .child(
-            div()
-                // Assistant bodies are selectable rich text that needs a
-                // bounded frame, so they take a definite measure. User bubbles
-                // shrink to their text, capped at the same 85% of the row.
-                .when(is_user, |el| el.max_w(relative(0.85)))
-                .when(!is_user, |el| el.w(relative(0.85)))
-                .debug_selector({
-                    let selector = format!("bubble-{index}");
-                    move || selector.clone()
-                })
-                .min_w_0()
-                .overflow_hidden()
-                .rounded(theme.radius_lg)
-                .bg(background)
-                .text_color(foreground)
-                .px_3()
-                .py_2()
-                .child(bubble),
-        )
+        .debug_selector(selector)
+        .text_color(theme.foreground)
+        .child(bubble)
+        .into_any_element()
 }
 
 /// Whether the answer text carries any `[n]` citation markers, with or

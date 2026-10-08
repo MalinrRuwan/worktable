@@ -11,12 +11,12 @@
 
 use std::time::Duration;
 
+use crate::activity_now;
+use crate::citations::selection;
 use gpui::{
     App, ElementId, EntityId, InteractiveElement as _, IntoElement, ParentElement, Refineable as _,
     RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
 };
-
-use crate::activity_now;
 
 /// The reference reveal rate: 2 characters every 9ms.
 const DEFAULT_CHARS_PER_SECOND: f32 = 2.0 / 0.009;
@@ -177,6 +177,7 @@ impl RenderOnce for StreamingText {
         if self.caret_visible(now, complete, reduced) {
             display = SharedString::from(format!("{display}\u{258d}"));
         }
+        let document = selection::Document::default();
 
         // A plain block: the streaming bubble gives it a definite width, so
         // the text wraps and the bubble grows in height as the answer types.
@@ -184,9 +185,13 @@ impl RenderOnce for StreamingText {
             .debug_selector(|| "streaming-text".into())
             .min_w_0()
             .max_w_full()
-            .child(display);
+            .child(selection::text(&document, display, "").copy_end(end));
         root.style().refine(&self.style);
-        root
+        selection::Surface {
+            id: self.id,
+            child: root.into_any_element(),
+            document,
+        }
     }
 }
 

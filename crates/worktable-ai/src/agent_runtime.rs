@@ -16,7 +16,8 @@
 //! - support cancellation without queuing behind the run it cancels.
 //!
 //! Provider catalog and model lists live in [`crate::providers`]; the
-//! OpenCode Go client is in [`crate::opencode_go`].
+//! OpenCode gateways (Go and Zen) and their per-model client routing are in
+//! [`crate::opencode`].
 
 use std::{
     collections::HashMap,
@@ -34,10 +35,10 @@ use rig::completion::{AssistantContent, Message};
 use rig::prelude::*;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use worktable_db::{ProviderCredential, SqliteStore};
-use worktable_events::{ModelInfo, ProviderInfo, ProvidersSnapshot};
+use worktable_events::{ProviderGroup, ProviderInfo, ProvidersSnapshot};
 
 use crate::{
-    opencode_go,
+    chatgpt, opencode,
     providers::{self, ProviderKind, ProviderSpec},
     worker_protocol::{KnowledgeCitation, WorkerEvent, WorkerRequest},
 };
@@ -77,6 +78,9 @@ struct ActiveProviderConfig {
     model: String,
     /// Stable-ish session id for providers that route by conversation.
     session: String,
+    /// Gateway + dialect for the OpenCode provider; `None` for providers with
+    /// a single fixed client.
+    route: Option<opencode::Route>,
 }
 
 /// Resolve the active provider, its credential, and model, with the same
@@ -97,12 +101,36 @@ fn resolve_active_provider(store: &SqliteStore) -> Result<ActiveProviderConfig, 
             "provider '{provider_id}' is not in this build's catalog; pick a provider in Settings"
         ));
     };
+    // OpenCode serves two catalogs through one key; the enabled services
+    // decide which gateway (and dialect) serves the selected model.
+    let route = if spec.kind == ProviderKind::OpenCode {
+        let models = crate::model_state::read(store, &provider_id).models;
+        match models
+            .iter()
+            .find(|row| row.id == model)
+            .and_then(|row| opencode::route(row, opencode::Services::from_store(store)))
+        {
+            Some(route) => Some(route),
+            None => {
+                return Err(format!(
+                    "model '{model}' is not offered by the enabled OpenCode services; \
+                     pick a model in Settings"
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let key = store
         .read_provider_credential(&provider_id)
         .ok()
         .flatten()
+        .filter(|credential| spec.kind != ProviderKind::ChatGpt || credential.kind == "oauth")
         .map(|credential| credential.key);
     let Some(key) = key.filter(|key| !key.trim().is_empty()) else {
+        if spec.kind == ProviderKind::ChatGpt {
+            return Err(chatgpt::SIGN_IN_AGAIN.to_owned());
+        }
         return Err(format!(
             "no API key is stored for {provider_id}; add one in Settings"
         ));
@@ -112,7 +140,18 @@ fn resolve_active_provider(store: &SqliteStore) -> Result<ActiveProviderConfig, 
         key,
         model,
         session: uuid::Uuid::new_v4().to_string(),
+        route,
     })
+}
+
+async fn refresh_subscription(
+    store: &SqliteStore,
+    config: &mut ActiveProviderConfig,
+) -> Result<(), String> {
+    if config.spec.kind == ProviderKind::ChatGpt {
+        config.key = chatgpt::auth_context(store).await?.record_json();
+    }
+    Ok(())
 }
 
 /// Drop reasoning parts from a transcript before replaying it to a provider.
@@ -165,12 +204,16 @@ pub(crate) async fn enrich_topics(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let config = resolve_active_provider(store).map_err(anyhow::Error::msg)?;
+    let mut config = resolve_active_provider(store).map_err(anyhow::Error::msg)?;
+    refresh_subscription(store, &mut config)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let agent = build_agent(
         config.spec,
         &config.key,
         &config.model,
         &config.session,
+        config.route,
         None,
     )?;
     let mut topics = Vec::new();
@@ -289,6 +332,17 @@ impl ActiveRun {
     }
 }
 
+struct ActiveLogin {
+    cancel: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ActiveLogin {
+    fn matches(&self, cancel: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.cancel, cancel) && !cancel.load(Ordering::SeqCst)
+    }
+}
+
 /// The embedded agent runtime.
 ///
 /// `send` is non-blocking: prompts are spawned on the Tokio handle the app
@@ -302,18 +356,33 @@ pub struct AgentRuntime {
     events_tx: Sender<WorkerEvent>,
     events_rx: Mutex<Receiver<WorkerEvent>>,
     active: Arc<Mutex<Option<ActiveRun>>>,
+    login: Arc<Mutex<Option<ActiveLogin>>>,
     /// Conversation transcript per session, seeded by the previous run's
     /// `PromptResponse::messages`.
     history: Arc<Mutex<HashMap<String, Vec<Message>>>>,
     /// Stable id for the OpenCode Go `x-opencode-session` header when a
     /// request arrives without a session id.
     default_session: String,
+    model_loader: crate::ModelLoader,
+    model_jobs: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 impl AgentRuntime {
     /// Create the runtime on `tokio`'s executor. A `Ready` event is emitted
     /// once so the event pump reports the AI worker as ready.
     pub fn start(store: SqliteStore, tokio: tokio::runtime::Handle) -> Self {
+        Self::start_with_model_loader(
+            store,
+            tokio,
+            Arc::new(|store, provider| Box::pin(crate::model_catalog::fetch(store, provider))),
+        )
+    }
+
+    pub fn start_with_model_loader(
+        store: SqliteStore,
+        tokio: tokio::runtime::Handle,
+        model_loader: crate::ModelLoader,
+    ) -> Self {
         let (events_tx, events_rx) = channel();
         let runtime = Self {
             store,
@@ -321,8 +390,11 @@ impl AgentRuntime {
             events_tx,
             events_rx: Mutex::new(events_rx),
             active: Arc::new(Mutex::new(None)),
+            login: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(HashMap::new())),
             default_session: uuid::Uuid::new_v4().to_string(),
+            model_loader,
+            model_jobs: Arc::new(Mutex::new(HashMap::new())),
         };
         let _ = runtime.events_tx.send(WorkerEvent::Ready);
         runtime
@@ -350,7 +422,10 @@ impl AgentRuntime {
                 session_id,
                 content,
             } => self.start_prompt(request_id, session_id, content)?,
-            WorkerRequest::ListProviders => self.emit_snapshot(),
+            WorkerRequest::ListProviders => {
+                self.refresh_models(true);
+                self.emit_snapshot();
+            }
             WorkerRequest::SetApiKey {
                 provider_id,
                 api_key,
@@ -359,6 +434,18 @@ impl AgentRuntime {
                 provider_id,
                 model_id,
             } => {
+                if !crate::model_state::read(&self.store, &provider_id)
+                    .models
+                    .iter()
+                    .any(|model| model.id == model_id)
+                {
+                    let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                        error: "This model is no longer available. Refresh models in Settings and choose again."
+                            .to_owned(),
+                    });
+                    self.emit_snapshot();
+                    return Ok(());
+                }
                 if self
                     .store
                     .set_config("active_provider", &provider_id)
@@ -368,15 +455,28 @@ impl AgentRuntime {
                 }
                 self.emit_config_changed();
             }
+            WorkerRequest::SetProviderGroup {
+                provider_id,
+                group_id,
+                enabled,
+            } => self.set_provider_group(&provider_id, &group_id, enabled),
             WorkerRequest::Logout { provider_id } => self.logout(&provider_id),
             WorkerRequest::LoginOAuth { provider_id } => {
-                let _ = self.events_tx.send(WorkerEvent::LoginResult {
-                    provider_id,
-                    ok: false,
-                    error: Some(
-                        "OAuth login is not available; configure an API key instead".to_owned(),
-                    ),
-                });
+                if provider_id == chatgpt::ID {
+                    self.invalidate_models(chatgpt::ID);
+                    self.start_subscription_login();
+                } else {
+                    let _ = self.events_tx.send(WorkerEvent::LoginResult {
+                        provider_id,
+                        ok: false,
+                        error: Some(
+                            "OAuth login is not available; configure an API key instead".to_owned(),
+                        ),
+                    });
+                }
+            }
+            WorkerRequest::CancelLogin { provider_id } if provider_id == chatgpt::ID => {
+                self.cancel_subscription_login(true);
             }
             WorkerRequest::CancelLogin { .. } | WorkerRequest::AnswerAuthPrompt { .. } => {
                 let _ = self.events_tx.send(WorkerEvent::WorkerError {
@@ -386,6 +486,193 @@ impl AgentRuntime {
             WorkerRequest::Shutdown => {}
         }
         Ok(())
+    }
+
+    fn invalidate_models(&self, provider_id: &str) {
+        let mut jobs = self.model_jobs.lock().unwrap();
+        if let Some(job) = jobs.remove(provider_id) {
+            job.abort();
+        }
+        if crate::model_state::invalidate(&self.store, provider_id).is_err() {
+            let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                error: "Couldn't reset the model list. Try again in Settings.".to_owned(),
+            });
+        }
+    }
+
+    fn refresh_models(&self, force: bool) {
+        for spec in providers::PROVIDERS {
+            let credential = self.store.read_provider_credential(spec.id).ok().flatten();
+            let configured = credential.is_some_and(|credential| {
+                !credential.key.is_empty()
+                    && ((spec.supports_api_key() && credential.kind == "api_key")
+                        || (spec.supports_oauth() && credential.kind == "oauth"))
+            });
+            if !configured {
+                continue;
+            }
+            let mut jobs = self.model_jobs.lock().unwrap();
+            let mut state = crate::model_state::read(&self.store, spec.id);
+            if jobs.contains_key(spec.id)
+                || (!force && !state.models.is_empty() && state.error.is_none())
+            {
+                continue;
+            }
+            state.loading = true;
+            state.error = None;
+            if crate::model_state::write(&self.store, spec.id, &state).is_err() {
+                continue;
+            }
+            let revision = state.revision;
+            let provider_id = spec.id.to_owned();
+            let store = self.store.clone();
+            let loader = self.model_loader.clone();
+            let tx = self.events_tx.clone();
+            let current_jobs = self.model_jobs.clone();
+            let task_id = provider_id.clone();
+            let task = self.tokio.spawn(async move {
+                let result = loader(store.clone(), task_id.clone()).await;
+                let mut jobs = current_jobs.lock().unwrap();
+                let mut state = crate::model_state::read(&store, &task_id);
+                if state.revision != revision || !jobs.contains_key(&task_id) {
+                    return;
+                }
+                jobs.remove(&task_id);
+                state.loading = false;
+                match result {
+                    Ok(fetched) => {
+                        state.models = fetched.models;
+                        state.error = fetched.warning;
+                    }
+                    Err(error) => state.error = Some(error),
+                }
+                if crate::model_state::write(&store, &task_id, &state).is_err() {
+                    return;
+                }
+                // Keep the selected id only if the authenticated API still
+                // offers it. Otherwise default within this provider, not from
+                // a second static catalog.
+                if store
+                    .get_config("active_provider")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(task_id.as_str())
+                    && !state.models.iter().any(|model| {
+                        store.get_config("active_model").ok().flatten().as_deref()
+                            == Some(model.id.as_str())
+                    })
+                {
+                    let model = state
+                        .models
+                        .first()
+                        .map(|model| model.id.as_str())
+                        .unwrap_or("");
+                    let _ = store.set_config("active_model", model);
+                    let _ = tx.send(WorkerEvent::ConfigChanged {
+                        active_provider: Some(task_id.clone()),
+                        active_model: (!model.is_empty()).then(|| model.to_owned()),
+                    });
+                }
+                if let Ok(snapshot) = build_snapshot(&store) {
+                    let _ = tx.send(WorkerEvent::ProvidersSnapshot { snapshot });
+                }
+            });
+            jobs.insert(provider_id, task.abort_handle());
+        }
+    }
+
+    fn cancel_subscription_login(&self, report: bool) {
+        let mut current = self.login.lock().unwrap();
+        if let Some(login) = current.take() {
+            login.cancel.store(true, Ordering::SeqCst);
+            login.notify.notify_one();
+            if report {
+                let _ = self.events_tx.send(WorkerEvent::LoginResult {
+                    provider_id: chatgpt::ID.to_owned(),
+                    ok: false,
+                    error: Some("ChatGPT sign-in cancelled".to_owned()),
+                });
+            }
+        }
+    }
+
+    fn start_subscription_login(&self) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut current = self.login.lock().unwrap();
+            if let Some(previous) = current.take() {
+                previous.cancel.store(true, Ordering::SeqCst);
+                previous.notify.notify_one();
+            }
+            *current = Some(ActiveLogin {
+                cancel: cancel.clone(),
+                notify: notify.clone(),
+            });
+        }
+        let login = self.login.clone();
+        let callback_login = login.clone();
+        let callback_cancel = cancel.clone();
+        let tx = self.events_tx.clone();
+        let callback_tx = tx.clone();
+        let store = self.store.clone();
+        self.tokio.spawn(async move {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = notify.notified() => return,
+                result = chatgpt::login(move |user_code, verification_uri| {
+                    let current = callback_login.lock().unwrap();
+                    if current.as_ref().is_some_and(|login| login.matches(&callback_cancel)) {
+                        let _ = callback_tx.send(WorkerEvent::AuthNotify {
+                            provider_id: chatgpt::ID.to_owned(),
+                            notify: worktable_events::AuthNotifyKind::DeviceCode {
+                                user_code,
+                                verification_uri,
+                                expires_in_seconds: Some(15 * 60),
+                            },
+                        });
+                    }
+                }) => result,
+            };
+            // Hold identity through persistence and the final event: cancelling,
+            // replacing login, or logging out invalidates this result atomically.
+            let mut current = login.lock().unwrap();
+            if !current.as_ref().is_some_and(|login| login.matches(&cancel)) {
+                return;
+            }
+            let result = result.and_then(|key| {
+                let _guard = chatgpt::CREDENTIAL_LOCK.lock().unwrap();
+                store
+                    .write_provider_credential(
+                        chatgpt::ID,
+                        &ProviderCredential {
+                            kind: "oauth".to_owned(),
+                            key,
+                        },
+                    )
+                    .and_then(|()| store.set_config("active_provider", chatgpt::ID))
+                    .and_then(|()| store.set_config("active_model", ""))
+                    .map_err(|_| {
+                        "Could not save ChatGPT authorization. Sign in again in Settings."
+                            .to_owned()
+                    })
+            });
+            *current = None;
+            let _ = tx.send(WorkerEvent::LoginResult {
+                provider_id: chatgpt::ID.to_owned(),
+                ok: result.is_ok(),
+                error: result.err(),
+            });
+            // Model discovery owns activation/selection. Never pick an API-key
+            // model for a subscription simply because login completed.
+            if let Ok(snapshot) = build_snapshot(&store) {
+                let _ = tx.send(WorkerEvent::ProvidersSnapshot { snapshot });
+            }
+        });
     }
 
     /// Cancel the in-flight run, if any. The run's task notices the flag and
@@ -461,10 +748,17 @@ impl AgentRuntime {
     }
 
     fn set_api_key(&self, provider_id: &str, api_key: &str) {
+        if provider_id == chatgpt::ID {
+            let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                error: "ChatGPT subscription uses sign-in, not an API key. Sign in in Settings → Providers.".to_owned(),
+            });
+            return;
+        }
         let credential = ProviderCredential {
             kind: "api_key".to_owned(),
             key: api_key.to_owned(),
         };
+        self.invalidate_models(provider_id);
         if let Err(error) = self
             .store
             .write_provider_credential(provider_id, &credential)
@@ -475,29 +769,66 @@ impl AgentRuntime {
             return;
         }
 
-        // Activate the provider if nothing is selected yet.
-        let active_provider = self.store.get_config("active_provider").ok().flatten();
-        if active_provider.as_deref().is_none_or(str::is_empty) {
-            let _ = self.store.set_config("active_provider", provider_id);
-        }
+        // Saving a key activates that provider. Updating only its model while
+        // retaining another provider would leave an invalid selected pair.
+        let _ = self.store.set_config("active_provider", provider_id);
+        let _ = self.store.set_config("active_model", "");
+        self.refresh_models(false);
+        self.emit_config_changed();
+    }
 
-        // A provider without a model can never serve a prompt, and picking a
-        // model is an easy-to-miss separate step — default to the catalog's
-        // first model unless a valid one is already selected.
-        let active_model = self.store.get_config("active_model").ok().flatten();
-        let model_needed = match active_model.as_deref() {
-            None | Some("") => true,
-            Some(model) => !providers::model_known(provider_id, model),
+    /// Enable or disable one of OpenCode's model catalogs. Disabling a
+    /// catalog can strand the active model, so the selection is re-defaulted
+    /// to the first offered model (or cleared when nothing is left).
+    fn set_provider_group(&self, provider_id: &str, group_id: &str, enabled: bool) {
+        if provider_id != opencode::ID {
+            let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                error: format!("provider '{provider_id}' has no model groups"),
+            });
+            return;
+        }
+        let Some(service) = opencode::Service::from_id(group_id) else {
+            let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                error: format!("unknown OpenCode service '{group_id}'"),
+            });
+            return;
         };
-        if model_needed && let Some(first) = providers::first_model(provider_id) {
-            let _ = self.store.set_config("active_model", first);
+        let services = opencode::Services::from_store(&self.store).with(service, enabled);
+        self.invalidate_models(provider_id);
+        if let Err(error) = services.write_to_store(&self.store) {
+            let _ = self.events_tx.send(WorkerEvent::WorkerError {
+                error: format!("failed to store the OpenCode services: {error}"),
+            });
+            return;
         }
 
+        let active_provider = self.store.get_config("active_provider").ok().flatten();
+        if active_provider.as_deref() == Some(opencode::ID) {
+            let _ = self.store.set_config("active_model", "");
+            if !services.go && !services.zen {
+                let _ = self.store.set_config("active_provider", "");
+            }
+        }
+
+        self.refresh_models(false);
         self.emit_config_changed();
     }
 
     fn logout(&self, provider_id: &str) {
-        let _ = self.store.delete_provider_credential(provider_id);
+        self.invalidate_models(provider_id);
+        if provider_id == chatgpt::ID {
+            // Same lock order as login completion. Keep it until DB deletion,
+            // so no successful late login can restore a logged-out credential.
+            let mut current = self.login.lock().unwrap();
+            if let Some(login) = current.take() {
+                login.cancel.store(true, Ordering::SeqCst);
+                login.notify.notify_one();
+            }
+            let _guard = chatgpt::CREDENTIAL_LOCK.lock().unwrap();
+            let _ = self.store.delete_provider_credential(provider_id);
+        } else {
+            let _ = self.store.delete_provider_credential(provider_id);
+        }
         if self
             .store
             .get_config("active_provider")
@@ -538,6 +869,10 @@ impl AgentRuntime {
     }
 
     pub fn shutdown(&self) {
+        self.cancel_subscription_login(false);
+        for (_, job) in self.model_jobs.lock().unwrap().drain() {
+            job.abort();
+        }
         if let Some(run) = self.active.lock().unwrap().take() {
             run.cancel.store(true, Ordering::SeqCst);
         }
@@ -559,13 +894,26 @@ async fn run_prompt(
     content: String,
 ) {
     // Resolve the active provider/model and its credential.
-    let config = match resolve_active_provider(&store) {
+    let mut config = match resolve_active_provider(&store) {
         Ok(config) => config,
         Err(error) => {
             fail(&tx, &active, &cancel, &request_id, &session_id, error);
             return;
         }
     };
+
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    let refreshed = tokio::select! {
+        biased;
+        _ = notify.notified() => return,
+        result = refresh_subscription(&store, &mut config) => result,
+    };
+    if let Err(error) = refreshed {
+        fail(&tx, &active, &cancel, &request_id, &session_id, error);
+        return;
+    }
 
     // Build the agent for this provider's rig client family. The collector is
     // shared with the tool so the run can emit the search hits as citations.
@@ -587,6 +935,7 @@ async fn run_prompt(
         &config.key,
         &config.model,
         routing_session,
+        config.route,
         tool,
     ) {
         Ok(agent) => agent,
@@ -773,12 +1122,14 @@ fn clear_active(active: &Arc<Mutex<Option<ActiveRun>>>, cancel: &Arc<AtomicBool>
 }
 
 /// Build the rig agent for a provider, attaching the knowledge tool on
-/// native targets.
+/// native targets. `route` is the resolved OpenCode gateway/dialect for the
+/// selected model.
 fn build_agent(
     provider: &ProviderSpec,
     api_key: &str,
     model: &str,
     session: &str,
+    route: Option<opencode::Route>,
     tool: Option<ProvidedTool>,
 ) -> anyhow::Result<rig::agent::Agent> {
     // Every provider shares the same builder options: the preamble and the
@@ -793,13 +1144,32 @@ fn build_agent(
         };
     }
     let agent = match provider.kind {
-        ProviderKind::OpenCodeGo => {
-            let client = opencode_go::client(api_key, session)?;
-            finish_agent!(configured!(client, model), tool)
+        ProviderKind::OpenCode => {
+            let route = route.ok_or_else(|| {
+                anyhow!("the OpenCode model route was not resolved for '{model}'")
+            })?;
+            match route.dialect {
+                opencode::Dialect::Chat => {
+                    let client = opencode::chat_client(route.service, api_key, session)?;
+                    finish_agent!(configured!(client, model), tool)
+                }
+                opencode::Dialect::Responses => {
+                    let client = opencode::responses_client(route.service, api_key, session)?;
+                    finish_agent!(configured!(client, model), tool)
+                }
+                opencode::Dialect::Messages => {
+                    let client = opencode::messages_client(route.service, api_key, session)?;
+                    finish_agent!(configured!(client, model), tool)
+                }
+            }
         }
         ProviderKind::OpenAi => {
             let client = rig::providers::openai::Client::new(api_key)
                 .map_err(|error| anyhow!("failed to build the OpenAI client: {error}"))?;
+            finish_agent!(configured!(client, model), tool)
+        }
+        ProviderKind::ChatGpt => {
+            let client = chatgpt::client_from_record(api_key).map_err(anyhow::Error::msg)?;
             finish_agent!(configured!(client, model), tool)
         }
         ProviderKind::Anthropic => {
@@ -817,29 +1187,53 @@ fn build_agent(
 }
 
 /// Build the provider/model catalog for the Settings panel from the rig-backed
-/// [`providers`] registry. Credential status comes from Worktable's database.
+/// [`providers`] registry. Credential status comes from Worktable's database;
+/// OpenCode's model list follows the enabled service checkboxes.
 fn build_snapshot(store: &SqliteStore) -> anyhow::Result<ProvidersSnapshot> {
     let credentials = store.list_provider_credentials()?;
     let active_provider = store.get_config("active_provider")?;
     let active_model = store.get_config("active_model")?;
+    let services = opencode::Services::from_store(store);
 
     let providers = providers::PROVIDERS
         .iter()
-        .map(|spec| ProviderInfo {
-            id: spec.id.to_owned(),
-            name: spec.name.to_owned(),
-            supports_api_key: true,
-            supports_oauth: false,
-            api_key_set: credentials.contains_key(spec.id),
-            oauth_set: false,
-            models: spec
-                .models
-                .iter()
-                .map(|(id, name)| ModelInfo {
-                    id: (*id).to_owned(),
-                    name: (*name).to_owned(),
-                })
-                .collect(),
+        .map(|spec| {
+            let api_key_set = spec.supports_api_key()
+                && credentials
+                    .get(spec.id)
+                    .is_some_and(|c| c.kind == "api_key" && !c.key.is_empty());
+            let oauth_set = spec.supports_oauth()
+                && credentials
+                    .get(spec.id)
+                    .is_some_and(|c| c.kind == "oauth" && !c.key.is_empty());
+            let state = if api_key_set || oauth_set {
+                crate::model_state::read(store, spec.id)
+            } else {
+                crate::model_state::ModelState::default()
+            };
+            ProviderInfo {
+                id: spec.id.to_owned(),
+                name: spec.name.to_owned(),
+                supports_api_key: spec.supports_api_key(),
+                supports_oauth: spec.supports_oauth(),
+                api_key_set,
+                oauth_set,
+                groups: if spec.kind == ProviderKind::OpenCode {
+                    opencode::SERVICES
+                        .iter()
+                        .map(|service| ProviderGroup {
+                            id: service.id().to_owned(),
+                            name: service.name().to_owned(),
+                            enabled: services.enabled(*service),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                models: state.models,
+                models_loading: state.loading,
+                models_error: state.error,
+            }
         })
         .collect();
 
@@ -861,7 +1255,9 @@ fn empty_snapshot() -> ProvidersSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_state;
     use std::time::{Duration, Instant};
+    use worktable_events::ModelInfo;
 
     /// A multi-thread runtime for the worker, matching how the app hosts it.
     fn test_runtime(store: SqliteStore) -> (tokio::runtime::Runtime, AgentRuntime) {
@@ -870,7 +1266,39 @@ mod tests {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let agent = AgentRuntime::start(store, runtime.handle().clone());
+        let agent = AgentRuntime::start_with_model_loader(
+            store,
+            runtime.handle().clone(),
+            Arc::new(|store, provider| {
+                Box::pin(async move {
+                    let services = opencode::Services::from_store(&store);
+                    let groups = if provider == opencode::ID {
+                        opencode::SERVICES
+                            .into_iter()
+                            .filter(|service| services.enabled(*service))
+                            .map(|service| Some(service.name().to_owned()))
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![None]
+                    };
+                    Ok(crate::model_catalog::FetchedModels {
+                        models: groups
+                            .into_iter()
+                            .enumerate()
+                            .flat_map(|(section, group)| {
+                                (0..2).map(move |row| ModelInfo {
+                                    id: format!("server-model-{section}-{row}"),
+                                    name: format!("Server model {section}-{row}"),
+                                    group: group.clone(),
+                                    api: None,
+                                })
+                            })
+                            .collect(),
+                        warning: None,
+                    })
+                })
+            }),
+        );
         (runtime, agent)
     }
 
@@ -910,6 +1338,133 @@ mod tests {
     }
 
     #[test]
+    fn subscription_agent_builds_without_provider_io() {
+        let provider = providers::spec(chatgpt::ID).unwrap();
+        build_agent(
+            provider,
+            r#"{"access_token":"fake-access","account_id":"fake-account"}"#,
+            rig::providers::chatgpt::GPT_5_4,
+            "session-test",
+            None,
+            None,
+        )
+        .expect("subscription Responses agent constructs without I/O");
+    }
+
+    #[test]
+    fn subscription_login_identity_and_cancellation_guard() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let login = ActiveLogin {
+            cancel: cancel.clone(),
+            notify,
+        };
+        assert!(login.matches(&cancel));
+        assert!(!login.matches(&Arc::new(AtomicBool::new(false))));
+        cancel.store(true, Ordering::SeqCst);
+        assert!(!login.matches(&cancel));
+    }
+
+    #[test]
+    fn subscription_cancel_and_logout_invalidate_pending_login_without_io() {
+        let store = temp_store();
+        let (_runtime, agent) = test_runtime(store.clone());
+        let _ = agent.try_recv();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *agent.login.lock().unwrap() = Some(ActiveLogin {
+            cancel: cancel.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        agent
+            .send(WorkerRequest::CancelLogin {
+                provider_id: chatgpt::ID.to_owned(),
+            })
+            .unwrap();
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(agent.login.lock().unwrap().is_none());
+        assert!(matches!(
+            agent.try_recv(),
+            Some(WorkerEvent::LoginResult { ok: false, .. })
+        ));
+
+        store
+            .write_provider_credential(
+                chatgpt::ID,
+                &ProviderCredential {
+                    kind: "oauth".to_owned(),
+                    key: r#"{"access_token":"fake-access"}"#.to_owned(),
+                },
+            )
+            .unwrap();
+        store.set_config("active_provider", chatgpt::ID).unwrap();
+        store.set_config("active_model", "gpt-5.4").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *agent.login.lock().unwrap() = Some(ActiveLogin {
+            cancel: cancel.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        agent
+            .send(WorkerRequest::Logout {
+                provider_id: chatgpt::ID.to_owned(),
+            })
+            .unwrap();
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(agent.login.lock().unwrap().is_none());
+        assert!(
+            store
+                .read_provider_credential(chatgpt::ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get_config("active_provider").unwrap().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            store.get_config("active_model").unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn subscription_cannot_accept_api_keys_or_resolve_api_key_credentials() {
+        let store = temp_store();
+        let (_runtime, agent) = test_runtime(store.clone());
+        let _ = agent.try_recv();
+        agent
+            .send(WorkerRequest::SetApiKey {
+                provider_id: chatgpt::ID.to_owned(),
+                api_key: "fake-api-key".to_owned(),
+            })
+            .unwrap();
+        assert!(
+            store
+                .read_provider_credential(chatgpt::ID)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            agent.try_recv(),
+            Some(WorkerEvent::WorkerError { .. })
+        ));
+        store.set_config("active_provider", chatgpt::ID).unwrap();
+        store.set_config("active_model", "gpt-5.4").unwrap();
+        store
+            .write_provider_credential(
+                chatgpt::ID,
+                &ProviderCredential {
+                    kind: "api_key".to_owned(),
+                    key: "fake-api-key".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            resolve_active_provider(&store),
+            Err(error) if error == chatgpt::SIGN_IN_AGAIN
+        ));
+    }
+
+    #[test]
     fn list_providers_returns_the_rig_catalog() {
         let (_runtime, agent) = test_runtime(temp_store());
         let _ = agent.try_recv();
@@ -928,10 +1483,10 @@ mod tests {
         for provider in &snapshot.providers {
             assert!(!provider.id.is_empty());
             assert!(!provider.name.is_empty());
-            assert!(!provider.models.is_empty());
+            assert!(provider.models.is_empty());
         }
         assert!(
-            snapshot.providers.iter().any(|p| p.id == opencode_go::ID),
+            snapshot.providers.iter().any(|p| p.id == opencode::ID),
             "opencode-go should be in the catalog"
         );
         assert!(
@@ -979,12 +1534,23 @@ mod tests {
     #[test]
     fn set_api_key_activates_provider_and_selects_a_model() {
         let store = temp_store();
-        let (_runtime, agent) = test_runtime(store);
+        let (_runtime, initial_agent) = test_runtime(store.clone());
+        drop(initial_agent);
+        let (release, result) = tokio::sync::oneshot::channel();
+        let result = Arc::new(Mutex::new(Some(result)));
+        let agent = AgentRuntime::start_with_model_loader(
+            store,
+            _runtime.handle().clone(),
+            Arc::new(move |_, _| {
+                let result = result.lock().unwrap().take().unwrap();
+                Box::pin(async move { result.await.unwrap() })
+            }),
+        );
         let _ = agent.try_recv();
 
         agent
             .send(WorkerRequest::SetApiKey {
-                provider_id: opencode_go::ID.to_owned(),
+                provider_id: opencode::ID.to_owned(),
                 api_key: "sk-test".to_owned(),
             })
             .unwrap();
@@ -999,12 +1565,307 @@ mod tests {
         else {
             panic!("expected ConfigChanged after SetApiKey");
         };
-        assert_eq!(active_provider.as_deref(), Some(opencode_go::ID));
-        assert_eq!(
-            active_model.as_deref(),
-            Some("glm-5.3"),
-            "the catalog's first model should be auto-selected"
+        assert_eq!(active_provider.as_deref(), Some(opencode::ID));
+        assert!(
+            active_model.is_none(),
+            "saving a key is not model discovery"
         );
+        release
+            .send(Ok(crate::model_catalog::FetchedModels {
+                models: vec![ModelInfo {
+                    id: "server-model-0-0".to_owned(),
+                    name: "Server model 0-0".to_owned(),
+                    group: Some(opencode::Service::Go.name().to_owned()),
+                    api: None,
+                }],
+                warning: None,
+            }))
+            .unwrap();
+        let event = recv_until(&agent, Duration::from_secs(2), |event| {
+            matches!(event, WorkerEvent::ConfigChanged { active_provider, active_model }
+                if active_provider.as_deref() == Some(opencode::ID)
+                    && active_model.as_deref() == Some("server-model-0-0"))
+        });
+        assert!(
+            event.is_some(),
+            "successful discovery selects its first row"
+        );
+    }
+
+    #[test]
+    fn saving_another_key_keeps_the_provider_model_pair_consistent() {
+        let store = temp_store();
+        store.set_config("active_provider", "openai").unwrap();
+        store.set_config("active_model", "gpt-5-mini").unwrap();
+        let (_runtime, agent) = test_runtime(store.clone());
+
+        agent.set_api_key("deepseek", "test-key-no-network");
+        let _ = recv_until(&agent, Duration::from_secs(2), |event| {
+            matches!(event, WorkerEvent::ProvidersSnapshot { snapshot }
+                if snapshot.active_model.as_deref() == Some("server-model-0-0"))
+        });
+        let snapshot = build_snapshot(&store).unwrap();
+        assert_eq!(snapshot.active_provider.as_deref(), Some("deepseek"));
+        assert_eq!(snapshot.active_model.as_deref(), Some("server-model-0-0"));
+
+        // An empty enabled catalog must not retain a different provider's id.
+        opencode::Services {
+            go: false,
+            zen: false,
+        }
+        .write_to_store(&store)
+        .unwrap();
+        agent.set_api_key(opencode::ID, "test-key-no-network");
+        let snapshot = build_snapshot(&store).unwrap();
+        assert_eq!(snapshot.active_provider.as_deref(), Some(opencode::ID));
+        assert!(snapshot.active_model.is_none());
+    }
+
+    #[test]
+    fn provider_groups_gate_the_catalog_and_revalidate_the_model() {
+        let store = temp_store();
+        store.set_config("unrelated_setting", "preserved").unwrap();
+        let (_runtime, agent) = test_runtime(store.clone());
+        agent
+            .send(WorkerRequest::SetApiKey {
+                provider_id: opencode::ID.to_owned(),
+                api_key: "sk-test".to_owned(),
+            })
+            .unwrap();
+        assert!(
+            recv_until(&agent, Duration::from_secs(2), |event| {
+                matches!(event, WorkerEvent::ProvidersSnapshot { snapshot }
+                    if snapshot.active_model.as_deref() == Some("server-model-0-0"))
+            })
+            .is_some()
+        );
+        agent
+            .send(WorkerRequest::SetModel {
+                provider_id: opencode::ID.to_owned(),
+                model_id: "server-model-0-1".to_owned(),
+            })
+            .unwrap();
+        agent
+            .send(WorkerRequest::SetProviderGroup {
+                provider_id: opencode::ID.to_owned(),
+                group_id: "go".to_owned(),
+                enabled: false,
+            })
+            .unwrap();
+
+        assert!(
+            recv_until(&agent, Duration::from_secs(2), |event| {
+                matches!(event, WorkerEvent::ProvidersSnapshot { snapshot }
+                    if snapshot.providers.iter().any(|provider|
+                        provider.id == opencode::ID && !provider.models_loading
+                            && provider.models.len() == 2
+                            && provider.models.iter().all(|model|
+                                model.group.as_deref() == Some(opencode::Service::Zen.name()))))
+            })
+            .is_some()
+        );
+        let snapshot = build_snapshot(&store).unwrap();
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == opencode::ID)
+            .unwrap();
+        assert!(
+            !provider
+                .groups
+                .iter()
+                .find(|group| group.id == "go")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            provider
+                .groups
+                .iter()
+                .find(|group| group.id == "zen")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !provider
+                .models
+                .iter()
+                .any(|model| model.group.as_deref() == Some(opencode::Service::Go.name()))
+        );
+        assert!(
+            provider
+                .models
+                .iter()
+                .any(|model| model.id == "server-model-0-0")
+        );
+        assert_eq!(snapshot.active_model.as_deref(), Some("server-model-0-0"));
+
+        // A stale picker cannot select a model after its service is disabled.
+        agent
+            .send(WorkerRequest::SetModel {
+                provider_id: opencode::ID.to_owned(),
+                model_id: "server-model-1-1".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.get_config("active_model").unwrap().as_deref(),
+            Some("server-model-0-0")
+        );
+        assert!(
+            recv_until(&agent, Duration::from_secs(2), |event| {
+                matches!(event, WorkerEvent::WorkerError { .. })
+            })
+            .is_some()
+        );
+
+        agent
+            .send(WorkerRequest::SetProviderGroup {
+                provider_id: opencode::ID.to_owned(),
+                group_id: "zen".to_owned(),
+                enabled: false,
+            })
+            .unwrap();
+        let snapshot = build_snapshot(&store).unwrap();
+        assert!(snapshot.active_provider.is_none());
+        assert!(snapshot.active_model.is_none());
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|p| p.id == opencode::ID)
+            .unwrap();
+        assert!(provider.models.is_empty());
+        assert!(provider.groups.iter().all(|group| !group.enabled));
+        assert!(provider.api_key_set, "disabling services must not log out");
+        assert_eq!(
+            store
+                .read_provider_credential(opencode::ID)
+                .unwrap()
+                .unwrap()
+                .key,
+            "sk-test"
+        );
+        assert_eq!(
+            store.get_config("unrelated_setting").unwrap().as_deref(),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn opencode_agents_build_for_each_gateway_and_dialect_without_io() {
+        let provider = providers::spec(opencode::ID).unwrap();
+        for service in opencode::SERVICES {
+            let services = opencode::Services {
+                go: service == opencode::Service::Go,
+                zen: service == opencode::Service::Zen,
+            };
+            for api in ["chat", "responses", "messages"] {
+                let model = ModelInfo {
+                    id: "server-model".to_owned(),
+                    name: "Server model".to_owned(),
+                    group: Some(service.name().to_owned()),
+                    api: Some(api.to_owned()),
+                };
+                let route = opencode::route(&model, services).unwrap();
+                assert_eq!(route.service, service);
+                build_agent(
+                    provider,
+                    "sk-test",
+                    &model.id,
+                    "session-test",
+                    Some(route),
+                    None,
+                )
+                .expect("each offered model must have a constructible client");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_grouping_matches_the_dispatch_route_for_every_enabled_set() {
+        let store = temp_store();
+        for services in [
+            opencode::Services::default(),
+            opencode::Services {
+                go: true,
+                zen: false,
+            },
+            opencode::Services {
+                go: false,
+                zen: true,
+            },
+            opencode::Services {
+                go: false,
+                zen: false,
+            },
+        ] {
+            services.write_to_store(&store).unwrap();
+            let snapshot = build_snapshot(&store).unwrap();
+            for provider in snapshot.providers {
+                if provider.id == opencode::ID {
+                    assert!(
+                        provider.models.is_empty(),
+                        "unconfigured providers advertise no models"
+                    );
+                    for model in provider.models {
+                        let route = opencode::route(&model, services).unwrap();
+                        assert_eq!(model.group.as_deref(), Some(route.service.name()));
+                        assert!(services.enabled(route.service));
+                    }
+                } else {
+                    assert!(provider.groups.is_empty());
+                    assert!(provider.models.iter().all(|model| model.group.is_none()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_opencode_selection_and_credential_resolve_without_migration() {
+        let store = temp_store();
+        store
+            .write_provider_credential(
+                "opencode-go",
+                &ProviderCredential {
+                    kind: "api_key".to_owned(),
+                    key: "sk-test-legacy".to_owned(),
+                },
+            )
+            .unwrap();
+        store.set_config("active_provider", "opencode-go").unwrap();
+        store
+            .set_config("active_model", "legacy-server-model")
+            .unwrap();
+        model_state::write(
+            &store,
+            "opencode-go",
+            &model_state::ModelState {
+                models: vec![ModelInfo {
+                    id: "legacy-server-model".to_owned(),
+                    name: "Legacy server model".to_owned(),
+                    group: Some(opencode::Service::Go.name().to_owned()),
+                    api: Some("chat".to_owned()),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = resolve_active_provider(&store).unwrap();
+        assert_eq!(config.key, "sk-test-legacy");
+        assert_eq!(config.model, "legacy-server-model");
+        assert_eq!(
+            config.route,
+            Some(opencode::Route {
+                service: opencode::Service::Go,
+                dialect: opencode::Dialect::Chat,
+            })
+        );
+        opencode::Services {
+            go: false,
+            zen: true,
+        }
+        .write_to_store(&store)
+        .unwrap();
+        assert!(resolve_active_provider(&store).is_err());
     }
 
     #[test]
@@ -1013,10 +1874,18 @@ mod tests {
         let (_runtime, agent) = test_runtime(store.clone());
         let _ = agent.try_recv();
 
+        agent.set_api_key("openai", "test-key-no-network");
+        assert!(
+            recv_until(&agent, Duration::from_secs(2), |event| {
+                matches!(event, WorkerEvent::ProvidersSnapshot { snapshot }
+                    if snapshot.active_model.as_deref() == Some("server-model-0-0"))
+            })
+            .is_some()
+        );
         agent
             .send(WorkerRequest::SetModel {
                 provider_id: "openai".to_owned(),
-                model_id: "gpt-5.5".to_owned(),
+                model_id: "server-model-0-1".to_owned(),
             })
             .unwrap();
 
@@ -1031,10 +1900,10 @@ mod tests {
             panic!("expected ConfigChanged after SetModel");
         };
         assert_eq!(active_provider.as_deref(), Some("openai"));
-        assert_eq!(active_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(active_model.as_deref(), Some("server-model-0-1"));
         assert_eq!(
             store.get_config("active_model").unwrap().as_deref(),
-            Some("gpt-5.5")
+            Some("server-model-0-1")
         );
     }
 
@@ -1060,7 +1929,13 @@ mod tests {
             })
             .unwrap();
         let event = recv_until(&agent, Duration::from_secs(2), |event| {
-            matches!(event, WorkerEvent::ConfigChanged { .. })
+            matches!(
+                event,
+                WorkerEvent::ConfigChanged {
+                    active_provider: None,
+                    active_model: None,
+                }
+            )
         });
         let Some(WorkerEvent::ConfigChanged {
             active_provider,

@@ -20,7 +20,41 @@
 //! | `md`      | `theme.radius`      | rows, cards, ordinary controls     |
 //! | `lg`      | `theme.radius_lg`   | menus, popovers, floating surfaces |
 
-use gpui::{Pixels, Rems, Window, rems};
+use gpui::{App, Pixels, Rems, Window, rems};
+use gpui_component::{Theme, ThemeRegistry};
+
+/// Install the bundled palette before the first frame. Disk watching can
+/// replace it later, but a missing theme directory must not leave blue defaults.
+pub fn load_theme(cx: &mut App) -> anyhow::Result<()> {
+    ThemeRegistry::global_mut(cx).load_themes_from_str(include_str!("../../../themes/ayu.json"))?;
+    apply_registered_theme(cx);
+    Ok(())
+}
+
+/// Register both variants without changing the user's current appearance.
+pub fn apply_registered_theme(cx: &mut App) {
+    // Since 0.7, apply_config also switches modes. Capture this before loading
+    // either variant, not after the dark variant has made itself active.
+    let mode = Theme::global(cx).mode;
+    for name in ["Ayu Light", "Ayu Dark"] {
+        if let Some(config) = ThemeRegistry::global(cx).themes().get(name).cloned() {
+            Theme::global_mut(cx).apply_config(&config);
+        }
+    }
+    Theme::change(mode, None, cx);
+    apply_control_style(cx);
+}
+
+/// Product-wide control treatment, reapplied after a theme file is loaded.
+pub fn apply_control_style(cx: &mut App) {
+    Theme::update(cx, |theme| {
+        // GPUI Kit keeps the 1px focus edge when the outside halo is disabled.
+        theme.focus_ring = false;
+        // macOS Tahoe control radii are a documented platform boundary.
+        theme.radius = gpui::px(10.);
+        theme.radius_lg = gpui::px(14.);
+    });
+}
 
 /// Reading-column width the app is designed around; content never gets
 /// narrower than this when the viewport allows it.
@@ -95,3 +129,33 @@ pub fn content_column_width(window: &Window) -> Pixels {
 /// Physical window-chrome inset for the transparent macOS titlebar: leaves
 /// room for the traffic lights. A platform boundary, not a design value.
 pub const TITLEBAR_INSET: Pixels = gpui::px(30.);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use gpui_component::ThemeMode;
+
+    #[gpui::test]
+    fn bundled_theme_keeps_the_mode_and_uses_warm_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            Theme::change(ThemeMode::Light, None, cx);
+            load_theme(cx).expect("bundled theme");
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                Theme::change(mode, None, cx);
+                apply_registered_theme(cx);
+                let theme = Theme::global(cx);
+                assert_eq!(theme.mode, mode, "loading both variants must preserve mode");
+                assert_eq!(theme.list_active.h, theme.accent.h);
+                assert_eq!(theme.selection.h, theme.primary.h);
+                assert_eq!(theme.tokens.list_active.color, theme.list_active);
+                assert_eq!(theme.tokens.selection.color, theme.selection);
+                assert!(
+                    !theme.focus_ring,
+                    "focus uses a thin edge, not an outside halo"
+                );
+            }
+        });
+    }
+}

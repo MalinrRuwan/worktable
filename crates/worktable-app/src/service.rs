@@ -78,7 +78,38 @@ impl WorktableService {
         );
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         // Direct connect for hermetic tests (no env var, no bootstrap side-effects).
-        let runtime = tokio.block_on(WorktableRuntime::connect(db_path))?;
+        let loader: worktable_ai::ModelLoader = Arc::new(|store, provider_id| {
+            Box::pin(async move {
+                // Generic fake API rows, never a production provider catalog.
+                let services = worktable_ai::opencode::Services::from_store(&store);
+                let groups = if provider_id == worktable_ai::opencode::ID {
+                    worktable_ai::opencode::SERVICES
+                        .into_iter()
+                        .filter(|service| services.enabled(*service))
+                        .map(|service| Some(service.name().to_owned()))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![None]
+                };
+                Ok(worktable_ai::model_catalog::FetchedModels {
+                    models: groups
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(section, group)| {
+                            (0..2).map(move |row| worktable_events::ModelInfo {
+                                id: format!("server-model-{section}-{row}"),
+                                name: format!("Server model {section}-{row}"),
+                                group: group.clone(),
+                                api: None,
+                            })
+                        })
+                        .collect(),
+                    warning: None,
+                })
+            })
+        });
+        let runtime =
+            tokio.block_on(WorktableRuntime::connect_with_model_loader(db_path, loader))?;
         let entries = tokio
             .block_on(runtime.list_entries(500))
             .unwrap_or_default();
@@ -417,6 +448,23 @@ impl WorktableService {
         self.run_on_tokio(
             move |runtime| async move { runtime.set_model(&provider_id, &model_id).await },
         )
+        .await
+    }
+
+    /// Enable or disable a catalog service without changing its credential.
+    pub async fn set_provider_group(
+        &self,
+        provider_id: &str,
+        group_id: &str,
+        enabled: bool,
+    ) -> EmptyResult {
+        let provider_id = provider_id.to_owned();
+        let group_id = group_id.to_owned();
+        self.run_on_tokio(move |runtime| async move {
+            runtime
+                .set_provider_group(&provider_id, &group_id, enabled)
+                .await
+        })
         .await
     }
 

@@ -1197,13 +1197,13 @@ fn nav_provider_configure_select_and_logout(cx: &mut TestAppContext) {
         "provider catalog should load"
     );
 
-    let (provider_id, model_id) = cx.read_entity(&view, |v, _| {
-        let (pid, models) = v
-            .provider_models
+    let provider_id = cx.read_entity(&view, |v, _| {
+        let provider = v
+            .providers
             .iter()
-            .find(|(_, m)| !m.is_empty())
-            .expect("a provider with models");
-        (pid.clone(), models[0].0.clone())
+            .find(|provider| provider.supports_api_key)
+            .expect("an API-key provider");
+        provider.id.clone()
     });
 
     // Settings → Providers lists the catalog; the row's Configure button
@@ -1211,6 +1211,20 @@ fn nav_provider_configure_select_and_logout(cx: &mut TestAppContext) {
     view.update(&mut cx, |this, cx| {
         this.show_settings_at(super::SettingsTab::Providers, cx)
     });
+    cx.run_until_parked();
+    // Unconfigured providers have no model rows, including through the keyboard.
+    click_selector(&mut cx, "settings-model-picker");
+    cx.simulate_input("unconfigured model");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("model-picker-empty").is_some());
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.read_entity(&view, |v, _| v.active_provider.is_none()));
+    assert!(cx.read_entity(&view, |v, cx| {
+        v.model_picker.read(cx).selected_value().is_none()
+    }));
+    cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     // `debug_bounds` wants a `'static` selector; the row id carries the
     // provider id, so leak the small string within the test process.
@@ -1257,18 +1271,100 @@ fn nav_provider_configure_select_and_logout(cx: &mut TestAppContext) {
         })
     });
     assert!(ok, "saving the API key should confirm in the dialog status");
-
-    // Model picker → "select_model" activates provider + model.
-    view.update(&mut cx, |this, cx| {
-        this.select_model(&provider_id, &model_id, cx)
+    assert!(wait_for(&mut cx, 10, |cx| cx.read_entity(&view, |v, _| {
+        v.providers
+            .iter()
+            .any(|provider| provider.id == provider_id && provider.models.len() >= 2)
+    })));
+    let model_id = cx.read_entity(&view, |v, _| {
+        v.providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .unwrap()
+            .models[1]
+            .id
+            .clone()
     });
+
+    // The native grouped picker filters by source ID and commits with Enter.
+    click_selector(&mut cx, "provider-dialog-close");
+    click_selector(&mut cx, "settings-model-picker");
+    cx.simulate_input(&model_id);
+    cx.run_until_parked();
+    let option_selector =
+        Box::leak(format!("model-option:{provider_id}:{model_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(option_selector).is_some(),
+        "filtered model should be visible"
+    );
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
     let ok = wait_for(&mut cx, 10, |cx| {
         cx.read_entity(&view, |v, _| {
             v.active_provider.as_deref() == Some(provider_id.as_str())
                 && v.active_model.as_deref() == Some(model_id.as_str())
+                && !v.providers_loading
         })
     });
-    assert!(ok, "selecting a model should activate provider + model");
+    assert!(
+        ok,
+        "selecting a model should activate provider + model: {:?}",
+        cx.read_entity(&view, |v, _| (
+            v.active_provider.clone(),
+            v.active_model.clone(),
+            v.settings_status.clone()
+        ))
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, cx| v
+            .model_picker
+            .read(cx)
+            .selected_value()
+            .cloned()),
+        Some(crate::model_picker::ModelIdentity {
+            provider_id: provider_id.clone(),
+            model_id: model_id.clone(),
+        }),
+        "the controlled picker should reflect the saved snapshot"
+    );
+
+    // Pointer selection uses the same paired identity, not a display name.
+    let first_model = cx.read_entity(&view, |v, _| {
+        v.providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .unwrap()
+            .models[0]
+            .id
+            .clone()
+    });
+    click_selector(&mut cx, "settings-model-picker");
+    cx.simulate_input(&first_model);
+    cx.run_until_parked();
+    let option_selector =
+        Box::leak(format!("model-option:{provider_id}:{first_model}").into_boxed_str());
+    click_selector(&mut cx, option_selector);
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.active_model.as_deref() == Some(first_model.as_str()) && !v.providers_loading
+        })
+    }));
+
+    click_selector(&mut cx, "settings-model-picker");
+    cx.simulate_input("there is no model with this name");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("model-picker-empty").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("model-picker-empty").is_none());
+    cx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .model_picker
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+    });
 
     // Button "logout:{id}" → credential cleared in a fresh snapshot.
     view.update(&mut cx, |this, cx| this.logout_provider(&provider_id, cx));
@@ -1281,6 +1377,15 @@ fn nav_provider_configure_select_and_logout(cx: &mut TestAppContext) {
         })
     });
     assert!(ok, "logout should clear the stored API key");
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |v, cx| v
+            .model_picker
+            .read(cx)
+            .selected_value()
+            .is_none()),
+        "logout clears the controlled picker even if the stored model remains"
+    );
 }
 
 #[gpui::test]
@@ -1302,8 +1407,12 @@ fn nav_oauth_login_and_cancel_round_trip(cx: &mut TestAppContext) {
         return;
     };
 
-    // Button "login:{id}" → spinner state, synchronously.
-    view.update(&mut cx, |this, cx| this.login_oauth(&provider_id, cx));
+    // Model an in-progress login without starting a real provider request.
+    view.update(&mut cx, |this, cx| {
+        this.logging_in.insert(provider_id.clone());
+        this.provider_dialog_status = Some(format!("Signing in to {provider_id}"));
+        cx.notify();
+    });
     cx.run_until_parked();
     let (logging_in, status) = cx.read_entity(&view, |v, _| {
         (
@@ -1316,6 +1425,16 @@ fn nav_oauth_login_and_cancel_round_trip(cx: &mut TestAppContext) {
 
     // Button "cancel-login:{id}" → spinner cleared, cancelled status.
     view.update(&mut cx, |this, cx| this.cancel_login(&provider_id, cx));
+    view.update(&mut cx, |this, cx| {
+        this.on_event(
+            &worktable_events::WorktableEvent::AiLoginResult {
+                provider_id: provider_id.clone(),
+                ok: false,
+                error: Some("ChatGPT sign-in cancelled".to_owned()),
+            },
+            cx,
+        );
+    });
     let ok = wait_for(&mut cx, 10, |cx| {
         cx.read_entity(&view, |v, _| {
             !v.logging_in.contains(&provider_id)
@@ -3723,6 +3842,13 @@ fn chats_select_a_saved_transcript_and_new_chat_keeps_the_previous_one(cx: &mut 
             .collect::<Vec<_>>()),
         ["recent", "older"]
     );
+    let row = cx.debug_bounds("chat-row:recent").unwrap();
+    let content = cx.debug_bounds("chat-row-content:recent").unwrap();
+    let rem = cx.update(|window, _| window.rem_size());
+    assert!(content.left() >= row.left() + rem * 0.75);
+    assert!(content.right() <= row.right() - rem * 0.75);
+    assert!(content.top() >= row.top() + rem * 0.5);
+    assert!(content.bottom() <= row.bottom() - rem * 0.5);
     click_selector(&mut cx, "chat-row:recent");
     assert!(wait_for(&mut cx, 5, |cx| cx
         .read_entity(&view, |v, _| v.chat_id.as_deref()
@@ -3964,4 +4090,488 @@ fn chats_reduced_motion_and_dismissal_reject_a_pending_selection(cx: &mut TestAp
         "Keep this draft"
     );
     assert!(cx.read_entity(&view, |v, _| v.chat_id.is_none()));
+}
+
+/// Activity changes only the contents of the three composer circles, not layout.
+#[gpui::test]
+fn assistant_composer_circles_keep_uniform_geometry_across_activity(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for width in [480., 1000.] {
+        let (view, window) = setup_view_with_size(
+            cx,
+            Vec::new(),
+            Size {
+                width: px(width),
+                height: px(884.),
+            },
+        );
+        let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+        settle(&mut visual);
+        no_splash(&mut visual, &view);
+        view.update(&mut visual, |this, cx| this.show_assistant(cx));
+        settle_strip(&mut visual);
+
+        let mut idle_geometry = None;
+        for (busy, building) in [(false, false), (true, false), (false, true), (true, true)] {
+            view.update(&mut visual, |this, cx| {
+                this.assistant_busy = busy;
+                this.knowledge_building = building;
+                cx.notify();
+            });
+            force_frame(&mut visual);
+            let chats = visual.debug_bounds("assistant-chats").unwrap();
+            let build = visual.debug_bounds("build-knowledge").unwrap();
+            let send = visual
+                .debug_bounds(if busy {
+                    "abort-assistant"
+                } else {
+                    "send-assistant"
+                })
+                .unwrap();
+            let input = visual.debug_bounds("assistant-input").unwrap();
+            let diameter = visual.update(|window, _| window.rem_size() * 2.25);
+            for circle in [chats, build, send] {
+                assert_eq!(circle.size, Size::new(diameter, diameter));
+                assert_eq!(circle.origin.y, chats.origin.y);
+            }
+            assert_eq!(build.left() - chats.right(), send.left() - build.right());
+            let gap = visual.update(|window, _| window.rem_size() * 0.25);
+            assert_eq!(chats.left() - input.right(), gap);
+            assert_eq!(build.left() - chats.right(), gap);
+            assert!(build.left() > chats.right(), "circles need a visible gap");
+            let geometry = (chats, build, send, input);
+            if let Some(idle) = idle_geometry {
+                assert_eq!(geometry, idle, "activity must not move controls or input");
+            } else {
+                idle_geometry = Some(geometry);
+            }
+            assert_eq!(
+                visual.read_entity(&view, |v, _| (v.assistant_busy, v.knowledge_building)),
+                (busy, building)
+            );
+            assert_eq!(visual.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
+        }
+    }
+}
+
+#[gpui::test]
+fn assistant_plain_answer_preserves_measure_citations_and_thinking(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view_with_size(
+        cx,
+        Vec::new(),
+        Size {
+            width: px(480.),
+            height: px(884.),
+        },
+    );
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.show_thinking = true;
+        let mut answer = crate::assistant::ChatMessage::assistant("Your Rust note is here[1].");
+        answer.thinking = "I found a matching note.".into();
+        answer.citations.push(worktable_ui::CitationRef {
+            n: 1,
+            label: "Rust note".into(),
+            snippet: "A saved Rust note".into(),
+            host: "Library".into(),
+            url: "worktable-entry:rust".into(),
+        });
+        this.messages = vec![crate::assistant::ChatMessage::user("Yes"), answer];
+        cx.notify();
+    });
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    let user = cx.debug_bounds("bubble-0").unwrap();
+    let user_content = cx.debug_bounds("user-bubble:0").unwrap();
+    let answer = cx.debug_bounds("assistant-answer:1").unwrap();
+    let transcript = cx.debug_bounds("assistant-messages").unwrap();
+    let rem = cx.update(|window, _| window.rem_size());
+    let measure = transcript.size.width - rem * 2.;
+    assert!(user.size.width < answer.size.width / 2.);
+    assert!((answer.size.width - measure * 0.85).abs() <= px(1.));
+    assert!((user.right() - (transcript.right() - rem)).abs() <= px(1.));
+    assert!(
+        user_content.left() > user.left(),
+        "user chrome keeps its padding"
+    );
+    assert_eq!(answer, cx.debug_bounds("bubble-1").unwrap());
+    assert!(answer.left() < user.left(), "the answer stays left aligned");
+    for selector in [
+        "thinking-header-1",
+        "thinking-body-1",
+        "msg-1-citations-ref-1",
+    ] {
+        let content = cx.debug_bounds(selector).unwrap();
+        assert!(content.size.width > px(0.) && content.size.height > px(0.));
+        assert!(content.top() >= transcript.top() && content.bottom() <= transcript.bottom());
+    }
+    assert_eq!(
+        cx.read_entity(&view, |v, _| (
+            v.messages[0].text.clone(),
+            v.messages[1].citations.len()
+        )),
+        ("Yes".into(), 1)
+    );
+    click_selector(&mut cx, "thinking-header-1");
+    assert!(cx.debug_bounds("thinking-body-1").is_none());
+    assert!(cx.debug_bounds("assistant-answer:1").is_some());
+    assert!(cx.debug_bounds("msg-1-citations-ref-1").is_some());
+    assert!(cx.read_entity(&view, |v, _| v.messages[1].thinking_collapsed));
+}
+
+/// Bounds expose the label line metrics, not font weight, in the pinned GPUI API.
+#[gpui::test]
+fn appearance_labels_share_line_metrics_and_trailing_control_alignment(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view_with_size(
+        cx,
+        Vec::new(),
+        Size {
+            width: px(480.),
+            height: px(884.),
+        },
+    );
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Appearance, cx);
+    });
+    force_frame(&mut cx);
+    let theme = cx.debug_bounds("appearance-theme-label").unwrap();
+    let thinking = cx.debug_bounds("appearance-thinking-label").unwrap();
+    let tour = cx.debug_bounds("appearance-tour-label").unwrap();
+    assert_eq!(theme.size.height, thinking.size.height);
+    assert_eq!(theme.size.height, tour.size.height);
+    assert_eq!(theme.left(), thinking.left());
+    assert_eq!(theme.left(), tour.left());
+    let description = cx.debug_bounds("appearance-theme-description").unwrap();
+    let gap = cx.update(|window, _| window.rem_size() * 0.25);
+    assert_eq!(description.top() - theme.bottom(), gap);
+    let control = cx.debug_bounds("appearance-theme-control").unwrap();
+    let switch = cx.debug_bounds("thinking-switch").unwrap();
+    let replay = cx.debug_bounds("show-onboarding").unwrap();
+    assert!((theme.center().y - control.center().y).abs() <= px(1.));
+    assert!((control.right() - switch.right()).abs() <= px(1.));
+    assert!((control.right() - replay.right()).abs() <= px(1.));
+    assert!(theme.right() <= control.left());
+    assert_eq!(
+        cx.read_entity(&view, |v, _| (v.mode, v.settings_tab)),
+        (AppMode::Settings, Some(super::SettingsTab::Appearance))
+    );
+    click_selector(&mut cx, "thinking-switch");
+    assert!(cx.read_entity(&view, |v, _| v.show_thinking));
+    assert_eq!(cx.debug_bounds("appearance-theme-label").unwrap(), theme);
+}
+
+#[gpui::test]
+fn citation_numbers_keep_padding_baseline_and_repeat_previews(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| design::load_theme(cx).unwrap());
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        let mut answer = crate::assistant::ChatMessage::assistant("Notes[1][12][12][123].");
+        answer.citations = [1, 12, 123]
+            .into_iter()
+            .map(|n| worktable_ui::CitationRef {
+                n,
+                label: "A very long source title without enough room "
+                    .repeat(10)
+                    .into(),
+                snippet: format!(
+                    "{} {}",
+                    "https://example.com/".repeat(30),
+                    "text ".repeat(100)
+                )
+                .into(),
+                host: "a-long-unbroken-host-name.example.com".repeat(10).into(),
+                url: "worktable-entry:test-1000".into(),
+            })
+            .collect();
+        this.messages = vec![answer];
+        cx.notify();
+    });
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    let one = cx.debug_bounds("msg-0-citations-cite-1").unwrap();
+    let two = cx.debug_bounds("msg-0-citations-cite-12-1").unwrap();
+    let repeat = cx.debug_bounds("msg-0-citations-cite-12-2").unwrap();
+    let three = cx.debug_bounds("msg-0-citations-cite-123-3").unwrap();
+    let rem = cx.update(|window, _| window.rem_size());
+    assert_eq!(one.size.height, rem);
+    assert!(two.size.width > one.size.width);
+    assert!(three.size.width > two.size.width);
+    assert_eq!(two.size, repeat.size);
+    for marker in [two, repeat, three] {
+        assert_eq!(
+            marker.top(),
+            one.top(),
+            "grouped chips stay on one baseline"
+        );
+    }
+    assert!(
+        repeat.left() < two.right(),
+        "grouped chips overlap slightly"
+    );
+
+    // Both mentions of the same source must own their own hover preview.
+    for selector in ["msg-0-citations-cite-12-1", "msg-0-citations-cite-12-2"] {
+        let marker = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_move(marker.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let preview = cx.debug_bounds("citation-tooltip").expect("source preview");
+        assert!(preview.size.width <= rem * 16.);
+        for part in [
+            "citation-tooltip-label",
+            "citation-tooltip-snippet",
+            "citation-tooltip-host",
+        ] {
+            let bounds = cx.debug_bounds(part).unwrap();
+            assert!(bounds.left() >= preview.left() && bounds.right() <= preview.right());
+            assert!(bounds.top() >= preview.top() && bounds.bottom() <= preview.bottom());
+        }
+        cx.simulate_mouse_move(point(px(12.), px(12.)), None, Modifiers::default());
+        cx.run_until_parked();
+    }
+    click_selector(&mut cx, "msg-0-citations-cite-12-2");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v
+            .entry_modal
+            .as_ref()
+            .map(|modal| modal.entry_id.clone())),
+        Some("test-1000".to_owned())
+    );
+}
+
+#[gpui::test]
+fn model_service_controls_update_grouped_choices_without_losing_the_key(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for_providers(&mut cx, &view, 10));
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Providers, cx)
+    });
+    force_frame(&mut cx);
+    click_selector(&mut cx, "configure:opencode-go");
+    assert!(cx.debug_bounds("provider-groups").is_some());
+    assert!(cx.debug_bounds("provider-group:opencode-go:go").is_some());
+    assert!(cx.debug_bounds("provider-group:opencode-go:zen").is_some());
+    click_selector(&mut cx, "provider-key-input");
+    cx.simulate_input("test-key-no-network");
+    cx.run_until_parked();
+    click_selector(&mut cx, "save-provider-key");
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.providers.iter().any(|provider| {
+                provider.id == "opencode-go" && provider.api_key_set && !provider.models.is_empty()
+            })
+        })
+    }));
+    click_selector(&mut cx, "provider-group:opencode-go:zen");
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.providers.iter().any(|provider| {
+                provider.id == "opencode-go"
+                    && provider
+                        .groups
+                        .iter()
+                        .any(|group| group.id == "zen" && !group.enabled)
+                    && !provider
+                        .models
+                        .iter()
+                        .any(|model| model.group.as_deref() == Some("OpenCode Zen"))
+            })
+        })
+    }));
+    click_selector(&mut cx, "provider-group:opencode-go:zen");
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.providers.iter().any(|provider| {
+                provider.id == "opencode-go"
+                    && provider
+                        .groups
+                        .iter()
+                        .any(|group| group.id == "zen" && group.enabled)
+                    && provider
+                        .models
+                        .iter()
+                        .any(|model| model.group.as_deref() == Some("OpenCode Zen"))
+            })
+        })
+    }));
+    let zen_id = cx.read_entity(&view, |v, _| {
+        v.providers
+            .iter()
+            .find(|p| p.id == "opencode-go")
+            .unwrap()
+            .models
+            .iter()
+            .find(|model| model.group.as_deref() == Some("OpenCode Zen"))
+            .unwrap()
+            .id
+            .clone()
+    });
+    click_selector(&mut cx, "provider-dialog-close");
+    click_selector(&mut cx, "settings-model-picker");
+    cx.simulate_input("Zen");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("model-group:OpenCode Zen").is_some());
+    let selector: &'static str =
+        Box::leak(format!("model-option:opencode-go:{zen_id}").into_boxed_str());
+    click_selector(&mut cx, selector);
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.active_model.as_deref() == Some(zen_id.as_str())
+        })
+    }));
+
+    click_selector(&mut cx, "configure:opencode-go");
+    click_selector(&mut cx, "provider-group:opencode-go:zen");
+    assert!(wait_for(&mut cx, 10, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.providers.iter().any(|provider| {
+                provider.id == "opencode-go"
+                    && provider.api_key_set
+                    && !provider
+                        .models
+                        .iter()
+                        .any(|model| model.group.as_deref() == Some("OpenCode Zen"))
+                    && v.active_model.as_deref() != Some(zen_id.as_str())
+            })
+        })
+    }));
+    assert!(cx.read_entity(&view, |v, cx| {
+        v.model_picker
+            .read(cx)
+            .selected_value()
+            .is_some_and(|identity| identity.model_id != zen_id)
+    }));
+}
+
+#[gpui::test]
+fn subscription_login_renders_on_settings_and_in_dialog_without_reborrowing(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for_providers(&mut cx, &view, 10));
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Providers, cx);
+        this.logging_in.insert(worktable_ai::chatgpt::ID.to_owned());
+        cx.notify();
+    });
+    // The crash happened as soon as this waiting state rendered, before the
+    // provider returned a code. No actual OAuth request is needed to reproduce it.
+    force_frame(&mut cx);
+    assert!(cx.read_entity(&view, |v, _| {
+        v.logging_in.contains(worktable_ai::chatgpt::ID)
+    }));
+
+    view.update(&mut cx, |this, cx| {
+        this.auth_notice = Some(super::AuthNotice {
+            provider_id: worktable_ai::chatgpt::ID.to_owned(),
+            notify: worktable_events::AuthNotifyKind::DeviceCode {
+                user_code: "TEST-CODE".to_owned(),
+                verification_uri: "https://auth.openai.com/codex/device".to_owned(),
+                expires_in_seconds: Some(900),
+            },
+        });
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    for selector in [
+        "oauth-login-panel",
+        "oauth-device-code",
+        "oauth-open-verification",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} should render"
+        );
+    }
+    click_selector(&mut cx, "oauth-copy-code");
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("TEST-CODE".to_owned())
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_provider_dialog(worktable_ai::chatgpt::ID, window, cx);
+        });
+    });
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("provider-dialog").is_some());
+    assert!(cx.debug_bounds("oauth-device-code").is_some());
+    click_selector(&mut cx, "oauth-copy-code");
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("TEST-CODE".to_owned())
+    );
+    assert!(cx.read_entity(&view, |v, _| {
+        v.logging_in.contains(worktable_ai::chatgpt::ID)
+            && matches!(v.auth_notice.as_ref().map(|notice| &notice.notify),
+                Some(worktable_events::AuthNotifyKind::DeviceCode { user_code, .. })
+                    if user_code == "TEST-CODE")
+    }));
+    click_selector(&mut cx, "provider-dialog-close");
+    view.update(&mut cx, |this, cx| {
+        this.logging_in.remove(worktable_ai::chatgpt::ID);
+        this.auth_notice = None;
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("oauth-login-panel").is_none());
+}
+
+#[gpui::test]
+fn answer_copy_command_handles_plain_cited_and_streaming_text(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+    });
+    settle_strip(&mut cx);
+    for (text, streaming) in [
+        ("## A plain answer\n\nText with **formatting**", false),
+        ("A cited answer[12] and the same source again[12].", false),
+        ("A partially streamed answer", true),
+    ] {
+        view.update(&mut cx, |this, cx| {
+            let mut message = crate::assistant::ChatMessage::assistant(text);
+            message.streaming = streaming;
+            this.messages = vec![message];
+            cx.notify();
+        });
+        force_frame(&mut cx);
+        click_selector(&mut cx, "copy-answer:0");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(text.to_owned()),
+        );
+        assert_eq!(
+            cx.read_entity(&view, |v, _| v.messages[0].text.clone()),
+            text
+        );
+    }
 }

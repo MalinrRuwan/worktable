@@ -18,6 +18,7 @@ use gpui::{
     linear_color_stop, linear_gradient, point, rems, size, svg,
 };
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::DialogFooter;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::kbd::Kbd;
@@ -370,7 +371,9 @@ pub struct WorktableView {
 
     // Provider settings
     pub(crate) providers: Vec<ProviderInfo>,
-    provider_models: HashMap<String, Arc<Vec<(String, String)>>>,
+    pub(crate) model_picker:
+        gpui::Entity<gpui_component::select::SelectState<crate::model_picker::ModelPicker>>,
+    model_picker_window: gpui::AnyWindowHandle,
     active_provider: Option<String>,
     active_model: Option<String>,
     providers_loading: bool,
@@ -467,6 +470,15 @@ impl WorktableView {
         });
         let entry_edit_input =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Write markdown…"));
+        let model_picker = cx.new(|cx| {
+            gpui_component::select::SelectState::new(
+                crate::model_picker::ModelPicker::default(),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
 
         let mut view = Self {
             service,
@@ -507,7 +519,8 @@ impl WorktableView {
             // Seeded from the process mirror; the async config read refines it.
             background_on_close: crate::preferences::background_on_close(),
             providers: Vec::new(),
-            provider_models: HashMap::new(),
+            model_picker,
+            model_picker_window: window.window_handle(),
             active_provider: None,
             active_model: None,
             providers_loading: false,
@@ -560,6 +573,16 @@ impl WorktableView {
     }
 
     fn subscribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions
+            .push(cx.subscribe(&self.model_picker, |this, _, event, cx| {
+                if let gpui_component::select::SelectEvent::Confirm(Some(identity)) = event {
+                    let choices = crate::model_picker::ModelPicker::new(&this.providers);
+                    if choices.configured(identity) {
+                        this.select_model(&identity.provider_id, &identity.model_id, cx);
+                    }
+                    this.sync_model_picker(cx);
+                }
+            }));
         // Route search input changes into `self.query`.
         let query_input = self.search_input.clone();
         let subscription = cx.subscribe(&self.search_input, move |this, _emitter, event, cx| {
@@ -832,6 +855,7 @@ impl WorktableView {
                         Button::new("github-dialog-close")
                             .label("Close")
                             .ghost()
+                            .h_9()
                             .debug_selector(|| "github-dialog-close".into())
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     ),
@@ -1340,6 +1364,7 @@ impl WorktableView {
                         Button::new("provider-dialog-close")
                             .label("Close")
                             .ghost()
+                            .h_9()
                             .debug_selector(|| "provider-dialog-close".into())
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     ),
@@ -2053,7 +2078,21 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiProvidersSnapshot { snapshot } => {
+                let old_choices = crate::model_picker::ModelPicker::new(&self.providers);
+                let old_selection = old_choices.selection(
+                    self.active_provider.as_deref(),
+                    self.active_model.as_deref(),
+                );
                 self.apply_snapshot(snapshot);
+                let choices = crate::model_picker::ModelPicker::new(&self.providers);
+                let selection = choices.selection(
+                    self.active_provider.as_deref(),
+                    self.active_model.as_deref(),
+                );
+                // An unchanged refresh must not erase an in-progress search.
+                if choices != old_choices || selection != old_selection {
+                    self.sync_model_picker(cx);
+                }
                 cx.notify();
             }
             WorktableEvent::AiConfigChanged {
@@ -2097,7 +2136,11 @@ impl WorktableView {
                 ok,
                 error,
             } => {
-                self.logging_in.remove(provider_id);
+                // Cancellation clears this set synchronously. A later result
+                // must not replace its status or revive the dismissed login UI.
+                if !self.logging_in.remove(provider_id) {
+                    return;
+                }
                 self.pending_prompt = None;
                 if *ok {
                     self.provider_dialog_status = Some(format!("Signed in to {provider_id}."));
@@ -2117,18 +2160,6 @@ impl WorktableView {
     fn apply_snapshot(&mut self, snapshot: &ProvidersSnapshot) {
         self.providers_loading = false;
         self.providers = snapshot.providers.clone();
-        self.provider_models = snapshot
-            .providers
-            .iter()
-            .map(|provider| {
-                let models = provider
-                    .models
-                    .iter()
-                    .map(|model| (model.id.clone(), model.name.clone()))
-                    .collect();
-                (provider.id.clone(), Arc::new(models))
-            })
-            .collect();
         self.active_provider = snapshot.active_provider.clone();
         self.active_model = snapshot.active_model.clone();
         // Drop any api-key entry row that no longer exists.
@@ -2152,6 +2183,35 @@ impl WorktableView {
                 "'{provider}' is no longer an available provider — pick a new one under Providers."
             ));
         }
+    }
+
+    fn sync_model_picker(&self, cx: &mut Context<Self>) {
+        let choices = crate::model_picker::ModelPicker::new(&self.providers);
+        let selection = choices.selection(
+            self.active_provider.as_deref(),
+            self.active_model.as_deref(),
+        );
+        let picker = self.model_picker.clone();
+        let handle = self.model_picker_window;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.set_items(choices, window, cx);
+                    if let Some(selection) = selection {
+                        picker.set_selected_value(&selection, window, cx);
+                    } else {
+                        // Clear any old search as well as the committed value.
+                        picker.set_selected_value(
+                            &crate::model_picker::ModelIdentity::default(),
+                            window,
+                            cx,
+                        );
+                        picker.set_selected_index(None, window, cx);
+                    }
+                    cx.notify();
+                });
+            });
+        });
     }
 
     /// The agent can serve prompts only when the worker runs AND a provider
@@ -2541,6 +2601,33 @@ impl WorktableView {
         .detach();
     }
 
+    /// The worker owns the enabled services and emits their updated catalog.
+    pub fn set_provider_group(
+        &mut self,
+        provider_id: &str,
+        group_id: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let service = Arc::clone(&self.service);
+        let provider_id = provider_id.to_owned();
+        let group_id = group_id.to_owned();
+        cx.spawn(async move |view, cx| {
+            let result = service
+                .set_provider_group(&provider_id, &group_id, enabled)
+                .await;
+            if let Err(error) = result {
+                let _ = view.update(cx, |this, cx| {
+                    this.provider_dialog_status = Some(format!(
+                        "Couldn't update model services: {error}. Try again."
+                    ));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub fn select_model(&mut self, provider_id: &str, model_id: &str, cx: &mut Context<Self>) {
         let service = Arc::clone(&self.service);
         let provider_id = provider_id.to_owned();
@@ -2558,6 +2645,7 @@ impl WorktableView {
                         this.settings_status = Some(format!("Failed to select model: {error}"));
                     }
                 }
+                this.sync_model_picker(cx);
                 this.refresh_providers(cx);
                 cx.notify();
             });
@@ -3029,8 +3117,10 @@ impl Render for WorktableView {
             )
             .on_action(
                 cx.listener(|this, _: &crate::actions::CopyEntry, window, cx| {
-                    if !this.text_input_focused(window, cx) {
+                    if this.list_actions_allowed() && !this.text_input_focused(window, cx) {
                         this.copy_selected(cx)
+                    } else {
+                        cx.propagate();
                     }
                 }),
             )
@@ -3437,6 +3527,7 @@ fn render_onboarding(
                             Button::new("onboarding-check-accessibility")
                                 .label("Check again")
                                 .ghost()
+                                .h_9()
                                 .small()
                                 .debug_selector(|| "onboarding-check-accessibility".into())
                                 .on_click(
@@ -3473,6 +3564,7 @@ fn render_onboarding(
             Button::new("onboarding-back")
                 .label("Back")
                 .ghost()
+                .h_9()
                 .small()
                 .debug_selector(|| "onboarding-back".into())
                 .on_click(cx.listener(|this, _, _, cx| this.back_onboarding(cx))),
@@ -3482,6 +3574,7 @@ fn render_onboarding(
         Button::new("onboarding-skip")
             .label(if is_last { "Skip for now" } else { "Skip" })
             .ghost()
+            .h_9()
             .small()
             .debug_selector(|| "onboarding-skip".into())
             .on_click(cx.listener(|this, _, _, cx| this.skip_onboarding(cx))),
@@ -3892,7 +3985,7 @@ fn render_library_header(
     // The leading slot morphs between the full search field (Entries) and a
     // circular search button (Agent, where the field has nothing to filter).
     // Progress rides the page-slide clock so both transitions match.
-    let circle = design::to_pixels(rems(2.5), window);
+    let circle = design::to_pixels(rems(2.25), window);
     let reserved = design::to_pixels(rems(2.0), window)
         + design::to_pixels(rems(1.0), window)
         + design::to_pixels(rems(5.0), window);
@@ -3939,8 +4032,7 @@ fn render_library_header(
                 Input::new(&this.search_input)
                     .w_full()
                     .appearance(true)
-                    .bordered(false)
-                    .focus_bordered(false)
+                    .border_color(theme.muted)
                     .bg(theme.muted)
                     .text_color(theme.foreground)
                     .prefix(
@@ -4030,6 +4122,7 @@ fn settings_header(this: &mut WorktableView, cx: &mut Context<WorktableView>) ->
                 .icon(app_icon(IconName::ArrowLeft))
                 .label("Back")
                 .ghost()
+                .h_9()
                 .small()
                 .debug_selector(|| "settings-back".into())
                 .tooltip(if page.is_some() {
@@ -4070,7 +4163,6 @@ fn page_toggle_button(this: &WorktableView, cx: &mut Context<WorktableView>) -> 
     // dashboard for the entries list.
     let mut toggle = CircleAction::new("page-toggle")
         .secondary()
-        .large()
         .debug_selector("page-toggle")
         .tooltip(if is_assistant {
             "Showing agent — switch to entries"
@@ -4106,7 +4198,7 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
     Button::new("library-menu")
         .icon(app_icon(IconName::Menu))
         .secondary()
-        .size_10()
+        .size_9()
         .rounded_full()
         .tooltip("Library menu")
         .debug_selector(|| "library-menu".into())
@@ -4189,7 +4281,7 @@ fn render_settings(
                     Orb::new("providers-loading", OrbVariant::G2)
                         .view(cx.entity_id())
                         .size(rems(1.75))
-                        .color(theme.primary),
+                        .color(theme.foreground),
                 )
                 .into_any_element()
         } else {
@@ -4211,6 +4303,7 @@ fn render_settings(
                 Button::new("retry-providers")
                     .label("Retry")
                     .ghost()
+                    .h_9()
                     .small()
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| this.refresh_providers(cx));
@@ -4219,21 +4312,6 @@ fn render_settings(
             .into_any_element();
     }
 
-    let active = this
-        .active_provider
-        .as_deref()
-        .map(|provider| {
-            format!(
-                "Active provider: {}{}",
-                provider,
-                this.active_model
-                    .as_deref()
-                    .map(|model| format!(" / {model}"))
-                    .unwrap_or_default()
-            )
-        })
-        .unwrap_or_else(|| "No AI provider is active yet.".to_owned());
-
     // General page: window/background behavior. The toggle mirrors into a
     // process-wide flag the AppKit close handler reads synchronously.
     let general_section = v_flex()
@@ -4241,7 +4319,7 @@ fn render_settings(
         .p_4()
         .child(
             v_flex()
-                .gap_2()
+                .gap_1()
                 .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Window"))
                 .child(
                     div()
@@ -4291,64 +4369,78 @@ fn render_settings(
         .gap_5()
         .p_4()
         .child(
-            // Label and control on one line, like every other settings row:
-            // the control is the label's control, not a block under it.
-            h_flex()
+            // Keep the title's line box independent of the taller controls,
+            // so help copy uses the same title-to-description gap as other rows.
+            v_flex()
                 .w_full()
-                .items_center()
-                .justify_between()
-                .gap_4()
+                .gap_1()
                 .child(
-                    v_flex()
-                        // The label column gives way, so the control keeps its
-                        // place at the row's trailing edge instead of being
-                        // pushed past the window.
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Theme"))
+                    h_flex()
+                        .w_full()
+                        .relative()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Light, dark, or follow the system appearance"),
+                                .text_sm()
+                                .debug_selector(|| "appearance-theme-label".into())
+                                .child("Theme"),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .absolute()
+                                .right_0()
+                                .h_full()
+                                .items_center()
+                                .debug_selector(|| "appearance-theme-control".into())
+                                .child(
+                                    ButtonGroup::new("theme-mode-group")
+                                        .compact()
+                                        .outline()
+                                        .child(
+                                            Button::new("theme-light")
+                                                .icon(app_icon(IconName::Sun))
+                                                .tooltip("Light")
+                                                .debug_selector(|| "theme-light".into())
+                                                .selected(is_light),
+                                        )
+                                        .child(
+                                            Button::new("theme-dark")
+                                                .icon(app_icon(IconName::Moon))
+                                                .tooltip("Dark")
+                                                .debug_selector(|| "theme-dark".into())
+                                                .selected(is_dark),
+                                        )
+                                        .child(
+                                            Button::new("theme-system")
+                                                .icon(app_icon(IconName::Cpu))
+                                                .tooltip("System")
+                                                .debug_selector(|| "theme-system".into())
+                                                .selected(is_system),
+                                        )
+                                        .on_click(cx.listener(
+                                            |this, selected: &Vec<usize>, window, cx| {
+                                                let mode = match selected.first() {
+                                                    Some(0) => AppThemeMode::Light,
+                                                    Some(1) => AppThemeMode::Dark,
+                                                    _ => AppThemeMode::System,
+                                                };
+                                                if mode != this.theme_mode {
+                                                    this.set_theme_mode(mode, window, cx);
+                                                }
+                                            },
+                                        )),
+                                ),
                         ),
                 )
                 .child(
-                    ButtonGroup::new("theme-mode-group")
-                        .compact()
-                        .outline()
-                        .child(
-                            Button::new("theme-light")
-                                .icon(app_icon(IconName::Sun))
-                                .tooltip("Light")
-                                .debug_selector(|| "theme-light".into())
-                                .selected(is_light),
-                        )
-                        .child(
-                            Button::new("theme-dark")
-                                .icon(app_icon(IconName::Moon))
-                                .tooltip("Dark")
-                                .debug_selector(|| "theme-dark".into())
-                                .selected(is_dark),
-                        )
-                        .child(
-                            Button::new("theme-system")
-                                .icon(app_icon(IconName::Cpu))
-                                .tooltip("System")
-                                .debug_selector(|| "theme-system".into())
-                                .selected(is_system),
-                        )
-                        .on_click(cx.listener(|this, selected: &Vec<usize>, window, cx| {
-                            let mode = match selected.first() {
-                                Some(0) => AppThemeMode::Light,
-                                Some(1) => AppThemeMode::Dark,
-                                _ => AppThemeMode::System,
-                            };
-                            if mode != this.theme_mode {
-                                this.set_theme_mode(mode, window, cx);
-                            }
-                        })),
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .debug_selector(|| "appearance-theme-description".into())
+                        .child("Light, dark, or follow the system appearance"),
                 ),
         )
         .child(
@@ -4360,7 +4452,12 @@ fn render_settings(
                         .flex_1()
                         .min_w_0()
                         .gap_1()
-                        .child(div().text_sm().child("Show thinking"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .debug_selector(|| "appearance-thinking-label".into())
+                                .child("Show thinking"),
+                        )
                         .child(
                             div()
                                 .text_xs()
@@ -4392,7 +4489,12 @@ fn render_settings(
                         .flex_1()
                         .min_w_0()
                         .gap_1()
-                        .child(div().text_sm().child("Welcome tour"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .debug_selector(|| "appearance-tour-label".into())
+                                .child("Welcome tour"),
+                        )
                         .child(
                             div()
                                 .text_xs()
@@ -4404,6 +4506,7 @@ fn render_settings(
                     Button::new("show-onboarding")
                         .label("Replay")
                         .ghost()
+                        .h_9()
                         .small()
                         .debug_selector(|| "show-onboarding".into())
                         .on_click(cx.listener(|this, _, _, cx| this.start_onboarding(cx))),
@@ -4417,7 +4520,7 @@ fn render_settings(
         .p_4()
         .child(
             v_flex()
-                .gap_2()
+                .gap_1()
                 .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Data"))
                 .child(
                     div()
@@ -4455,6 +4558,7 @@ fn render_settings(
                     Button::new("configure-github-stars")
                         .label("Configure")
                         .ghost()
+                        .h_9()
                         .small()
                         .debug_selector(|| "configure-github-stars".into())
                         .on_click(
@@ -4463,8 +4567,7 @@ fn render_settings(
                 ),
         );
 
-    // One card per provider; Configure opens the modal auth dialog. The model
-    // picker stays on the row so switching a model is one click.
+    // One shared model picker; provider rows own authentication configuration.
     let provider_rows: Vec<gpui::AnyElement> = this
         .providers
         .iter()
@@ -4475,9 +4578,23 @@ fn render_settings(
         .iter()
         .next()
         .cloned()
-        .and_then(|provider_id| render_active_login(&view, &provider_id, cx));
+        .and_then(|provider_id| render_active_login(this, &view, &provider_id, cx));
+    let models_loading = this
+        .providers
+        .iter()
+        .any(|provider| provider.models_loading);
+    let model_errors: Vec<_> = this
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            provider
+                .models_error
+                .as_ref()
+                .map(|error| format!("{}: {error}", provider.name))
+        })
+        .collect();
     let mut providers_section = v_flex()
-        .gap_2()
+        .gap_1()
         .p_4()
         .child(
             div()
@@ -4490,8 +4607,58 @@ fn render_settings(
                 .text_color(theme.muted_foreground)
                 .child("Choose a provider, model, and authentication method for the assistant."),
         )
-        .child(div().text_sm().text_color(theme.primary).child(active))
+        .child(
+            div()
+                .debug_selector(|| "settings-model-picker".into())
+                .child(
+                    gpui_component::select::Select::new(&this.model_picker)
+                        .id("settings-model-select")
+                        .accessibility_label("Assistant model")
+                        .placeholder("Choose a model")
+                        .search_placeholder("Search providers and models")
+                        .empty(move |_, cx| {
+                            div()
+                                .debug_selector(|| "model-picker-empty".into())
+                                .p_3()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if models_loading {
+                                    "Fetching models from your providers"
+                                } else {
+                                    "No models found. Configure or sign in to a provider below, or try another search."
+                                })
+                        })
+                        .h_9()
+                        .w_full(),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Configure or sign in to a provider below to load its models."),
+        )
         .children(provider_rows);
+    providers_section = providers_section.child(
+        Button::new("refresh-models")
+            .label("Refresh models")
+            .ghost()
+            .h_9()
+            .loading(models_loading)
+            .disabled(models_loading)
+            .debug_selector(|| "refresh-models".into())
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_providers(cx))),
+    );
+    for (index, error) in model_errors.into_iter().enumerate() {
+        providers_section = providers_section.child(
+            div()
+                .id(SharedString::from(format!("model-error-{index}")))
+                .role(Role::Alert)
+                .text_xs()
+                .text_color(theme.danger)
+                .child(error),
+        );
+    }
     if let Some(status) = &this.settings_status {
         providers_section = providers_section.child(
             div()
@@ -4589,9 +4756,8 @@ fn settings_categories(
     list
 }
 
-/// One provider card in Settings → Providers: identity and auth badges,
-/// the model picker when the provider is usable, and the Configure button
-/// that opens the auth dialog.
+/// One provider card in Settings → Providers: identity, auth badges, and
+/// the Configure button that opens the auth dialog.
 fn render_settings_provider_row(
     this: &WorktableView,
     provider: &ProviderInfo,
@@ -4600,7 +4766,6 @@ fn render_settings_provider_row(
 ) -> gpui::AnyElement {
     let theme = cx.theme().clone();
     let is_active = this.active_provider.as_deref() == Some(&provider.id);
-    let active_model = this.active_model.clone();
 
     let mut badges = Vec::new();
     if provider.supports_api_key {
@@ -4650,22 +4815,6 @@ fn render_settings_provider_row(
                 ),
         );
 
-    let usable = provider.api_key_set || provider.oauth_set;
-    let model_options = this
-        .provider_models
-        .get(&provider.id)
-        .cloned()
-        .unwrap_or_default();
-    if usable && !model_options.is_empty() {
-        row = row.child(model_picker_button(
-            view,
-            provider,
-            model_options,
-            active_model,
-            cx,
-        ));
-    }
-
     let configure_view = view.clone();
     let provider_id = provider.id.clone();
     row = row.child(
@@ -4673,6 +4822,7 @@ fn render_settings_provider_row(
             .label("Configure")
             .icon(app_icon(IconName::Settings))
             .ghost()
+            .h_9()
             .small()
             .debug_selector({
                 let selector = format!("configure:{}", provider.id);
@@ -4688,56 +4838,14 @@ fn render_settings_provider_row(
     row.into_any_element()
 }
 
-/// A lazy model dropdown for a provider row. The full model list only builds
-/// when the menu is opened (scrollable), so the settings page stays light.
-fn model_picker_button(
-    view: &gpui::Entity<WorktableView>,
-    provider: &ProviderInfo,
-    models: Arc<Vec<(String, String)>>,
-    active_model: Option<String>,
-    _cx: &mut App,
-) -> gpui::AnyElement {
-    let view = view.clone();
-    let provider_id = provider.id.clone();
-    let label = match &active_model {
-        Some(id) if models.iter().any(|(model_id, _)| model_id == id) => id.clone(),
-        _ => "Select model…".to_owned(),
-    };
-
-    Button::new(format!("model-picker:{}", provider.id))
-        .label(label)
-        .icon(app_icon(IconName::ChevronDown))
-        .ghost()
-        .small()
-        .dropdown_menu(move |menu, _, _| {
-            let mut menu = menu;
-            for (model_id, model_name) in models.iter() {
-                let is_active = active_model.as_deref() == Some(model_id.as_str());
-                let model_id = model_id.clone();
-                let model_name = model_name.clone();
-                let view = view.clone();
-                let provider_id = provider_id.clone();
-                menu = menu.item(PopupMenuItem::new(model_name).checked(is_active).on_click(
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.select_model(&provider_id, &model_id, cx)
-                        });
-                    },
-                ));
-            }
-            menu.scrollable(true)
-        })
-        .into_any_element()
-}
-
 /// A panel showing the in-progress OAuth login (auth URL, device code, and any
 /// prompt the user must answer) for one provider.
 fn render_active_login(
+    this: &WorktableView,
     view: &gpui::Entity<WorktableView>,
     provider_id: &str,
-    cx: &mut App,
+    cx: &App,
 ) -> Option<gpui::AnyElement> {
-    let this = view.read(cx);
     if !this.logging_in.contains(provider_id) {
         return None;
     }
@@ -4786,6 +4894,7 @@ fn render_active_login(
             } => {
                 let verification_uri = verification_uri.clone();
                 let user_code = user_code.clone();
+                let copy_code = user_code.clone();
                 let view = view.clone();
                 column = column
                     .child(
@@ -4795,14 +4904,33 @@ fn render_active_login(
                     )
                     .child(
                         div()
+                            .debug_selector(|| "oauth-device-code".into())
                             .text_lg()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(theme.primary)
-                            .child(user_code),
+                            .child(
+                                TextView::markdown(
+                                    SharedString::from(format!("oauth-code:{provider_id}")),
+                                    user_code,
+                                )
+                                .selectable(true),
+                            ),
+                    )
+                    .child(
+                        Button::new(format!("copy-device-code:{provider_id}"))
+                            .label("Copy code")
+                            .icon(app_icon(IconName::Copy))
+                            .ghost()
+                            .h_9()
+                            .debug_selector(|| "oauth-copy-code".into())
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone()));
+                            }),
                     )
                     .child(
                         Button::new(format!("open-device-url:{provider_id}"))
                             .label("Open verification page")
+                            .debug_selector(|| "oauth-open-verification".into())
                             .icon(app_icon(IconName::ExternalLink))
                             .on_click(move |_, _, cx| {
                                 view.update(cx, |this, cx| {
@@ -4850,6 +4978,7 @@ fn render_active_login(
                         Button::new(format!("prompt-option:{}", option.id))
                             .label(label)
                             .ghost()
+                            .h_9()
                             .on_click({
                                 let view = view.clone();
                                 move |_, _, cx| {
@@ -4873,6 +5002,7 @@ fn render_active_login(
 
     Some(
         v_flex()
+            .debug_selector(|| "oauth-login-panel".into())
             .gap_2()
             .p_3()
             .rounded(theme.radius_tokens().md)
@@ -4913,8 +5043,7 @@ fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> im
                     Input::new(&this.composer_body)
                         .w_full()
                         .appearance(true)
-                        .bordered(false)
-                        .focus_bordered(false)
+                        .border_color(theme.muted)
                         .bg(theme.muted)
                         .text_color(theme.foreground),
                 ),
@@ -5429,6 +5558,7 @@ fn modal_chip(
         .small()
         .rounded_full()
         .ghost()
+        .h_9()
         .debug_selector(move || selector.clone())
         .on_click(move |_, window, cx| handler(window, cx));
     match icon {
@@ -6068,6 +6198,7 @@ fn render_chats_sheet(
                     .icon(app_icon(IconName::Plus))
                     .small()
                     .ghost()
+                    .h_9()
                     .disabled(!allowed)
                     .debug_selector(|| "new-chat".into())
                     .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
@@ -6139,6 +6270,7 @@ fn render_chats_sheet(
                         .label("Retry")
                         .small()
                         .ghost()
+                        .h_9()
                         .on_click(cx.listener(|this, _, _, cx| this.save_current_chat(cx))),
                 ),
         );
@@ -6164,6 +6296,7 @@ fn render_chats_sheet(
                         .label("Retry")
                         .small()
                         .ghost()
+                        .h_9()
                         .debug_selector(|| "chats-retry".into())
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_chats(cx))),
                 ),
@@ -6182,6 +6315,7 @@ fn render_chats_sheet(
                         Button::new("chats-loading")
                             .label("Loading chats")
                             .ghost()
+                            .h_9()
                             .loading(true)
                             .disabled(true),
                     )
@@ -6217,6 +6351,7 @@ fn render_chats_sheet(
                         let chat = &this.chats[ix];
                         let id = chat.id.clone();
                         let selector = format!("chat-row:{id}");
+                        let content_selector = format!("chat-row-content:{id}");
                         let active = this.chat_id.as_ref() == Some(&id);
                         div()
                             .id(SharedString::from(format!("chat-item:{id}")))
@@ -6232,16 +6367,18 @@ fn render_chats_sheet(
                                     .selected(active)
                                     .disabled(!allowed)
                                     .w_full()
-                                    // A control height inside the taller row:
-                                    // a ghost hover filling the whole row reads
-                                    // as a slab, not as a control.
-                                    .h(rems(2.5))
+                                    // Two text lines need their own padded row,
+                                    // not the one-line toolbar button height.
+                                    .h_full()
+                                    .px_3()
+                                    .py_2()
                                     .justify_start()
                                     .overflow_hidden()
                                     .tooltip(chat.title.clone())
                                     .debug_selector(move || selector.clone())
                                     .child(
                                         h_flex()
+                                            .debug_selector(move || content_selector.clone())
                                             .gap_3()
                                             .w_full()
                                             .min_w_0()
@@ -6476,7 +6613,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
             let orb = Orb::new("assistant-tool", variant)
                 .view(cx.entity_id())
                 .size(rems(1.5))
-                .color(theme.primary)
+                .color(theme.foreground)
                 .label(label)
                 .surface(theme.popover)
                 .label_color(theme.muted_foreground)
@@ -6504,7 +6641,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 let orb = Orb::new("assistant-thinking", OrbVariant::S1)
                     .view(cx.entity_id())
                     .size(rems(1.25))
-                    .color(theme.muted_foreground)
+                    .color(theme.foreground)
                     .label("Thinking…")
                     .surface(theme.popover)
                     .label_color(theme.muted_foreground)
@@ -6549,7 +6686,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                         Orb::new("knowledge-building", OrbVariant::G2)
                             .view(cx.entity_id())
                             .size(rems(1.5))
-                            .color(theme.primary),
+                            .color(theme.foreground),
                     ),
             );
         } else {
@@ -6559,7 +6696,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(app_icon(IconName::HardDrive).text_color(theme.primary)),
+                    .child(app_icon(IconName::HardDrive).text_color(theme.foreground)),
             );
         }
         button
@@ -6585,7 +6722,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 .border_color(theme.border)
                 .child(
                     h_flex()
-                        .gap_2()
+                        .gap_1()
                         .w_full()
                         .items_center()
                         .child(
@@ -6598,8 +6735,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                                         .disabled(!configured)
                                         .w_full()
                                         .appearance(true)
-                                        .bordered(false)
-                                        .focus_bordered(false)
+                                        .border_color(theme.muted)
                                         .bg(theme.muted)
                                         .text_color(theme.foreground),
                                 ),
@@ -6623,12 +6759,12 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                         .child({
                             let send: gpui::AnyElement = if this.assistant_busy {
                                 CircleAction::new("abort-assistant")
-                                    .ghost()
+                                    .primary()
                                     .child(
                                         Orb::new("assistant-send-orb", OrbVariant::S1)
                                             .view(cx.entity_id())
                                             .size(rems(1.25))
-                                            .color(theme.primary),
+                                            .color(theme.primary_foreground),
                                     )
                                     .tooltip("Stop the assistant")
                                     .debug_selector("abort-assistant")
@@ -6639,7 +6775,10 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                             } else {
                                 CircleAction::new("send-assistant")
                                     .primary()
-                                    .icon(app_icon(IconName::ArrowUp))
+                                    .icon(
+                                        app_icon(IconName::ArrowUp)
+                                            .text_color(theme.primary_foreground),
+                                    )
                                     .tooltip("Send")
                                     .debug_selector("send-assistant")
                                     .disabled(!configured)
@@ -6667,6 +6806,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                                     .label("Retry")
                                     .small()
                                     .ghost()
+                                    .h_9()
                                     .debug_selector(|| "retry-chat-save".into())
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.save_current_chat(cx)),
@@ -6737,7 +6877,7 @@ impl Render for ProviderDialogView {
                 state.logging_in.contains(&provider.id),
             )
         };
-        let login_panel = render_active_login(&main, &provider.id, cx);
+        let login_panel = render_active_login(main.read(cx), &main, &provider.id, cx);
 
         let mut column = v_flex()
             .debug_selector(|| "provider-dialog".into())
@@ -6776,6 +6916,7 @@ impl Render for ProviderDialogView {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .debug_selector(|| "provider-key-input".into())
                             .child(Input::new(&self.api_key_input)),
                     )
                     .child(
@@ -6790,6 +6931,36 @@ impl Render for ProviderDialogView {
             );
         }
 
+        if !provider.groups.is_empty() {
+            let mut groups = v_flex()
+                .gap_2()
+                .debug_selector(|| "provider-groups".into())
+                .child(div().text_sm().child("Model services"))
+                .child(div().text_xs().text_color(theme.muted_foreground).child(
+                    "Choose which model catalogs the picker offers. \
+                         Models available on both use OpenCode Go.",
+                ));
+            for group in &provider.groups {
+                let main_for_group = main.clone();
+                let provider_id = provider.id.clone();
+                let group_id = group.id.clone();
+                let selector = format!("provider-group:{provider_id}:{group_id}");
+                let debug = selector.clone();
+                groups = groups.child(
+                    Checkbox::new(selector)
+                        .checked(group.enabled)
+                        .label(group.name.clone())
+                        .debug_selector(move || debug.clone())
+                        .on_click(move |enabled, _, cx| {
+                            main_for_group.update(cx, |this, cx| {
+                                this.set_provider_group(&provider_id, &group_id, *enabled, cx);
+                            });
+                        }),
+                );
+            }
+            column = column.child(groups);
+        }
+
         if provider.supports_oauth {
             let main_for_auth = main.clone();
             if provider.oauth_set {
@@ -6798,6 +6969,7 @@ impl Render for ProviderDialogView {
                     Button::new("provider-sign-out")
                         .label("Sign out")
                         .ghost()
+                        .h_9()
                         .on_click(move |_, _, cx| {
                             let provider_id = provider_id.clone();
                             main_for_auth
@@ -6810,6 +6982,7 @@ impl Render for ProviderDialogView {
                     Button::new("provider-cancel-login")
                         .label("Cancel sign-in")
                         .ghost()
+                        .h_9()
                         .on_click(move |_, _, cx| {
                             let provider_id = provider_id.clone();
                             main_for_auth
@@ -6820,7 +6993,13 @@ impl Render for ProviderDialogView {
                 let provider_id = provider.id.clone();
                 column = column.child(
                     Button::new("provider-sign-in")
-                        .label("Sign in with OAuth")
+                        .label(if provider.id == worktable_ai::chatgpt::ID {
+                            "Sign in with ChatGPT"
+                        } else {
+                            "Sign in"
+                        })
+                        .primary()
+                        .h_9()
                         .icon(app_icon(IconName::ExternalLink))
                         .on_click(move |_, _, cx| {
                             let provider_id = provider_id.clone();

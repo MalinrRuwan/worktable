@@ -7,14 +7,14 @@
 //!
 //! The prose flows as word-level inline atoms so a chip sits exactly where its
 //! marker sat — a chip never wraps on its own line, and punctuation that
-//! follows a marker stays tight against it. Because of that word layout,
-//! citation prose is plain text; markdown formatting is not applied to
-//! citation-bearing messages.
+//! follows a marker stays tight against it. Markdown blocks keep their styling,
+//! while their text runs share one native, window-scoped selection participant.
 //!
 //! Components are theme-agnostic: the caller passes [`CitationColors`] and a
 //! radius from the active theme.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -24,6 +24,265 @@ use gpui::{
 };
 
 use crate::markdown::{Block, Inline, needs_space, parse_blocks};
+
+// A cited answer is one selection participant, not one per word. The pinned
+// SelectableText::with_handle overwrites the handle's geometry/runs for each
+// child, so aggregate them here before projecting the native selection. Runs
+// reuse the existing word/chip layout; the clipboard alone adds word spaces
+// and block breaks. Chips and source footer rows remain interactive links.
+pub(crate) mod selection {
+    use super::*;
+    use gpui::{
+        AnyElement, Bounds, Element, GlobalElementId, HitboxBehavior, InspectorElementId, LayoutId,
+        PaintQuad, StyledText, transparent_black,
+    };
+    use gpui_base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
+
+    #[derive(Default)]
+    pub(crate) struct Runs {
+        runs: Vec<TextSelectionRun>,
+        separators: Vec<String>,
+        ranges: Vec<Option<std::ops::Range<usize>>>,
+        copy_ends: Vec<usize>,
+    }
+
+    pub(crate) type Document = Rc<RefCell<Runs>>;
+
+    pub(crate) fn text(document: &Document, text: impl Into<SharedString>, after: &str) -> Span {
+        let text = text.into();
+        Span {
+            styled: StyledText::new(text.clone()),
+            text,
+            after: after.to_owned(),
+            document: document.clone(),
+            index: 0,
+            copy_end: None,
+        }
+    }
+
+    pub(crate) struct Span {
+        styled: StyledText,
+        text: SharedString,
+        after: String,
+        document: Document,
+        index: usize,
+        copy_end: Option<usize>,
+    }
+
+    impl Span {
+        pub(crate) fn copy_end(mut self, end: usize) -> Self {
+            self.copy_end = Some(end);
+            self
+        }
+    }
+
+    impl IntoElement for Span {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Span {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            self.styled.request_layout(id, inspector, window, cx)
+        }
+        fn prepaint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.styled
+                .prepaint(id, inspector, bounds, &mut (), window, cx);
+            let mut document = self.document.borrow_mut();
+            self.index = document.runs.len();
+            document.runs.push(
+                TextSelectionRun::new(self.text.clone(), self.styled.layout().clone(), bounds)
+                    .with_document_order(self.index as u64),
+            );
+            document.separators.push(self.after.clone());
+            document
+                .copy_ends
+                .push(self.copy_end.unwrap_or(self.text.len()));
+        }
+        fn paint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            inspector: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let document = self.document.borrow();
+            if let Some(Some(range)) = document.ranges.get(self.index) {
+                let layout = self.styled.layout();
+                if let (Some(start), Some(end)) = (
+                    layout.position_for_index(range.start),
+                    layout.position_for_index(range.end),
+                ) {
+                    let mut row = start.y;
+                    while row <= end.y {
+                        let left = if row == start.y {
+                            start.x
+                        } else {
+                            bounds.left()
+                        };
+                        let right = if row == end.y { end.x } else { bounds.right() };
+                        window.paint_quad(PaintQuad {
+                            bounds: Bounds::from_corners(
+                                Point::new(left, row),
+                                Point::new(right, row + layout.line_height()),
+                            ),
+                            background: gpui_base::Theme::global(cx).tokens.colors.selection.into(),
+                            corner_radii: Default::default(),
+                            border_widths: Default::default(),
+                            border_color: transparent_black(),
+                            border_style: Default::default(),
+                        });
+                        row += layout.line_height();
+                    }
+                }
+            }
+            drop(document);
+            self.styled
+                .paint(id, inspector, bounds, &mut (), &mut (), window, cx);
+        }
+    }
+
+    pub(crate) struct Surface {
+        pub id: ElementId,
+        pub child: AnyElement,
+        pub document: Document,
+    }
+
+    impl IntoElement for Surface {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Surface {
+        type RequestLayoutState = Rc<TextSelectionHandle>;
+        type PrepaintState = ();
+        fn id(&self) -> Option<ElementId> {
+            Some(self.id.clone())
+        }
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Rc<TextSelectionHandle>) {
+            let handle = window.with_element_state(
+                id.expect("answer selection has a stable id"),
+                |retained: Option<Rc<TextSelectionHandle>>, _| {
+                    let handle =
+                        retained.unwrap_or_else(|| Rc::new(TextSelectionHandle::new("", cx)));
+                    (handle.clone(), handle)
+                },
+            );
+            let document = self.document.clone();
+            let selection = Rc::downgrade(&handle);
+            handle.copy_with(
+                move |cx| {
+                    let Some(selection) = selection.upgrade() else {
+                        return String::new();
+                    };
+                    let document = document.borrow();
+                    let projection = selection.update_runs(&document.runs, cx);
+                    copy_runs(&document, projection.ranges())
+                },
+                cx,
+            );
+            (self.child.request_layout(window, cx), handle)
+        }
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            handle: &mut Rc<TextSelectionHandle>,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            *self.document.borrow_mut() = Runs::default();
+            self.child.prepaint(window, cx);
+            let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+            let text_bounds = self
+                .document
+                .borrow()
+                .runs
+                .iter()
+                .map(TextSelectionRun::bounds)
+                .collect();
+            handle.register(
+                TextSelectionRegistration::new(hitbox, bounds)
+                    .with_text_bounds(text_bounds)
+                    .with_rendered_element(handle, window, cx),
+                window,
+                cx,
+            );
+        }
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            handle: &mut Rc<TextSelectionHandle>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            {
+                let mut document = self.document.borrow_mut();
+                document.ranges = handle.update_runs(&document.runs, cx).ranges().to_vec();
+            }
+            self.child.paint(window, cx);
+        }
+    }
+
+    fn copy_runs(document: &Runs, ranges: &[Option<std::ops::Range<usize>>]) -> String {
+        let mut copied = String::new();
+        let last = ranges.iter().rposition(Option::is_some);
+        for (index, (run, range)) in document.runs.iter().zip(ranges).enumerate() {
+            if let Some(range) = range {
+                let end = range.end.min(document.copy_ends[index]);
+                if range.start < end {
+                    copied.push_str(&run.text()[range.start..end]);
+                }
+                if range.end == run.text().len() && Some(index) != last {
+                    copied.push_str(&document.separators[index]);
+                }
+            }
+        }
+        copied
+    }
+}
 
 /// Handler invoked when a citation is activated, receiving the click position
 /// so apps can morph in-app sources (e.g. a `worktable-entry:` URL) from
@@ -112,9 +371,7 @@ pub struct CitationColors {
     pub chip_background: Hsla,
     /// Hovered chip surface.
     pub chip_hover_background: Hsla,
-    /// Background behind tooltip text (the inverse of `foreground`).
-    pub background: Hsla,
-    /// Footer separator hairline.
+    /// Chip stroke, tooltip edge, and footer separator.
     pub border: Hsla,
 }
 
@@ -157,7 +414,6 @@ impl InlineCitations {
                 muted: Hsla::default(),
                 chip_background: Hsla::default(),
                 chip_hover_background: Hsla::default(),
-                background: Hsla::default(),
                 border: Hsla::default(),
             },
             radius: px(4.0),
@@ -193,7 +449,12 @@ impl InlineCitations {
     }
 
     /// One wrapping row of inline atoms: a paragraph, heading, or list body.
-    fn atom_row(&self, atoms: &[Inline]) -> Div {
+    fn atom_row(
+        &self,
+        atoms: &[Inline],
+        document: &selection::Document,
+        block_index: usize,
+    ) -> Div {
         let colors = self.colors;
         let mut row = div().flex().flex_wrap().items_center().w_full().min_w_0();
         for (index, atom) in atoms.iter().enumerate() {
@@ -213,7 +474,20 @@ impl InlineCitations {
                         .into_any_element()
                 }
                 Inline::Text(span) => {
-                    let mut text = div().min_w_0().child(span.text.clone());
+                    let next_text = atoms[index + 1..]
+                        .iter()
+                        .find(|next| matches!(next, Inline::Text(_)));
+                    let after = match next_text {
+                        None => "\n",
+                        Some(next) if needs_space(atom, next) => " ",
+                        Some(_) => "",
+                    };
+                    let selector = format!("{}-text-{block_index}-{index}", self.id);
+                    let mut text = div()
+                        .id(ElementId::Name(selector.clone().into()))
+                        .debug_selector(move || selector.clone())
+                        .min_w_0()
+                        .child(selection::text(document, span.text.clone(), after));
                     if span.bold {
                         text = text.font_weight(FontWeight::SEMIBOLD);
                     }
@@ -232,7 +506,7 @@ impl InlineCitations {
                     }
                     match &span.link {
                         Some(url) => {
-                            let selector = format!("{}-link-{index}", self.id);
+                            let selector = format!("{}-link-{block_index}-{index}", self.id);
                             let url = url.clone();
                             let open = self.open.clone();
                             text.id(ElementId::Name(selector.into()))
@@ -261,10 +535,17 @@ impl InlineCitations {
     }
 
     /// Render one markdown block (paragraph, heading, list, quote, code).
-    fn render_block(&self, block: &Block) -> gpui::AnyElement {
+    fn render_block(
+        &self,
+        block: &Block,
+        document: &selection::Document,
+        block_index: usize,
+    ) -> gpui::AnyElement {
         let colors = self.colors;
         match block {
-            Block::Paragraph(atoms) => self.atom_row(atoms).into_any_element(),
+            Block::Paragraph(atoms) => self
+                .atom_row(atoms, document, block_index)
+                .into_any_element(),
             Block::Heading { level, content } => {
                 let mut heading = div().w_full().min_w_0().font_weight(FontWeight::SEMIBOLD);
                 heading = match level {
@@ -272,7 +553,9 @@ impl InlineCitations {
                     2 => heading.text_base(),
                     _ => heading.text_sm(),
                 };
-                heading.child(self.atom_row(content)).into_any_element()
+                heading
+                    .child(self.atom_row(content, document, block_index))
+                    .into_any_element()
             }
             Block::Bullet(atoms) => div()
                 .flex()
@@ -281,8 +564,13 @@ impl InlineCitations {
                 .gap_2()
                 .w_full()
                 .min_w_0()
-                .child(div().flex_shrink_0().text_color(colors.muted).child("•"))
-                .child(self.atom_row(atoms))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(colors.muted)
+                        .child(selection::text(document, "•", " ")),
+                )
+                .child(self.atom_row(atoms, document, block_index))
                 .into_any_element(),
             Block::Numbered { marker, content } => div()
                 .flex()
@@ -295,9 +583,9 @@ impl InlineCitations {
                     div()
                         .flex_shrink_0()
                         .text_color(colors.muted)
-                        .child(marker.clone()),
+                        .child(selection::text(document, marker.clone(), " ")),
                 )
-                .child(self.atom_row(content))
+                .child(self.atom_row(content, document, block_index))
                 .into_any_element(),
             Block::Quote(atoms) => div()
                 .flex()
@@ -314,7 +602,7 @@ impl InlineCitations {
                         .rounded_full()
                         .bg(colors.border),
                 )
-                .child(self.atom_row(atoms).italic())
+                .child(self.atom_row(atoms, document, block_index).italic())
                 .into_any_element(),
             Block::Code(code) => {
                 let mut block = div()
@@ -328,7 +616,11 @@ impl InlineCitations {
                 if let Some(mono) = self.mono_font.clone() {
                     block = block.font_family(mono);
                 }
-                block.child(code.clone()).into_any_element()
+                let selector = format!("{}-code-{block_index}", self.id);
+                block = block.debug_selector(move || selector.clone());
+                block
+                    .child(selection::text(document, code.clone(), "\n"))
+                    .into_any_element()
             }
         }
     }
@@ -356,33 +648,12 @@ impl InlineCitations {
         } else {
             format!("{}-{suffix}-{n}-{occurrence}", self.id)
         };
-        let mut chip = div()
+        let mut chip = number_chip(colors, self.radius, n, superscript)
             .id(ElementId::Name(selector.clone().into()))
-            .debug_selector(move || selector)
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(rems(0.75))
-            .rounded(self.radius)
-            .bg(colors.chip_background)
-            .text_color(colors.muted)
-            .text_size(rems(0.5625))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .line_height(rems(0.5625))
-            .child(n.to_string());
+            .debug_selector(move || selector);
         if grouped {
-            // Overlap the previous chip by a hair; the ring keeps the two
-            // readable as separate chips where they meet. No vertical offset:
-            // a cluster must stay on the text's baseline, never stepping down.
-            chip = chip
-                .ml(rems(-0.125))
-                .border_1()
-                .border_color(colors.background);
-        }
-        if superscript {
-            // The reference raises the marker like a superscript.
-            chip = chip.relative().top(rems(-0.25));
+            // Same stroke and baseline on each chip in an overlapping cluster.
+            chip = chip.ml(rems(-0.125));
         }
         let Some(reference) = reference else {
             return chip;
@@ -509,7 +780,6 @@ impl CitationFooter {
                 muted: Hsla::default(),
                 chip_background: Hsla::default(),
                 chip_hover_background: Hsla::default(),
-                background: Hsla::default(),
                 border: Hsla::default(),
             },
             radius: px(4.0),
@@ -622,21 +892,31 @@ impl RenderOnce for CitationFooter {
     }
 }
 
-/// The square numbered chip shared by inline markers and footer rows.
+/// The numbered circle/pill shared by inline markers and every source footer.
 fn number_chip(colors: CitationColors, radius: Pixels, n: u32, superscript: bool) -> Div {
+    // Keep padding for every number, not just the first nine sources.
+    let digits = n.checked_ilog10().unwrap_or(0) + 1;
+    let width = rems(0.625 + 0.375 * digits as f32);
     let mut chip = div()
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
-        .size(rems(0.75))
-        .rounded(radius)
+        .h_4()
+        .min_w(width)
+        .px(rems(0.1875))
+        .rounded_full()
         .bg(colors.chip_background)
+        .border_1()
+        .border_color(colors.border)
         .text_color(colors.muted)
-        .text_size(rems(0.5625))
+        .text_size(rems(0.6875))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .line_height(rems(0.5625))
+        .line_height(rems(0.875))
         .child(n.to_string());
+    if radius == Pixels::ZERO {
+        chip = chip.rounded(radius);
+    }
     if superscript {
         chip = chip.relative().top(rems(-0.25));
     }
@@ -652,6 +932,7 @@ impl Styled for InlineCitations {
 impl RenderOnce for InlineCitations {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
+        let document = selection::Document::default();
         let mut root = div()
             .flex()
             .flex_col()
@@ -659,8 +940,8 @@ impl RenderOnce for InlineCitations {
             .w_full()
             .min_w_0()
             .text_color(colors.foreground);
-        for block in parse_blocks(&self.text) {
-            root = root.child(self.render_block(&block));
+        for (index, block) in parse_blocks(&self.text).iter().enumerate() {
+            root = root.child(self.render_block(block, &document, index));
         }
         if !self.refs.is_empty() {
             let mut footer = div()
@@ -679,7 +960,11 @@ impl RenderOnce for InlineCitations {
             root = root.child(footer);
         }
         root.style().refine(&self.style);
-        root
+        selection::Surface {
+            id: ElementId::Name(format!("{}-selection", self.id).into()),
+            child: root.into_any_element(),
+            document,
+        }
     }
 }
 
@@ -700,6 +985,7 @@ impl Render for CitationTooltip {
         // snippet text can never paint outside the card (or grow it to the
         // window width).
         let mut card = div()
+            .debug_selector(|| "citation-tooltip".into())
             .flex()
             .flex_col()
             .gap_1()
@@ -717,6 +1003,8 @@ impl Render for CitationTooltip {
             .text_xs()
             .child(
                 div()
+                    .debug_selector(|| "citation-tooltip-label".into())
+                    .w_full()
                     .min_w_0()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .line_clamp(2)
@@ -725,6 +1013,8 @@ impl Render for CitationTooltip {
         if !self.snippet.is_empty() {
             card = card.child(
                 div()
+                    .debug_selector(|| "citation-tooltip-snippet".into())
+                    .w_full()
                     .min_w_0()
                     .text_color(self.colors.muted)
                     .line_clamp(4)
@@ -734,6 +1024,8 @@ impl Render for CitationTooltip {
         if !self.host.is_empty() {
             card = card.child(
                 div()
+                    .debug_selector(|| "citation-tooltip-host".into())
+                    .w_full()
                     .min_w_0()
                     .text_color(self.colors.muted)
                     .opacity(0.8)
@@ -744,6 +1036,10 @@ impl Render for CitationTooltip {
         card
     }
 }
+
+#[cfg(test)]
+#[path = "citations_selection_tests.rs"]
+mod selection_tests;
 
 #[cfg(test)]
 mod tests {

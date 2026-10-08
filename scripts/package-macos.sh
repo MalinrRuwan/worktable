@@ -88,7 +88,10 @@ hdiutil create \
   -ov -format UDZO \
   "$DMG_PATH"
 rm -rf "$STAGING"
-shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
+(
+  cd "$(dirname "$DMG_PATH")"
+  shasum -a 256 "$(basename "$DMG_PATH")"
+) | tee "$DMG_PATH.sha256"
 
 echo "Created $BUNDLE_DIR"
 echo "Created $DMG_PATH"

@@ -38,6 +38,7 @@ pub struct WorktableRuntime {
     lease_tasks: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     active_runs: Arc<Mutex<BTreeMap<String, AiRun>>>,
     pump_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    model_loader: Option<crate::ModelLoader>,
 }
 
 impl WorktableRuntime {
@@ -53,7 +54,18 @@ impl WorktableRuntime {
             lease_tasks: Arc::new(Mutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             pump_task: Arc::new(Mutex::new(None)),
+            model_loader: None,
         })
+    }
+
+    /// Use a supplied catalog loader for tests without contacting a provider.
+    pub async fn connect_with_model_loader(
+        database_path: &str,
+        loader: crate::ModelLoader,
+    ) -> anyhow::Result<Self> {
+        let mut runtime = Self::connect(database_path).await?;
+        runtime.model_loader = Some(loader);
+        Ok(runtime)
     }
 
     pub fn events(&self) -> EventBus {
@@ -161,7 +173,14 @@ impl WorktableRuntime {
         // the session state machine starts clean.
         let _ = self.store.fail_stale_runs(unix_time_ms()?);
 
-        let worker = AgentRuntime::start(self.store.clone(), tokio::runtime::Handle::current());
+        let worker = match &self.model_loader {
+            Some(loader) => AgentRuntime::start_with_model_loader(
+                self.store.clone(),
+                tokio::runtime::Handle::current(),
+                loader.clone(),
+            ),
+            None => AgentRuntime::start(self.store.clone(), tokio::runtime::Handle::current()),
+        };
         *agent = Some(worker);
 
         // Start the event pump that drains worker output into the event bus and
@@ -376,6 +395,21 @@ impl WorktableRuntime {
         self.send_to_worker(WorkerRequest::SetModel {
             provider_id: provider_id.to_owned(),
             model_id: model_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Enable or disable one of a provider's model groups (OpenCode Go/Zen).
+    pub async fn set_provider_group(
+        &self,
+        provider_id: &str,
+        group_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.send_to_worker(WorkerRequest::SetProviderGroup {
+            provider_id: provider_id.to_owned(),
+            group_id: group_id.to_owned(),
+            enabled,
         })
         .await
     }
