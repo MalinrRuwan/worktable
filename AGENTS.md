@@ -297,7 +297,7 @@ build that records it), and `AXIsProcessTrusted` is now false, Worktable opens
 one recovery dialog with *Open System Settings*; it does not prompt when the
 stable requirement preserved the grant, when the tour is unfinished, or twice
 for the same version. The grant is recorded whenever the tour's check again
-button or Settings sees it active.
+button or the Accessibility dialog's Check again sees it active.
 
 Accessibility is visible before it becomes a failure. While
 `AXIsProcessTrusted` is false, `status_item` swaps the menu-bar template for
