@@ -4399,20 +4399,6 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
                             }),
                     );
                 }
-                if active.is_some() {
-                    let view = view.clone();
-                    let entry_id = entry_id.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("Clear label")
-                            .icon(Icon::new(IconName::Close))
-                            .on_click(move |_, _, cx| {
-                                let entry_id = entry_id.clone();
-                                view.update(cx, |this, cx| {
-                                    this.set_entry_label(&entry_id, None, cx);
-                                });
-                            }),
-                    );
-                }
             }
             menu.separator().item(
                 PopupMenuItem::new("Quit Worktable")
@@ -6310,10 +6296,6 @@ fn render_entry_card(
     // Labels are per-entry even when a multi-selection was right-clicked; only
     // the menu's copy/delete actions carry the selection count.
     let active_label = label;
-    let label_swatches: Vec<(EntryLabelColor, gpui::Hsla)> = EntryLabelColor::ALL
-        .iter()
-        .map(|color| (*color, design::entry_label_color(&theme, *color)))
-        .collect();
     // A right click on a selected card keeps the selection, so the menu's
     // actions apply to every selected entry.
     let menu_multi = selected.contains(&entry.id) && selected.len() > 1;
@@ -6339,7 +6321,6 @@ fn render_entry_card(
         let view_del = view.clone();
         let view_copy_list = view.clone();
         let view_copy_menu = view.clone();
-        let view_clear_label = view.clone();
         let copy_label = copy_label.clone();
         let delete_label = delete_label.clone();
         let menu_multi = menu_multi;
@@ -6354,49 +6335,10 @@ fn render_entry_card(
                     });
                 }),
         );
-        menu = menu.separator();
-        for (color, swatch) in &label_swatches {
-            let view_label = view.clone();
-            let id_label_menu = id_label_menu.clone();
-            let color = *color;
-            let checked = active_label == Some(color);
-            // Keep the color circle visible on the active row. A checked menu
-            // item spends the leading icon slot on a check mark, which would
-            // hide the very color the row is choosing; name the state instead.
-            let label = if checked {
-                format!("{} (current)", color.menu_label())
-            } else {
-                color.menu_label().to_owned()
-            };
-            menu = menu.item(
-                PopupMenuItem::new(label)
-                    .icon(
-                        Icon::default()
-                            .path(crate::assets::LABEL_CIRCLE_PATH)
-                            .text_color(*swatch),
-                    )
-                    .on_click(move |_event, _window, cx| {
-                        let id = id_label_menu.clone();
-                        view_label.update(cx, |this, cx| {
-                            this.toggle_entry_label(&id, color, cx);
-                        });
-                    }),
-            );
-        }
-        if active_label.is_some() {
-            let id = id_label.clone();
-            menu = menu.item(
-                PopupMenuItem::new("Clear label")
-                    .icon(Icon::new(IconName::Close))
-                    .on_click(move |_event, _window, cx| {
-                        let id = id.clone();
-                        view_clear_label.update(cx, |this, cx| {
-                            this.set_entry_label(&id, None, cx);
-                        });
-                    }),
-            );
-        }
-        menu.separator()
+        let row_view = view.clone();
+        let row_id = id_label_menu.clone();
+        menu = menu
+            .separator()
             .item(
                 PopupMenuItem::new(copy_label)
                     .icon(Icon::new(IconName::Copy))
@@ -6408,13 +6350,15 @@ fn render_entry_card(
                         }
                     }),
             )
-            .item(
-                PopupMenuItem::new("Copy as list")
-                    .icon(Icon::new(IconName::Copy))
-                    .on_click(move |_event, _window, cx| {
-                        view_copy_list.update(cx, |this, cx| this.copy_entries_as_list(cx));
-                    }),
-            )
+            .when(menu_multi, |m| {
+                m.item(
+                    PopupMenuItem::new("Copy as list")
+                        .icon(Icon::new(IconName::Copy))
+                        .on_click(move |_event, _window, cx| {
+                            view_copy_list.update(cx, |this, cx| this.copy_entries_as_list(cx));
+                        }),
+                )
+            })
             .when(is_link_menu, |m| {
                 m.item(
                     PopupMenuItem::new("Open link")
@@ -6425,6 +6369,48 @@ fn render_entry_card(
                 )
             })
             .separator()
+            .item(PopupMenuItem::element(move |_, cx| {
+                let theme = cx.theme();
+                let mut row = h_flex()
+                    .id("entry-label-colors")
+                    .debug_selector(|| "entry-label-colors".into())
+                    .items_center()
+                    .gap_2()
+                    .px_1();
+                for color in EntryLabelColor::ALL {
+                    let swatch = design::entry_label_color(theme, color);
+                    let active = active_label == Some(color);
+                    let view = row_view.clone();
+                    let id = row_id.clone();
+                    let selector = format!("entry-label-dot:{}", color.key());
+                    let debug = selector.clone();
+                    row = row.child(
+                        div()
+                            .id(selector)
+                            .debug_selector(move || debug.clone())
+                            .role(Role::Button)
+                            .aria_label(format!("{} label", color.name()))
+                            .size_4()
+                            .rounded_full()
+                            .bg(swatch)
+                            .border_2()
+                            .border_color(if active {
+                                theme.foreground
+                            } else {
+                                theme.border
+                            })
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                let id = id.clone();
+                                view.update(cx, |this, cx| {
+                                    this.toggle_entry_label(&id, color, cx);
+                                });
+                            }),
+                    );
+                }
+                row
+            }))
+            .separator()
             .item(
                 PopupMenuItem::new(delete_label)
                     .icon(Icon::new(IconName::Delete))
@@ -6432,7 +6418,8 @@ fn render_entry_card(
                         let id = id_del2.clone();
                         view_del.update(cx, |this, cx| this.delete_context_target(id, cx));
                     }),
-            )
+            );
+        menu
     });
 
     card.into_any_element()

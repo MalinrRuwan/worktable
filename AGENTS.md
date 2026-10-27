@@ -35,9 +35,8 @@ in-app splash and onboarding. `assets.rs` layers the logo over the component ass
 source; `status_item` owns the AppKit images and blinks the menu-bar glyph
 twice when a triple-Shift capture is delivered. The Entries|Agent toggle's
 sparkle is Lucide's `sparkles` SVG (`worktable-sparkles.svg`) served the same
-way, tinted through `text_color` (`currentColor`); `label-circle.svg` is the
-filled dot used as the entry-label color swatch in the context and library
-menus.
+way, tinted through `text_color` (`currentColor`). Entry-label colors use
+theme-token dots in the card context menu.
 
 The `karpathy-guidelines` agent skill is installed globally. Apply it while
 working here: think before coding, surface assumptions, make surgical changes,
@@ -199,11 +198,13 @@ Purple — stored in `wt_entry_labels` under stable lowercase keys. A label pain
 only the card's 1px stroke (and the detail panel's outer border); background,
 radius, padding, selection, and hover stay the shared treatment, and the card's
 accessible name names the color rather than relying on color alone. Labels are
-presentation metadata, never entry content: the context menu lists the five
-colors after *View entry*, choosing the active color clears it, and the choice
-applies only to the right-clicked entry even when several are selected. With an
-entry selected, the library menu exposes the same five checked color items as
-the keyboard path. Deleting an entry removes its label in the same transaction.
+presentation metadata, never entry content: the card context menu shows a
+horizontal row of five theme-colored dots below the copy actions, choosing the
+active dot clears the label, and there is no separate Clear label item. The
+choice applies only to the right-clicked entry even when several are selected.
+With an entry selected, the library menu exposes the same five checked color
+items as the keyboard path. Copy as list is hidden for a single entry. Deleting
+an entry removes its label in the same transaction.
 
 A new entry enters from the top with the list's push-down entrance: the
 existing rows start one card higher (their pre-insert places) and glide down
