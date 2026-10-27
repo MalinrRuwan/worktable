@@ -158,6 +158,11 @@ Worktable stores its library locally. By default:
 | `~/.worktable/worktable.db` | Entries, settings, provider credentials, saved chats, and model context |
 | `~/.worktable/media/` | Imported images, hard-linked when possible and copied across devices |
 | `~/.worktable/images/` | Images saved by global capture |
+| `~/.worktable/logs/worktable.log` | Diagnostic log, written only after you turn on Settings → General → Diagnostic logs |
+
+Diagnostic logging is off by default. When enabled, it appends startup and
+background errors (including database migration failures) to the log file;
+nothing technical is written to `stderr` in its place.
 
 **Local storage does not mean local AI inference.** Assistant prompts, retrieved
 entry content, and content used for AI topic enrichment can be sent to your
@@ -235,6 +240,7 @@ Visual snapshots complement interaction tests; they do not replace them.
 | `WORKTABLE_CONTROL_SOCKET` | Enable the local control socket at this path |
 | `WORKTABLE_APP_BIN` | App binary used by `worktable-cli start` |
 | `WORKTABLE_THEMES_DIR` | Watch a different directory for development theme overrides |
+| `WORKTABLE_LOG_DIR` | Write the gated diagnostic log to this directory |
 | `RUST_LOG` | Configure logging, for example `worktable=debug` |
 
 ### Package a macOS app
@@ -257,6 +263,14 @@ dist/
 
 Packaging uses the host architecture and ad-hoc signing by default; it does
 not notarize the app. Generated files in `dist/` are ignored by Git.
+
+Ad-hoc builds carry a stable bundle identifier and designated requirement
+(`designated => identifier "com.worktable.app"`) so replacing the app in
+`/Applications` is more likely to keep its Accessibility grant. That is best
+effort: macOS may still require enabling Accessibility once after an update,
+and if capture stays blocked, remove Worktable from System Settings → Privacy &
+Security → Accessibility and add it again. A Developer ID-signed and notarized
+build is the reliable TCC path.
 
 ### Contributing
 

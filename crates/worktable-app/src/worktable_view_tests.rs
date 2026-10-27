@@ -1417,6 +1417,63 @@ fn general_settings_toggle_background_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn general_settings_toggle_diagnostic_logs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = seeded_db(Vec::new());
+    let (view, window) = setup_view_with_db(cx, db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // Off by default, in the view and in the process logger.
+    assert!(!cx.read_entity(&view, |v, _| v.logs_enabled));
+    assert!(!crate::logging::enabled());
+
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::General, cx)
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("logs-switch").is_some(),
+        "General should offer the diagnostic-log switch after the background row"
+    );
+
+    click_selector(&mut cx, "logs-switch");
+    assert!(
+        cx.read_entity(&view, |v, _| v.logs_enabled),
+        "the switch turns diagnostic logging on"
+    );
+    assert!(
+        crate::logging::enabled(),
+        "the process logger follows the switch immediately"
+    );
+    assert!(
+        wait_for_config(&db, crate::logging::LOGS_ENABLED_KEY, "1"),
+        "enabling logs persists logs_enabled=1"
+    );
+
+    // A fresh view over the same database reloads the stored preference.
+    let (reloaded, _reloaded_window) = setup_view_with_db(&mut cx, db.clone(), TEST_WINDOW_SIZE);
+    assert!(
+        wait_for(&mut cx, 10, |cx| cx
+            .read_entity(&reloaded, |v, _| v.logs_enabled)),
+        "a new view should load logs_enabled from config"
+    );
+
+    click_selector(&mut cx, "logs-switch");
+    assert!(
+        !cx.read_entity(&view, |v, _| v.logs_enabled),
+        "the switch turns diagnostic logging off"
+    );
+    assert!(!crate::logging::enabled());
+    assert!(
+        wait_for_config(&db, crate::logging::LOGS_ENABLED_KEY, "0"),
+        "disabling logs persists logs_enabled=0"
+    );
+}
+
+#[gpui::test]
 fn nav_github_configure_opens_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, window) = setup_view(cx, sample_entries());

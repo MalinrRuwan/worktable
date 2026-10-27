@@ -75,7 +75,23 @@ chmod 755 "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 
 CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
 strip -S -x "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null || true
-codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
+# Ad-hoc signatures are keyed by their code requirement, so replacing the app
+# invalidates any Accessibility grant macOS stored for the old cdhash. A
+# stable identifier plus designated requirement keeps the requirement — and
+# the TCC decision keyed to it — stable across ad-hoc replacements. A real
+# Developer ID identity keeps the normal signature: its certificate and Team
+# ID are the stable requirement.
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  codesign --force --deep --sign - \
+    --identifier "$BUNDLE_ID" \
+    --requirements "=designated => identifier \"$BUNDLE_ID\"" \
+    "$BUNDLE_DIR"
+else
+  codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
+fi
+codesign --verify --deep --strict "$BUNDLE_DIR"
+echo "Designated requirement:"
+codesign -d -r- "$BUNDLE_DIR" 2>&1 | sed -n '/^designated =>/p'
 
 # Drag-to-Applications disk image.
 STAGING=$(mktemp -d)

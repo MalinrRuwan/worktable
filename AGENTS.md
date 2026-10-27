@@ -74,6 +74,7 @@ crates/
 │   ├── src/design.rs          # Design tokens (radii, rem metrics, window chrome)
 │   ├── src/assistant.rs       # Chat message model + rendering (TextView markdown)
 │   ├── src/service.rs         # Tokio-side orchestration + event bus
+│   ├── src/logging.rs         # Gated diagnostic log (off by default)
 │   ├── src/status_item.rs     # macOS NSStatusItem / global capture
 │   └── src/bin/worktable_visual_test.rs  # Real Metal off-screen capture runner
 ├── worktable-ui/      # Motion kit + agent UI components (orbs, thinking state, streaming text, citations)
@@ -251,16 +252,20 @@ while the menu bar item and capture shortcut keep running. The status menu's
 unhide → activate → `Regular`, in that order — AppKit defers the Dock tile
 when the policy changes while the app is hidden, so restoring before unhiding
 leaves the icon missing. Turning the toggle off makes the close button quit
-the app.
+the app. General also carries *Diagnostic logs*, off by default; see
+[Diagnostics](#diagnostics).
 
 The first launch opens a **three-step tour** (`OnboardingState`): welcome with
 the keymap rendered as `gpui_component::kbd::Kbd` keycaps styled as our chips
 (keystrokes come from the live keymap via `Kbd::binding_for_action`), the
 macOS Accessibility permission for global capture (`AXIsProcessTrusted`,
 "Open System Settings", "Check again"), and a skippable provider step that
-deep-links to Settings → Providers. Every step can be skipped; completing it
-stores `onboarding_completed=1` in config, and Settings → Appearance has a
-*Replay* control. List key commands stay disabled while the tour is open.
+deep-links to Settings → Providers. The Accessibility step also explains the
+recovery path when a replaced build loses a grant that was already given:
+remove Worktable from the list and add it again. Every step can be skipped;
+completing it stores `onboarding_completed=1` in config, and Settings →
+Appearance has a *Replay* control. List key commands stay disabled while the
+tour is open.
 
 While an OAuth sign-in is in progress, the Settings Providers panel shows the
 device code or prompt with a **Cancel sign-in** control; cancelling clears the
@@ -508,6 +513,12 @@ Provider rules:
 - Name the product concept, never the engine: the graph is "knowledge" in
   every user-facing string (`Build knowledge`, `Knowledge is up to date`).
   Internal crate/module names (`worktable-helix`, `helix_tool`) stay internal.
+- **No raw technical errors in UI.** Status lines, dialogs, and transcript
+  notices show short recovery copy (`Couldn't save the label. Try again.`).
+  Route the underlying local error through `logging::error`/`warn`; never
+  interpolate SQLite statements, file paths, or HTTP bodies into user-facing
+  strings. Provider-authored assistant errors keep their existing recovery
+  copy.
 - Use the same term for an object everywhere: toolbar, menu, context menu,
   dialog, shortcuts, and settings.
 
@@ -644,6 +655,28 @@ Debug-only first-run notes: themes are watched from `themes/` (override with
 Failures in optional services (menu-bar item, theme watcher, Helix) log and
 degrade gracefully; they must never panic or block the window.
 
+## Diagnostics
+
+Diagnostic logging is **off by default** and gated by the `logs_enabled`
+config value (Settings → General → *Diagnostic logs*, switch selector
+`logs-switch`). Enabling it creates the log directory and writes an `info`
+line; disabling closes the file and writes nothing further. Nothing is written
+to `stderr` as a fallback, so a release build without the setting stays quiet.
+
+- Production path: `<database dir>/logs/worktable.log`, normally
+  `~/.worktable/logs/worktable.log`. A test or `WORKTABLE_DB_PATH` database
+  gets its log beside it. `WORKTABLE_LOG_DIR` overrides the directory.
+- Format: `[unix_ms] [level] message` with `error`, `warn`, and `info` levels.
+- Startup reads the persisted preference before the database migrates, so a
+  migration failure is logged when logging was already on. An unreadable
+  config leaves logging off; an unwritable log directory never blocks startup.
+- `worktable-app/src/logging.rs` owns the process-wide logger plus an explicit
+  `Logger` instance for file assertions in tests. UI tests toggle the setting
+  through the view but assert file contents only on an explicit instance, so
+  parallel tests never share a log file.
+- Raw technical errors go to this log; the UI keeps short recovery copy. The
+  visual-test runner and unit tests may still print to their own stdout/stderr.
+
 ## Releases
 
 `scripts/package-macos.sh` builds the release bundle and its installer:
@@ -654,8 +687,18 @@ VERSION=0.1.0 sh scripts/package-macos.sh
 
 It runs `cargo build --release -p worktable-app`, assembles
 `dist/Worktable.app` (binary + themes + `AppIcon.icns` from the Apple-grid
-asset), ad-hoc signs it, and writes a drag-to-Applications
+asset), signs it, and writes a drag-to-Applications
 `dist/Worktable-<version>.dmg` plus a `.sha256`. `dist/` stays git-ignored.
+
+Ad-hoc signing (`CODESIGN_IDENTITY` unset or `-`) passes the bundle identifier
+and a stable designated requirement (`designated => identifier
+"com.worktable.app"`), then verifies the signature and prints that requirement.
+This keeps the code requirement stable when `/Applications/Worktable.app` is
+replaced, so macOS is more likely to keep the Accessibility grant. It is best
+effort: TCC may still ask for Accessibility once after an update. A Developer
+ID identity keeps the normal signature (the certificate/Team ID is already the
+stable requirement); a Developer ID + notarized build is the reliable TCC
+path.
 
 ## Commit hygiene
 

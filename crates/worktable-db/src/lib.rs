@@ -99,15 +99,100 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-/// Chat storage: the picker's transcripts and the model context behind them.
+/// Idempotent schema repair, applied on **every** migrate.
 ///
-/// Created from `migrate` on every launch rather than from [`MIGRATIONS`],
-/// because a database can already carry a higher migration number than this
-/// array has entries (an experiment that was later removed leaves its version
-/// recorded). A versioned entry would then be skipped and leave the tables
-/// missing, which surfaces as "no such table: wt_ai_history" at the first
-/// prompt. `IF NOT EXISTS` makes the repair idempotent.
-const CHAT_SCHEMA: &str = r#"
+/// A database can carry a higher migration number than [`MIGRATIONS`] has
+/// entries (an experiment that was later removed leaves its version recorded),
+/// or a recorded version can point at a table that was never created. A
+/// versioned entry would then be skipped and leave the table missing, which
+/// surfaces later as "no such table" at the first use. `IF NOT EXISTS` makes
+/// the repair safe to run next to the versioned migrations and on every
+/// launch, including for a database created by the released 1.3.0 build.
+const SCHEMA_REPAIR: &str = r#"
+    CREATE TABLE IF NOT EXISTS wt_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_entries (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        title TEXT,
+        source TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS wt_entries_created_at_idx
+        ON wt_entries (created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wt_ai_provider_credentials (
+        provider_id TEXT PRIMARY KEY,
+        credential_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_entry_labels (
+        entry_id TEXT PRIMARY KEY,
+        color TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_pi_fs_entries (
+        path TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('file', 'directory')),
+        content TEXT,
+        mtime_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_sessions (
+        id TEXT PRIMARY KEY,
+        pi_session_id TEXT NOT NULL UNIQUE,
+        title TEXT,
+        state TEXT NOT NULL,
+        active_run_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_session_items (
+        session_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        relationship TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, item_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_runs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_events (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wt_ai_session_leases (
+        session_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        lease_until INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS wt_chats (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -426,11 +511,12 @@ impl SqliteStore {
                 .context("failed to drop the legacy entry kind column")?;
         }
 
-        // Chat storage is repaired on every launch, not versioned — see
-        // [`CHAT_SCHEMA`].
+        // Repair every table this build needs. Versioned migrations handle
+        // real schema changes; this batch heals a database whose recorded
+        // versions skipped a table (or whose counter is ahead of the array).
         connection
-            .execute_batch(CHAT_SCHEMA)
-            .context("failed to ensure the chat schema")?;
+            .execute_batch(SCHEMA_REPAIR)
+            .context("failed to repair the local schema")?;
 
         Ok(())
     }
@@ -1721,6 +1807,272 @@ mod tests {
             .save_session_history("saved", r#"[{"text":"context"}]"#)
             .unwrap();
         assert!(store.load_session_history("saved").unwrap().is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn migrate_from_1_3_0_adds_labels_and_preserves_entries_and_chats() {
+        // The released 1.3.0 build created the first four migrations plus its
+        // chat schema, but it had no `wt_entry_labels` table.
+        const RELEASED_CHAT_SCHEMA: &str = r#"
+            CREATE TABLE IF NOT EXISTS wt_chats (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                messages_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                revision INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS wt_chats_updated_at_idx
+                ON wt_chats (updated_at DESC);
+            CREATE TABLE IF NOT EXISTS wt_ai_history (
+                session_id TEXT PRIMARY KEY,
+                messages_json TEXT NOT NULL
+            );
+        "#;
+        let (dir, path) = temp_db_dir("release-1-3-0");
+        {
+            let connection = Connection::open(&path).unwrap();
+            for (index, migration) in MIGRATIONS.iter().take(4).enumerate() {
+                connection.execute_batch(migration).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO wt_schema_migrations (version, applied_at)
+                         VALUES (?, '1.3.0')",
+                        [index as i64 + 1],
+                    )
+                    .unwrap();
+            }
+            connection.execute_batch(RELEASED_CHAT_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO wt_entries (id, content, title, source, created_at)
+                     VALUES ('old-entry', 'old content', 'Old title', 'Worktable', 100)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO wt_chats (id, title, messages_json, updated_at, revision)
+                     VALUES ('old-chat', 'Old chat', '[{\"role\":\"user\"}]', 10, 3)",
+                    [],
+                )
+                .unwrap();
+            assert!(
+                !table_exists_raw(&connection, "wt_entry_labels"),
+                "the released schema has no label table"
+            );
+        }
+
+        let store = SqliteStore::connect(&path).unwrap();
+        store.migrate().unwrap();
+
+        assert!(table_exists(&store, "wt_entry_labels"));
+        let entries = store.list_entries(10).unwrap();
+        assert_eq!(entries.len(), 1, "the old entry must survive");
+        assert_eq!(entries[0].id, "old-entry");
+        assert_eq!(entries[0].content, "old content");
+        assert_eq!(
+            store.load_chat("old-chat").unwrap(),
+            Some(StoredChat {
+                summary: ChatSummary {
+                    id: "old-chat".into(),
+                    title: "Old chat".into(),
+                    updated_at: 10,
+                    revision: 3,
+                },
+                messages_json: "[{\"role\":\"user\"}]".into(),
+            }),
+            "the old chat transcript must survive"
+        );
+
+        store
+            .set_entry_label("old-entry", Some(EntryLabelColor::Amber))
+            .unwrap();
+        assert_eq!(
+            store.list_entry_labels().unwrap().get("old-entry"),
+            Some(&EntryLabelColor::Amber),
+            "labels work after the 1.3.0 upgrade"
+        );
+
+        // The repaired chat table still accepts new transcripts.
+        store.save_chat(&chat("new-chat", 20, 1)).unwrap();
+        assert_eq!(
+            store.load_chat("new-chat").unwrap(),
+            Some(chat("new-chat", 20, 1))
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A future migration number (an experiment that was removed) must not
+    /// prevent the built-in repair from recreating tables the app needs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn migrate_with_future_recorded_version_repairs_missing_tables() {
+        let (dir, path) = temp_db_dir("future-version");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE wt_schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    );
+                    CREATE TABLE wt_entries (
+                        id TEXT PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        title TEXT,
+                        source TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            // Every current version plus a future experiment is recorded, so
+            // the versioned loop skips all of them and only the repair can
+            // create the missing tables.
+            for version in 1..=MIGRATIONS.len() as i64 {
+                connection
+                    .execute(
+                        "INSERT INTO wt_schema_migrations (version, applied_at)
+                         VALUES (?, 'before the experiment')",
+                        [version],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO wt_schema_migrations (version, applied_at)
+                     VALUES (99, 'removed experiment')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO wt_entries (id, content, title, source, created_at)
+                     VALUES ('future-entry', 'kept across repair', NULL, 'Worktable', 50)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let store = SqliteStore::connect(&path).unwrap();
+        store.migrate().unwrap();
+        // A second launch must not fail on the now-existing tables.
+        store.migrate().unwrap();
+
+        for table in [
+            "wt_entries",
+            "wt_ai_provider_credentials",
+            "wt_ai_config",
+            "wt_entry_labels",
+            "wt_chats",
+            "wt_ai_history",
+            "wt_ai_sessions",
+            "wt_ai_session_items",
+            "wt_ai_runs",
+            "wt_ai_events",
+            "wt_ai_session_leases",
+            "wt_pi_fs_entries",
+        ] {
+            assert!(table_exists(&store, table), "{table} should be repaired");
+        }
+
+        let entries = store.list_entries(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "future-entry");
+        store
+            .set_entry_label("future-entry", Some(EntryLabelColor::Green))
+            .unwrap();
+        assert_eq!(
+            store.list_entry_labels().unwrap().get("future-entry"),
+            Some(&EntryLabelColor::Green)
+        );
+        store.save_chat(&chat("future-chat", 10, 1)).unwrap();
+        assert!(store.load_chat("future-chat").unwrap().is_some());
+        store
+            .save_session_history("future-chat", r#"[{"text":"context"}]"#)
+            .unwrap();
+        assert!(store.load_session_history("future-chat").unwrap().is_some());
+        store.set_config("active_provider", "openai").unwrap();
+        assert_eq!(
+            store.get_config("active_provider").unwrap().as_deref(),
+            Some("openai")
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let store = store();
+        store.insert_entry(&entry("a", 10)).unwrap();
+        store
+            .set_entry_label("a", Some(EntryLabelColor::Blue))
+            .unwrap();
+        store.save_chat(&chat("chat-a", 5, 1)).unwrap();
+
+        let entries_before: Vec<(String, String, Option<String>, i64)> = store
+            .list_entries(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id, entry.content, entry.title, entry.created_at))
+            .collect();
+        let labels_before = store.list_entry_labels().unwrap();
+        let chats_before = store.list_chats().unwrap();
+
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+
+        let entries_after: Vec<(String, String, Option<String>, i64)> = store
+            .list_entries(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id, entry.content, entry.title, entry.created_at))
+            .collect();
+        assert_eq!(entries_after, entries_before);
+        assert_eq!(store.list_entry_labels().unwrap(), labels_before);
+        assert_eq!(store.list_chats().unwrap(), chats_before);
+        let connection = store.connection.lock().unwrap();
+        let migrations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM wt_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            migrations as usize,
+            MIGRATIONS.len(),
+            "a second migrate must not duplicate migration rows"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn temp_db_dir(name: &str) -> (std::path::PathBuf, String) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("worktable-{name}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("worktable.db").to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn table_exists(store: &SqliteStore, name: &str) -> bool {
+        let connection = store.connection.lock().unwrap();
+        table_exists_raw(&connection, name)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn table_exists_raw(connection: &Connection, name: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok()
     }
 
     #[cfg(not(target_arch = "wasm32"))]

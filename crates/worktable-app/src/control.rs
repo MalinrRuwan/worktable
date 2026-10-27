@@ -39,10 +39,10 @@ pub(crate) fn start_from_env() -> Option<(UnboundedReceiver<ControlRequest>, Pat
     match start(&path) {
         Ok(server) => Some(server),
         Err(error) => {
-            eprintln!(
-                "Worktable: failed to start the control socket at {}: {error:#}",
+            crate::logging::error(format!(
+                "failed to start the control socket at {}: {error:#}",
                 path.display()
-            );
+            ));
             None
         }
     }
@@ -86,10 +86,10 @@ pub(crate) fn remove_socket(path: &Path) {
     if let Err(error) = std::fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!(
-            "Worktable: failed to remove the control socket at {}: {error}",
+        crate::logging::warn(format!(
+            "failed to remove the control socket at {}: {error}",
             path.display()
-        );
+        ));
     }
 }
 
@@ -99,7 +99,7 @@ fn serve(listener: UnixListener, sender: UnboundedSender<ControlRequest>) {
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!("Worktable: control socket accept failed: {error}");
+                crate::logging::error(format!("control socket accept failed: {error}"));
                 continue;
             }
         };
@@ -119,7 +119,7 @@ fn handle_connection(stream: UnixStream, sender: UnboundedSender<ControlRequest>
     let command = match BufReader::new(match stream.try_clone() {
         Ok(reader) => reader,
         Err(error) => {
-            eprintln!("Worktable: control socket clone failed: {error}");
+            crate::logging::error(format!("control socket clone failed: {error}"));
             return;
         }
     })

@@ -42,6 +42,9 @@ mod entry_actions;
 mod format;
 #[path = "../github.rs"]
 mod github;
+#[path = "../logging.rs"]
+#[allow(dead_code)]
+mod logging;
 #[path = "../model_picker.rs"]
 mod model_picker;
 #[path = "../preferences.rs"]

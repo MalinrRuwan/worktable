@@ -28,7 +28,9 @@ cargo build -p worktable-app -p worktable-cli
 - sets `WORKTABLE_DB_PATH`, `WORKTABLE_MEDIA_DIR`, and
   `WORKTABLE_CONTROL_SOCKET` to the isolated session;
 - writes app diagnostics to `<data_dir>/worktable.log` so `start` can return
-  without holding the caller's stdout/stderr open;
+  without holding the caller's stdout/stderr open; the app's opt-in
+  *Diagnostic logs* setting writes to `<data_dir>/logs/worktable.log`
+  instead; `start` never turns that setting on;
 - waits for `Ping`;
 - skips the first-run tour (pass `--keep-onboarding` to drive it yourself);
 - optionally seeds notes from `--seed '<json array>'`, where each item is a

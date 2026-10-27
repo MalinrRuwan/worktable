@@ -235,7 +235,7 @@ fn install_shift_capture_monitor(sender: CommandSender) {
         std::mem::forget(monitor);
         std::mem::forget(handler);
     } else {
-        eprintln!("Worktable: failed to install the global Shift monitor");
+        crate::logging::error("failed to install the global Shift monitor");
     }
 }
 
@@ -450,7 +450,9 @@ pub(crate) fn set_dock_visible(visible: bool) {
         objc2_app_kit::NSApplicationActivationPolicy::Accessory
     };
     if !app.setActivationPolicy(policy) {
-        eprintln!("Worktable: failed to switch the activation policy (visible: {visible})");
+        crate::logging::error(format!(
+            "failed to switch the activation policy (visible: {visible})"
+        ));
     }
 }
 

@@ -1,6 +1,5 @@
 //! GitHub Stars fetcher.
 
-use anyhow::Context as _;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -32,7 +31,7 @@ struct StarredResponse {
 fn log_api_body(context: &str, body: &str) {
     let body = body.trim();
     if !body.is_empty() {
-        eprintln!("Worktable: {context}: {body}");
+        crate::logging::warn(format!("{context}: {body}"));
     }
 }
 
@@ -82,7 +81,10 @@ pub async fn fetch_github_stars_with_base(
         .user_agent("Worktable/0.1.0")
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .context("failed to build HTTP client")?;
+        .map_err(|error| {
+            crate::logging::error(format!("failed to build the GitHub HTTP client: {error}"));
+            anyhow::anyhow!("Couldn't start the GitHub request. Try again.")
+        })?;
 
     let mut all_repos: Vec<GithubRepo> = Vec::new();
     let mut page: u32 = 1;
@@ -109,7 +111,10 @@ pub async fn fetch_github_stars_with_base(
             }
         }
 
-        let resp = req.send().await.context("failed to send GitHub request")?;
+        let resp = req.send().await.map_err(|error| {
+            crate::logging::error(format!("failed to send the GitHub request: {error}"));
+            anyhow::anyhow!("Couldn't reach GitHub. Check the connection and retry.")
+        })?;
         let status = resp.status();
         let headers = resp.headers().clone();
 
@@ -152,10 +157,11 @@ pub async fn fetch_github_stars_with_base(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let repos: Vec<StarredResponse> = resp
-            .json::<Vec<StarredResponse>>()
-            .await
-            .context("failed to parse GitHub response")?;
+        let repos: Vec<StarredResponse> =
+            resp.json::<Vec<StarredResponse>>().await.map_err(|error| {
+                crate::logging::error(format!("failed to parse the GitHub response: {error}"));
+                anyhow::anyhow!("GitHub returned an unexpected response. Try again.")
+            })?;
 
         let repos_len = repos.len();
         for item in repos {
@@ -235,7 +241,10 @@ pub async fn fetch_starred_repos_with_base(
         .user_agent("Worktable/0.1.0")
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .context("failed to build HTTP client")?;
+        .map_err(|error| {
+            crate::logging::error(format!("failed to build the GitHub HTTP client: {error}"));
+            anyhow::anyhow!("Couldn't start the GitHub request. Try again.")
+        })?;
 
     let mut all: Vec<StarredRepo> = Vec::new();
     let mut page: u32 = 1;
@@ -258,7 +267,10 @@ pub async fn fetch_starred_repos_with_base(
             req = req.header("Authorization", format!("Bearer {}", t.trim()));
         }
 
-        let resp = req.send().await.context("failed to send GitHub request")?;
+        let resp = req.send().await.map_err(|error| {
+            crate::logging::error(format!("failed to send the GitHub request: {error}"));
+            anyhow::anyhow!("Couldn't reach GitHub. Check the connection and retry.")
+        })?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if status.as_u16() == 404 {
@@ -270,10 +282,10 @@ pub async fn fetch_starred_repos_with_base(
             anyhow::bail!("GitHub API error {status}.");
         }
 
-        let items: Vec<StarredResponse> = resp
-            .json()
-            .await
-            .context("failed to parse GitHub starred response")?;
+        let items: Vec<StarredResponse> = resp.json().await.map_err(|error| {
+            crate::logging::error(format!("failed to parse the GitHub response: {error}"));
+            anyhow::anyhow!("GitHub returned an unexpected response. Try again.")
+        })?;
         let count = items.len();
         for item in items {
             let full_name = if item.repo.full_name.is_empty() {

@@ -357,7 +357,7 @@ impl WorktableService {
                 self.tokio.spawn(async move {
                     let helix = worktable_helix::HelixClient::from_env();
                     if let Err(err) = helix.sync_entry(&entry_clone).await {
-                        eprintln!("[worktable] Helix sync (memory mode) failed: {err}");
+                        crate::logging::warn(format!("Helix sync (memory mode) failed: {err}"));
                     }
                 });
             }
@@ -843,15 +843,28 @@ fn bootstrap_runtime(
     let database_path = match resolve_database_path() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("Worktable: {error}");
+            crate::logging::error(format!("{error}"));
             return (None, None);
         }
     };
 
-    let runtime = match tokio.block_on(WorktableRuntime::connect(&database_path)) {
+    init_logging(&database_path);
+    bootstrap_runtime_at(tokio, &database_path)
+}
+
+/// Open and migrate the runtime at `database_path`. A failure logs (when
+/// diagnostics are on) and returns no runtime so the service keeps working
+/// from its in-memory fallback.
+fn bootstrap_runtime_at(
+    tokio: &Arc<Runtime>,
+    database_path: &str,
+) -> (Option<Arc<WorktableRuntime>>, Option<Vec<WorktableEntry>>) {
+    let runtime = match tokio.block_on(WorktableRuntime::connect(database_path)) {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("Worktable: failed to open database at {database_path}: {error:#}");
+            crate::logging::error(format!(
+                "failed to open database at {database_path}: {error:#}"
+            ));
             return (None, None);
         }
     };
@@ -859,7 +872,7 @@ fn bootstrap_runtime(
     let entries = match tokio.block_on(runtime.list_entries(500)) {
         Ok(entries) => entries,
         Err(error) => {
-            eprintln!("Worktable: failed to load entries: {error:#}");
+            crate::logging::error(format!("failed to load entries: {error:#}"));
             Vec::new()
         }
     };
@@ -867,6 +880,26 @@ fn bootstrap_runtime(
     start_ai_worker(tokio, &runtime);
 
     (Some(Arc::new(runtime)), Some(entries))
+}
+
+/// Install the diagnostic logger before the database is migrated, using the
+/// preference persisted by the previous session. A database whose config
+/// cannot be read leaves logging off rather than blocking startup.
+fn init_logging(database_path: &str) {
+    let enabled = worktable_db::SqliteStore::connect(database_path)
+        .ok()
+        .and_then(|store| {
+            store
+                .get_config(crate::logging::LOGS_ENABLED_KEY)
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|value| value == "1");
+    crate::logging::init(
+        crate::logging::log_path_for_database(database_path),
+        enabled,
+        database_path,
+    );
 }
 
 /// Internal media library for the real app: `WORKTABLE_MEDIA_DIR` or
@@ -911,7 +944,7 @@ fn resolve_database_path() -> anyhow::Result<String> {
 /// Start the embedded Pi agent runtime.
 fn start_ai_worker(tokio: &Arc<Runtime>, runtime: &WorktableRuntime) {
     if let Err(error) = tokio.block_on(runtime.start_ai_worker()) {
-        eprintln!("Worktable: failed to start the AI agent: {error:#}");
+        crate::logging::error(format!("failed to start the AI agent: {error:#}"));
     }
 }
 
@@ -1023,6 +1056,22 @@ mod tests {
         let db = dir.join("worktable.db").to_string_lossy().into_owned();
         let service = Arc::new(WorktableService::new_for_test(&db).unwrap());
         (service, db)
+    }
+
+    /// An unusable database path must degrade to the in-memory fallback
+    /// instead of panicking or aborting startup.
+    #[test]
+    fn unusable_database_falls_back_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("wt-broken-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        let tokio = Arc::new(Runtime::new().unwrap());
+
+        let (runtime, seed) = bootstrap_runtime_at(&tokio, &path);
+
+        assert!(runtime.is_none(), "the runtime must not be created");
+        assert!(seed.is_none(), "no entries are seeded from a broken store");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The end-to-end import test — run under a reactor-free executor, exactly

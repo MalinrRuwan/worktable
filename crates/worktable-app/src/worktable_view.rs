@@ -378,6 +378,9 @@ pub struct WorktableView {
     pub(crate) show_thinking: bool,
     /// Keep running in the menu bar when the window closes (General).
     pub(crate) background_on_close: bool,
+    /// Append diagnostics to `logs/worktable.log` beside the database
+    /// (General). Off by default.
+    pub(crate) logs_enabled: bool,
 
     // Provider settings
     pub(crate) providers: Vec<ProviderInfo>,
@@ -530,6 +533,7 @@ impl WorktableView {
             show_thinking: false,
             // Seeded from the process mirror; the async config read refines it.
             background_on_close: crate::preferences::background_on_close(),
+            logs_enabled: crate::logging::enabled(),
             providers: Vec::new(),
             model_picker,
             model_picker_window: window.window_handle(),
@@ -739,7 +743,9 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 match result {
                     Ok(entries) => this.entries = entries,
-                    Err(error) => eprintln!("Worktable: failed to load entries: {error}"),
+                    Err(error) => {
+                        crate::logging::error(format!("failed to load entries: {error}"));
+                    }
                 }
                 this.rebuild_topic_cache();
                 cx.notify();
@@ -760,7 +766,9 @@ impl WorktableView {
                         cx.notify();
                     });
                 }
-                Err(error) => eprintln!("Worktable: failed to load entry labels: {error}"),
+                Err(error) => {
+                    crate::logging::error(format!("failed to load entry labels: {error}"));
+                }
             },
         )
         .detach();
@@ -779,7 +787,9 @@ impl WorktableView {
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
                     this.providers_loading = false;
-                    this.settings_status = Some(format!("Failed to load providers: {error}"));
+                    crate::logging::error(format!("failed to load providers: {error}"));
+                    this.settings_status =
+                        Some("Couldn't load providers. Check the key and retry.".to_owned());
                     cx.notify();
                 });
             }
@@ -814,7 +824,7 @@ impl WorktableView {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("Worktable: failed to load github_username: {error}");
+                        crate::logging::error(format!("failed to load github_username: {error}"));
                     }
                 }
                 cx.notify();
@@ -849,7 +859,9 @@ impl WorktableView {
                         this.fetch_github_stars(cx);
                     }
                     Err(error) => {
-                        this.github_error = Some(format!("Failed to save username: {error}"));
+                        crate::logging::error(format!("failed to save github_username: {error}"));
+                        this.github_error =
+                            Some("Couldn't save the GitHub username. Try again.".to_owned());
                     }
                 }
                 cx.notify();
@@ -931,7 +943,9 @@ impl WorktableView {
                         }
                     }
                     Err(error) => {
-                        this.github_import_status = Some(format!("Import failed: {error}"));
+                        crate::logging::error(format!("failed to import GitHub stars: {error}"));
+                        this.github_import_status =
+                            Some("Couldn't import stars. Try again.".to_owned());
                     }
                 }
                 cx.notify();
@@ -975,6 +989,7 @@ impl WorktableView {
                         this.github_error = None;
                     }
                     Err(error) => {
+                        crate::logging::error(format!("failed to fetch GitHub stars: {error}"));
                         this.github_error = Some(error);
                     }
                 }
@@ -1028,11 +1043,21 @@ impl WorktableView {
             let synced = match local {
                 Ok(Ok(synced)) => synced,
                 Ok(Err(error)) => {
-                    report_knowledge_status(view, cx, format!("Knowledge build failed: {error}"));
+                    crate::logging::error(format!("knowledge build failed: {error}"));
+                    report_knowledge_status(
+                        view,
+                        cx,
+                        "Knowledge build failed. Try again.".to_owned(),
+                    );
                     return;
                 }
                 Err(error) => {
-                    report_knowledge_status(view, cx, format!("Knowledge build failed: {error}"));
+                    crate::logging::error(format!("knowledge build failed: {error}"));
+                    report_knowledge_status(
+                        view,
+                        cx,
+                        "Knowledge build failed. Try again.".to_owned(),
+                    );
                     return;
                 }
             };
@@ -1057,11 +1082,17 @@ impl WorktableView {
                     let batch = match batch {
                         Ok(Ok(batch)) => batch,
                         Ok(Err(error)) => {
-                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            crate::logging::error(format!("AI topic enrichment failed: {error}"));
+                            enrichment_note = Some(
+                                "AI topics unavailable. Keyword topics are still saved.".to_owned(),
+                            );
                             break;
                         }
                         Err(error) => {
-                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            crate::logging::error(format!("AI topic enrichment failed: {error}"));
+                            enrichment_note = Some(
+                                "AI topics unavailable. Keyword topics are still saved.".to_owned(),
+                            );
                             break;
                         }
                     };
@@ -1082,7 +1113,10 @@ impl WorktableView {
                             break;
                         }
                         Err(error) => {
-                            enrichment_note = Some(format!("AI topics unavailable: {error}"));
+                            crate::logging::error(format!("AI topic enrichment failed: {error}"));
+                            enrichment_note = Some(
+                                "AI topics unavailable. Keyword topics are still saved.".to_owned(),
+                            );
                             break;
                         }
                     };
@@ -1494,6 +1528,7 @@ impl WorktableView {
             let background_on_close = service
                 .get_config(crate::preferences::BACKGROUND_ON_CLOSE_KEY)
                 .await;
+            let logs_enabled = service.get_config(crate::logging::LOGS_ENABLED_KEY).await;
             let _ = view.update(cx, |this, cx| {
                 if let Ok(Some(value)) = show_thinking {
                     this.show_thinking = value == "1";
@@ -1502,6 +1537,10 @@ impl WorktableView {
                     this.background_on_close = value != "0";
                     crate::preferences::set_background_on_close(this.background_on_close);
                 }
+                if let Ok(Some(value)) = logs_enabled {
+                    this.logs_enabled = value == "1";
+                }
+                crate::logging::set_enabled(this.logs_enabled);
                 // First launch: show the tour. Tests and the visual runner
                 // seed this as "1" so they open straight into the app.
                 if !matches!(onboarding_done, Ok(Some(ref value)) if value == "1") {
@@ -1593,6 +1632,25 @@ impl WorktableView {
         cx.spawn(async move |_view, _cx| {
             let _ = service
                 .set_config(crate::preferences::BACKGROUND_ON_CLOSE_KEY, &value)
+                .await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Flip the diagnostic-logging preference, update the process logger, and
+    /// persist it. Disabling closes the file and writes nothing further.
+    pub fn toggle_logs(&mut self, cx: &mut Context<Self>) {
+        self.logs_enabled = !self.logs_enabled;
+        crate::logging::set_enabled(self.logs_enabled);
+        if self.logs_enabled {
+            crate::logging::info("Diagnostic logs enabled.");
+        }
+        let value = if self.logs_enabled { "1" } else { "0" }.to_owned();
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |_view, _cx| {
+            let _ = service
+                .set_config(crate::logging::LOGS_ENABLED_KEY, &value)
                 .await;
         })
         .detach();
@@ -1755,6 +1813,7 @@ impl WorktableView {
         cx.spawn(async move |view, cx| {
             if let Err(error) = service.set_entry_label(&id, color).await {
                 let _ = view.update(cx, |this, cx| {
+                    crate::logging::error(format!("failed to save the entry label: {error}"));
                     if this.entry_labels.get(&id).copied() == color {
                         match previous {
                             Some(previous) => {
@@ -1766,7 +1825,7 @@ impl WorktableView {
                         }
                     }
                     this.entry_label_status =
-                        Some(format!("Couldn't save the label. Try again. ({error})"));
+                        Some("Couldn't save the label. Try again.".to_owned());
                     cx.notify();
                 });
             }
@@ -1957,7 +2016,9 @@ impl WorktableView {
                         this.entry_edit_status = None;
                     }
                     Err(error) => {
-                        this.entry_edit_status = Some(format!("Couldn't save the entry: {error}"));
+                        crate::logging::error(format!("failed to save the entry: {error}"));
+                        this.entry_edit_status =
+                            Some("Couldn't save the entry. Try again.".to_owned());
                     }
                 }
                 cx.notify();
@@ -2183,6 +2244,7 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiRunFailed { error, .. } | WorktableEvent::AiWorkerError { error } => {
+                crate::logging::error(format!("assistant run failed: {error}"));
                 let follow = self.transcript_follows_tail();
                 let error = friendly_ai_error(error);
                 self.providers_loading = false;
@@ -2278,10 +2340,12 @@ impl WorktableView {
                 if *ok {
                     self.provider_dialog_status = Some(format!("Signed in to {provider_id}."));
                 } else {
-                    self.provider_dialog_status = Some(format!(
-                        "Sign-in failed for {provider_id}: {}",
+                    crate::logging::error(format!(
+                        "sign-in failed for {provider_id}: {}",
                         error.as_deref().unwrap_or("unknown error")
                     ));
+                    self.provider_dialog_status =
+                        Some(format!("Sign-in failed for {provider_id}. Try again."));
                 }
                 self.refresh_providers(cx);
                 cx.notify();
@@ -2445,9 +2509,9 @@ impl WorktableView {
                         this.chats_state = ChatListState::Ready;
                     }
                     Err(error) => {
-                        this.chats_state = ChatListState::Failed(
-                            format!("Couldn't load chats: {error}. Try again.").into(),
-                        )
+                        crate::logging::error(format!("failed to load chats: {error}"));
+                        this.chats_state =
+                            ChatListState::Failed("Couldn't load chats. Try again.".into())
                     }
                 }
                 cx.notify();
@@ -2481,8 +2545,8 @@ impl WorktableView {
         let messages_json = match serde_json::to_string(&self.messages) {
             Ok(json) => json,
             Err(error) => {
-                self.chat_save_error =
-                    Some(format!("Couldn't save this chat: {error}. Try again.").into());
+                crate::logging::error(format!("failed to serialize the chat transcript: {error}"));
+                self.chat_save_error = Some("Couldn't save this chat. Try again.".into());
                 cx.notify();
                 return;
             }
@@ -2509,12 +2573,9 @@ impl WorktableView {
                 }
                 this.chat_save_pending = false;
                 if let Err(error) = result {
-                    this.chat_save_error = Some(
-                        format!(
-                            "Couldn't save this chat: {error}. Try again before switching chats."
-                        )
-                        .into(),
-                    );
+                    crate::logging::error(format!("failed to save the chat transcript: {error}"));
+                    this.chat_save_error =
+                        Some("Couldn't save this chat. Try again before switching chats.".into());
                 } else if this
                     .chats_sheet
                     .as_ref()
@@ -2555,12 +2616,21 @@ impl WorktableView {
         self.chat_loading = Some(id.clone());
         let service = Arc::clone(&self.service);
         cx.spawn_in(window, async move |view, cx| {
-            let result = service.load_chat(&id).await.and_then(|chat| {
-                let chat = chat.ok_or_else(|| "This chat is no longer available.".to_owned())?;
-                let messages = serde_json::from_str::<Vec<ChatMessage>>(&chat.messages_json)
-                    .map_err(|error| format!("Couldn't read this chat: {error}. Try again."))?;
-                Ok((chat.summary, messages))
-            });
+            let result = match service.load_chat(&id).await {
+                Ok(Some(chat)) => serde_json::from_str::<Vec<ChatMessage>>(&chat.messages_json)
+                    .map(|messages| (chat.summary, messages))
+                    .map_err(|error| {
+                        crate::logging::error(format!(
+                            "failed to read the chat transcript: {error}"
+                        ));
+                        "Couldn't read this chat. Try again.".to_owned()
+                    }),
+                Ok(None) => Err("This chat is no longer available.".to_owned()),
+                Err(error) => {
+                    crate::logging::error(format!("failed to load the chat transcript: {error}"));
+                    Err("Couldn't load this chat. Try again.".to_owned())
+                }
+            };
             let _ = view.update_in(cx, |this, window, cx| {
                 if this.chats_generation != generation {
                     return;
@@ -2672,6 +2742,9 @@ impl WorktableView {
             match result {
                 Err(error) => {
                     let _ = view.update(cx, |this, cx| {
+                        crate::logging::error(format!(
+                            "failed to submit the assistant prompt: {error}"
+                        ));
                         if this.chat_id.as_ref() != Some(&session_id) { return; }
                         this.assistant_busy = false;
                         if !this.messages.iter().any(|m| m.text.contains(&error)) {
@@ -2726,8 +2799,9 @@ impl WorktableView {
                             Some(format!("Saved API key for {provider_id}."));
                     }
                     Err(error) => {
+                        crate::logging::error(format!("failed to save the API key: {error}"));
                         this.provider_dialog_status =
-                            Some(format!("Failed to save API key: {error}"));
+                            Some("Couldn't save the API key. Check the key and retry.".to_owned());
                     }
                 }
                 this.refresh_providers(cx);
@@ -2754,9 +2828,9 @@ impl WorktableView {
                 .await;
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
-                    this.provider_dialog_status = Some(format!(
-                        "Couldn't update model services: {error}. Try again."
-                    ));
+                    crate::logging::error(format!("failed to update model services: {error}"));
+                    this.provider_dialog_status =
+                        Some("Couldn't update model services. Try again.".to_owned());
                     cx.notify();
                 });
             }
@@ -2778,7 +2852,9 @@ impl WorktableView {
                         this.settings_status = Some(format!("Using {provider_id} / {model_id}."));
                     }
                     Err(error) => {
-                        this.settings_status = Some(format!("Failed to select model: {error}"));
+                        crate::logging::error(format!("failed to select the model: {error}"));
+                        this.settings_status =
+                            Some("Couldn't select the model. Try again.".to_owned());
                     }
                 }
                 this.sync_model_picker(cx);
@@ -2802,8 +2878,10 @@ impl WorktableView {
             let result = service.login_oauth(&provider_id).await;
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
+                    crate::logging::error(format!("failed to start sign-in: {error}"));
                     this.logging_in.remove(&provider_id);
-                    this.provider_dialog_status = Some(format!("Failed to start sign-in: {error}"));
+                    this.provider_dialog_status =
+                        Some("Couldn't start sign-in. Try again.".to_owned());
                     cx.notify();
                 });
             }
@@ -2838,7 +2916,9 @@ impl WorktableView {
                         this.provider_dialog_status = Some(format!("Signed out of {provider_id}."));
                     }
                     Err(error) => {
-                        this.provider_dialog_status = Some(format!("Failed to sign out: {error}"));
+                        crate::logging::error(format!("failed to sign out: {error}"));
+                        this.provider_dialog_status =
+                            Some("Couldn't sign out. Try again.".to_owned());
                     }
                 }
                 this.refresh_providers(cx);
@@ -2883,7 +2963,9 @@ impl WorktableView {
             let result = service.answer_auth_prompt(&prompt_id, &answer).await;
             if let Err(error) = result {
                 let _ = view.update(cx, |this, cx| {
-                    this.provider_dialog_status = Some(format!("Failed to answer prompt: {error}"));
+                    crate::logging::error(format!("failed to answer the sign-in prompt: {error}"));
+                    this.provider_dialog_status =
+                        Some("Couldn't answer the sign-in prompt. Try again.".to_owned());
                     cx.notify();
                 });
             }
@@ -3030,7 +3112,10 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 this.entry_edit_status = Some(match result {
                     Ok(()) => "Image saved".to_owned(),
-                    Err(error) => format!("Couldn't save the image: {error}"),
+                    Err(error) => {
+                        crate::logging::error(format!("failed to save the image: {error}"));
+                        "Couldn't save the image. Try again.".to_owned()
+                    }
                 });
                 cx.notify();
             });
@@ -3085,7 +3170,8 @@ impl WorktableView {
             handle.focus(window, cx);
             viewer
         }) {
-            self.entry_edit_status = Some(format!("Couldn't open the image: {error}"));
+            crate::logging::error(format!("failed to open the image viewer: {error}"));
+            self.entry_edit_status = Some("Couldn't open the image. Try again.".to_owned());
             cx.notify();
         }
     }
@@ -4257,6 +4343,12 @@ fn render_onboarding(
                                     cx.listener(|this, _, _, cx| this.refresh_accessibility(cx)),
                                 ),
                         ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("If you already allowed Worktable before an update and capture still fails, remove Worktable from that list and add it again."),
                 );
             (
                 "Allow global capture",
@@ -5110,6 +5202,38 @@ fn render_settings(
                                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                     if *checked != this.background_on_close {
                                         this.toggle_background_on_close(cx);
+                                    }
+                                })),
+                        ),
+                ),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().text_sm().child("Diagnostic logs"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Write startup and background errors to ~/.worktable/logs. Off by default."),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| "logs-switch".into())
+                        .child(
+                            Switch::new("toggle-logs")
+                                .checked(this.logs_enabled)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    if *checked != this.logs_enabled {
+                                        this.toggle_logs(cx);
                                     }
                                 })),
                         ),

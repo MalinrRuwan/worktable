@@ -12,6 +12,7 @@ pub(crate) mod design;
 mod entry_actions;
 pub(crate) mod format;
 pub(crate) mod github;
+pub(crate) mod logging;
 pub(crate) mod model_picker;
 pub(crate) mod preferences;
 pub(crate) mod service;
@@ -116,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 
         // Open the main window.
         if let Err(error) = open_main_window(cx, service.clone(), visible.clone()) {
-            eprintln!("Worktable: failed to open window: {error:#}");
+            logging::error(format!("failed to open window: {error:#}"));
         }
 
         // Install the macOS menu-bar item.
@@ -124,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         {
             let sender = service.command_sender();
             if !status_item::install(sender) {
-                eprintln!("Worktable: failed to install the macOS menu-bar item");
+                logging::error("failed to install the macOS menu-bar item");
             }
         }
         // Route status-item commands into the app.
@@ -158,11 +159,11 @@ fn main() -> anyhow::Result<()> {
 /// changes made while the app is running.
 fn init_theme(cx: &mut App) {
     if let Err(error) = design::load_theme(cx) {
-        eprintln!("Worktable: failed to load the bundled theme: {error}");
+        logging::error(format!("failed to load the bundled theme: {error}"));
     }
     let themes_dir = resolve_themes_dir();
     if let Err(error) = ThemeRegistry::watch_dir(themes_dir, cx, design::apply_registered_theme) {
-        eprintln!("Worktable: failed to watch themes directory: {error}");
+        logging::warn(format!("failed to watch themes directory: {error}"));
     }
 }
 
@@ -461,7 +462,7 @@ fn open_window(cx: &mut App, visible: &Arc<AtomicBool>, service: &Arc<WorktableS
     if cx.windows().is_empty()
         && let Err(error) = open_main_window(cx, service.clone(), visible.clone())
     {
-        eprintln!("Worktable: failed to reopen window: {error:#}");
+        logging::error(format!("failed to reopen window: {error:#}"));
         return;
     }
     visible.store(true, Ordering::SeqCst);
