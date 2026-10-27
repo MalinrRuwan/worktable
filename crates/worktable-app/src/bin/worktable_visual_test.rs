@@ -427,7 +427,13 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
     capture(&mut cx, handle, "worktable_menu_open")?;
 
-    println!("— step 3: Settings navigates (first menu item: Down, Enter) —");
+    println!("— step 3: Settings navigates (menu: Down, Enter) —");
+    // The library menu prepends the Accessibility warning while this process
+    // lacks the real grant (the runner is not an app bundle, so that is the
+    // normal case); skip it to land on Settings.
+    if !status_item::accessibility_trusted() {
+        cx.simulate_keystrokes(handle, "down");
+    }
     cx.simulate_keystrokes(handle, "down");
     cx.simulate_keystrokes(handle, "enter");
     cx.run_until_parked();
@@ -508,6 +514,21 @@ fn run_visual_tests() -> anyhow::Result<()> {
     .ok();
     cx.run_until_parked();
     capture(&mut cx, handle, "worktable_update_dialog")?;
+    cx.update_window(handle, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
+    println!("— step 3e: accessibility warning dialog —");
+    // Force the off state: the host's TCC grant is not scriptable, and the
+    // recovery copy must be legible in the capture.
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_accessibility_dialog_for_visual_test(window, cx, false);
+        });
+    })
+    .ok();
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_accessibility_dialog")?;
     cx.update_window(handle, |_, window, cx| window.close_dialog(cx))
         .ok();
     cx.run_until_parked();

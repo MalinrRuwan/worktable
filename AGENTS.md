@@ -299,6 +299,20 @@ stable requirement preserved the grant, when the tour is unfinished, or twice
 for the same version. The grant is recorded whenever the tour's check again
 button or Settings sees it active.
 
+Accessibility is visible before it becomes a failure. While
+`AXIsProcessTrusted` is false, `status_item` swaps the menu-bar template for
+the non-template warning glyph (a neutral lamp with a red dot), including
+between the two capture blinks, and the library menu prepends *Accessibility
+is off…*. That row opens `AccessibilityDialogView`, which reads live trust
+(or a test-only `forced_trust`), shows an alert with the System Settings
+recovery path including remove/re-add after an update, and offers *Open System
+Settings* and *Check again*; `refresh_accessibility` and the startup preference
+load mirror the checked grant onto the status item, and `main.rs` polls the
+system flag every two seconds on the GPUI main thread so a grant made outside
+the app clears the dot without a relaunch. The menu reads trust when it opens,
+not when the view was built. Tests force both dialog states because the host's
+TCC grant is not scriptable; the live menu-bar dot is a manual check.
+
 While an OAuth sign-in is in progress, the Settings Providers panel shows the
 device code or prompt with a **Cancel sign-in** control; cancelling clears the
 pending login and reports `Sign-in cancelled.` in the panel's status.

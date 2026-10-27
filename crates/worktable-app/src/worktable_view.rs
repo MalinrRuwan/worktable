@@ -269,6 +269,14 @@ fn open_accessibility_settings() {
     crate::status_item::open_accessibility_settings();
 }
 
+/// Mirror the live Accessibility grant onto the menu-bar glyph, stubbed
+/// off-platform. Every trust check in the view goes through here so the red
+/// dot cannot drift from the dialog and onboarding copy.
+fn sync_status_accessibility_warning(trusted: bool) {
+    #[cfg(target_os = "macos")]
+    crate::status_item::set_accessibility_warning(trusted);
+}
+
 /// One keycap for the onboarding shortcut rows. The keystroke comes from the
 /// keymap when the action is bound (single source of truth) and falls back to
 /// the literal while the app is still starting up. Styled with the app's chip
@@ -1609,6 +1617,7 @@ impl WorktableView {
     /// Settings, outside the app).
     pub fn refresh_accessibility(&mut self, cx: &mut Context<Self>) {
         let trusted = accessibility_trusted();
+        sync_status_accessibility_warning(trusted);
         if let Some(state) = self.onboarding.as_mut() {
             state.accessibility_trusted = trusted;
         }
@@ -1688,6 +1697,9 @@ impl WorktableView {
                 let _ = service.set_config("accessibility_granted", "1").await;
             }
             let _ = view.update(cx, |this, cx| {
+                // The status item may have installed while these config reads
+                // were in flight; apply the grant the view just checked.
+                sync_status_accessibility_warning(trusted_now);
                 if let Ok(Some(value)) = show_thinking {
                     this.show_thinking = value == "1";
                 }
@@ -1797,6 +1809,60 @@ impl WorktableView {
                                     window.close_dialog(cx);
                                 }),
                         ),
+                )
+        });
+        cx.notify();
+    }
+
+    /// Open the live Accessibility status dialog from the library menu. The
+    /// dialog reads `AXIsProcessTrusted` every frame, so granting the
+    /// permission in System Settings and choosing Check again updates it in
+    /// place.
+    pub(crate) fn open_accessibility_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_accessibility_dialog(window, cx, None);
+    }
+
+    /// Visual-runner/test entry point with a fixed grant: the host's TCC
+    /// state is not scriptable, so both dialog states need a direct override.
+    #[cfg(any(test, feature = "visual-tests"))]
+    #[allow(dead_code)]
+    pub(crate) fn open_accessibility_dialog_for_visual_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        trusted: bool,
+    ) {
+        self.show_accessibility_dialog(window, cx, Some(trusted));
+    }
+
+    fn show_accessibility_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        forced_trust: Option<bool>,
+    ) {
+        let main = cx.entity();
+        let dialog_view =
+            cx.new(|cx| AccessibilityDialogView::new(main.downgrade(), forced_trust, cx));
+        let width = dialog_width(window, design::PROVIDER_DIALOG_WIDTH);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Accessibility")
+                .width(width)
+                .child(dialog_view.clone())
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("accessibility-dialog-close")
+                            .label("Close")
+                            .ghost()
+                            .h_9()
+                            .debug_selector(|| "accessibility-dialog-close".into())
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
                 )
         });
         cx.notify();
@@ -5530,6 +5596,24 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
         .debug_selector(|| "library-menu".into())
         .dropdown_menu(move |menu, _, _| {
             let settings_view = view.clone();
+            // Read trust when the menu opens, never from construction time:
+            // granting Accessibility while Worktable runs must remove the
+            // warning on the next open.
+            let mut menu = menu;
+            if !accessibility_trusted() {
+                let accessibility_view = view.clone();
+                menu = menu
+                    .item(
+                        PopupMenuItem::new("Accessibility is off…")
+                            .icon(Icon::new(IconName::TriangleAlert))
+                            .on_click(move |_, window, cx| {
+                                accessibility_view.update(cx, |this, cx| {
+                                    this.open_accessibility_dialog(window, cx);
+                                });
+                            }),
+                    )
+                    .separator();
+            }
             let mut menu = menu
                 .item(
                     PopupMenuItem::new("Settings")
@@ -8529,6 +8613,124 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 }),
         )
         .into_any_element()
+}
+
+/// The Accessibility status dialog body: the live grant, the exact System
+/// Settings recovery path, and the open/check actions.
+///
+/// It observes the main view so "Check again" repaints the status in place,
+/// and it can take a fixed grant from the test/visual runner because the
+/// host's TCC state is not controllable from a test.
+struct AccessibilityDialogView {
+    main: WeakEntity<WorktableView>,
+    forced_trust: Option<bool>,
+    _subscription: Subscription,
+}
+
+impl AccessibilityDialogView {
+    fn new(
+        main: WeakEntity<WorktableView>,
+        forced_trust: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let main_entity = main
+            .upgrade()
+            .expect("the main view exists while its dialog opens");
+        let subscription = cx.observe(&main_entity, |_, _, cx| cx.notify());
+        Self {
+            main,
+            forced_trust,
+            _subscription: subscription,
+        }
+    }
+
+    fn trusted(&self) -> bool {
+        self.forced_trust.unwrap_or_else(accessibility_trusted)
+    }
+}
+
+impl Render for AccessibilityDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let theme = cx.theme().clone();
+        let trusted = self.trusted();
+        let state_selector = if trusted {
+            "accessibility-dialog-on"
+        } else {
+            "accessibility-dialog-off"
+        };
+
+        let status = if trusted {
+            h_flex()
+                .id("accessibility-dialog-status")
+                .debug_selector(|| "accessibility-dialog-status".into())
+                .role(Role::Status)
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(theme.success)
+                .child(Icon::new(IconName::CircleCheck).size_4().flex_shrink_0())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child("Accessibility is on. Triple-Shift capture works."),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .id("accessibility-dialog-status")
+                .debug_selector(|| "accessibility-dialog-status".into())
+                .role(Role::Alert)
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(Icon::new(IconName::TriangleAlert).size_4().flex_shrink_0())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child("Accessibility is off. Triple-Shift capture is unavailable."),
+                )
+                .into_any_element()
+        };
+
+        let mut column = v_flex()
+            .debug_selector(move || state_selector.into())
+            .gap_3()
+            .child(status);
+        if !trusted {
+            column = column.child(div().text_xs().text_color(theme.muted_foreground).child(
+                "Open System Settings → Privacy & Security → Accessibility \
+                         and switch Worktable on. If Worktable is listed but off \
+                         after an update, remove it from the list and add it again.",
+            ));
+        }
+
+        let main = self.main.clone();
+        let open = Button::new("accessibility-dialog-open")
+            .label("Open System Settings")
+            .h_9()
+            .debug_selector(|| "accessibility-dialog-open".into())
+            .on_click(|_, _, _| open_accessibility_settings());
+        let open = if trusted {
+            open.secondary()
+        } else {
+            open.primary()
+        };
+        let check = Button::new("accessibility-dialog-check")
+            .label("Check again")
+            .ghost()
+            .h_9()
+            .debug_selector(|| "accessibility-dialog-check".into())
+            .on_click(move |_, _, cx| {
+                let _ = main.update(cx, |this, cx| this.refresh_accessibility(cx));
+            });
+
+        column
+            .child(h_flex().items_center().gap_2().child(open).child(check))
+            .into_any_element()
+    }
 }
 
 /// The body of the provider configuration dialog.

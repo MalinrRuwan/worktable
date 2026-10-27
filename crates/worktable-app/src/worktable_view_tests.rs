@@ -383,16 +383,14 @@ fn library_menu_selects_settings_through_the_keyboard(cx: &mut TestAppContext) {
     assert_eq!(count, 3, "seeded entries should be loaded into the view");
     assert_eq!(mode, AppMode::Entries);
 
-    // The trigger owns the popup; Down highlights the first item and Enter
-    // activates it, so the Settings path needs no pointer coordinates.
-    click_selector(&mut cx, "library-menu");
-    cx.simulate_keystrokes("down");
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
+    // The trigger owns the popup; Down highlights items and Enter activates
+    // one, so the Settings path needs no pointer coordinates. The menu may
+    // prepend the live Accessibility warning, which the helper accounts for.
+    select_library_menu_item(&mut cx, 0);
     assert_eq!(
         cx.read_entity(&view, |v, _| v.mode),
         AppMode::Settings,
-        "the first library-menu item should open Settings"
+        "the Settings item should open Settings"
     );
 }
 
@@ -414,11 +412,102 @@ fn library_menu_dismisses_with_escape(cx: &mut TestAppContext) {
     );
 
     // The trigger remains operable after dismissal.
+    select_library_menu_item(&mut cx, 0);
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
+}
+
+/// The warning row belongs to the live TCC state, which a test cannot revoke.
+/// On an untrusted host it is the first menu item and opens the dialog; on a
+/// trusted host (and hosts where the grant cannot be observed) the dialog is
+/// covered through the forced-trust test below.
+#[gpui::test]
+fn library_menu_accessibility_warning_opens_the_dialog(cx: &mut TestAppContext) {
+    if super::accessibility_trusted() {
+        return;
+    }
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
     click_selector(&mut cx, "library-menu");
     cx.simulate_keystrokes("down");
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
+    assert!(
+        cx.debug_bounds("accessibility-dialog-status").is_some(),
+        "the warning row opens the Accessibility dialog"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.mode),
+        AppMode::Entries,
+        "the dialog overlays the library instead of navigating"
+    );
+    click_selector(&mut cx, "accessibility-dialog-close");
+    assert!(cx.debug_bounds("accessibility-dialog-status").is_none());
+}
+
+/// Both dialog states are exercised through the forced grant: the off state
+/// carries the alert, the recovery path, and both actions; Check again keeps
+/// the dialog open, and Close dismisses it.
+#[gpui::test]
+fn accessibility_dialog_reports_off_and_on_states(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_accessibility_dialog_for_visual_test(window, cx, false);
+        });
+    });
+    cx.run_until_parked();
+    let off = cx.debug_bounds("accessibility-dialog-off");
+    assert!(off.is_some(), "the off state renders");
+    assert!(
+        cx.debug_bounds("accessibility-dialog-status").is_some(),
+        "the off state shows the alert status"
+    );
+    assert!(
+        cx.debug_bounds("accessibility-dialog-open").is_some(),
+        "Open System Settings is available"
+    );
+    assert!(
+        cx.debug_bounds("accessibility-dialog-check").is_some(),
+        "Check again is available"
+    );
+
+    click_selector(&mut cx, "accessibility-dialog-check");
+    assert!(
+        cx.debug_bounds("accessibility-dialog-status").is_some(),
+        "Check again re-renders the dialog instead of dismissing it"
+    );
+    click_selector(&mut cx, "accessibility-dialog-close");
+    assert!(cx.debug_bounds("accessibility-dialog-status").is_none());
+
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_accessibility_dialog_for_visual_test(window, cx, true);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("accessibility-dialog-on").is_some(),
+        "the on state renders"
+    );
+    assert!(
+        cx.debug_bounds("accessibility-dialog-status").is_some(),
+        "the on state still shows a status"
+    );
+    assert!(
+        cx.debug_bounds("accessibility-dialog-off").is_none(),
+        "the off alert is gone"
+    );
+    click_selector(&mut cx, "accessibility-dialog-close");
+    assert!(cx.debug_bounds("accessibility-dialog-status").is_none());
 }
 
 /// Labels persist through the real service and database: toggle, clear, and
@@ -997,6 +1086,18 @@ fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
     cx.run_until_parked();
 }
 
+/// Keyboard-select a library menu item by its position below the optional
+/// Accessibility warning (`Settings` is 0). The warning is present exactly
+/// when the host's real TCC grant is missing, which a test cannot change, so
+/// the offset follows the live flag instead of assuming a fixed menu.
+fn select_library_menu_item(cx: &mut VisualTestContext, item: usize) {
+    click_selector(cx, "library-menu");
+    let offset = usize::from(!super::accessibility_trusted());
+    let keystrokes = "down ".repeat(item + 1 + offset) + "enter";
+    cx.simulate_keystrokes(&keystrokes);
+    cx.run_until_parked();
+}
+
 /// The first entry card's center: one section header down inside the entries
 /// list. Row metrics resolve from the window rem size, exactly as rendering
 /// does, so this stays correct under theme/zoom changes.
@@ -1306,11 +1407,8 @@ fn nav_settings_tabs_switch_body(cx: &mut TestAppContext) {
     settle(&mut cx);
     no_splash(&mut cx, &view);
 
-    // Reach Settings via the library menu (first item, confirmed by keyboard).
-    click_selector(&mut cx, "library-menu");
-    cx.simulate_keystrokes("down");
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
+    // Reach Settings via the library menu (confirmed by keyboard).
+    select_library_menu_item(&mut cx, 0);
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
 
     // Settings lands on a line-separated category list; each row opens its
@@ -5405,8 +5503,7 @@ fn library_menu_sort_rows_change_order(cx: &mut TestAppContext) {
     settle_strip(&mut cx);
 
     // Settings is item 0, Time item 1, Alpha item 2.
-    click_selector(&mut cx, "library-menu");
-    cx.simulate_keystrokes("down down down enter");
+    select_library_menu_item(&mut cx, 2);
     assert_eq!(
         cx.read_entity(&view, |v, _| (v.sort_mode, v.sort_ascending)),
         (SortMode::Alpha, true),
@@ -5419,8 +5516,7 @@ fn library_menu_sort_rows_change_order(cx: &mut TestAppContext) {
     );
 
     // Choosing the active mode again flips the direction (Z to A).
-    click_selector(&mut cx, "library-menu");
-    cx.simulate_keystrokes("down down down enter");
+    select_library_menu_item(&mut cx, 2);
     assert_eq!(
         cx.read_entity(&view, |v, _| (v.sort_mode, v.sort_ascending)),
         (SortMode::Alpha, false),

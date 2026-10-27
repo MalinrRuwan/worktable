@@ -121,6 +121,11 @@ replaces itself, and reopens. If macOS dropped the Accessibility grant during
 that replacement, Worktable asks once to turn it back on; a preserved grant
 does not prompt.
 
+While Accessibility is off, the menu-bar glyph carries a red dot and the
+library menu prepends **Accessibility is off…**. That dialog explains the
+System Settings path, opens the pane, and checks the grant again without a
+relaunch.
+
 ### Choose your AI provider
 
 | Provider | Authentication |
