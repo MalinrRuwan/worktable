@@ -286,7 +286,8 @@ package run creates it in its own keychain at
 certificate and keychain password beside it. The certificate is trusted only
 as a user-domain code-signing root, not in the login keychain. Creating the
 identity needs OpenSSL 3 with `pkcs12 -legacy` (`brew install openssl@3`); the
-script also finds Homebrew's keg-only install. Signing uses the certificate leaf
+script also finds Homebrew's keg-only install. The first run may ask macOS to
+confirm the user trust setting for that certificate. Signing uses the certificate leaf
 as the designated requirement
 (`designated => identifier "com.worktable.app" and certificate leaf = H"…"`)
 rather than an ad-hoc cdhash, so replacing the app in `/Applications` keeps the

@@ -94,6 +94,13 @@ else
   security create-keychain -p "$PASSWORD" "$KEYCHAIN" >&2
 fi
 
+# A missing keychain with the old PEM still leaves a trust anchor in the user
+# store. Remove it before replacing the certificate so an orphaned root does
+# not linger.
+if [ -f "$CERT_PEM" ]; then
+  security remove-trusted-cert "$CERT_PEM" >/dev/null 2>&1 || true
+fi
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 KEY_PEM="$WORK_DIR/key.pem"
@@ -146,8 +153,13 @@ cp "$CERT_TMP" "$CERT_PEM"
 chmod 600 "$CERT_PEM"
 
 # Trust only as a code-signing root in the user domain, and only for this
-# dedicated keychain. The login keychain is never touched.
-security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$CERT_PEM" >&2
+# dedicated keychain. The login keychain is never touched. This is a user trust
+# setting, not a file in the codesign directory; macOS may ask for confirmation.
+log "Trusting the self-signed certificate for code signing."
+if ! security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$CERT_PEM" >&2; then
+  log "Couldn't add the self-signed certificate to the user trust settings."
+  exit 1
+fi
 
 if ! IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN" 2>&1); then
   log "Couldn't read the Worktable codesigning identity: $KEYCHAIN"

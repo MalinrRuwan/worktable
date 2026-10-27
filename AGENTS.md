@@ -754,7 +754,8 @@ the login keychain. The script generates a
 2048-bit RSA self-signed certificate (10 years, critical code-signing EKU),
 imports it with legacy PKCS#12 (macOS `security` rejects modern encryption),
 allows `/usr/bin/codesign`, and trusts it only as a code-signing root in the
-user domain. It prints only the keychain path on stdout.
+user domain; macOS may ask for confirmation the first time. It prints only the
+keychain path on stdout.
 
 The package script temporarily adds that keychain to the user keychain search
 list, signs with `codesign --force --deep --sign "$CODESIGN_IDENTITY"
