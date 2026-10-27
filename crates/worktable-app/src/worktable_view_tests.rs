@@ -4831,6 +4831,10 @@ fn model_service_controls_update_grouped_choices_without_losing_the_key(cx: &mut
     force_frame(&mut cx);
     click_selector(&mut cx, "configure:opencode-go");
     assert!(cx.debug_bounds("provider-groups").is_some());
+    assert!(
+        cx.debug_bounds("opencode-free-note").is_some(),
+        "the dialog explains which free models Worktable can call"
+    );
     assert!(cx.debug_bounds("provider-group:opencode-go:go").is_some());
     assert!(cx.debug_bounds("provider-group:opencode-go:zen").is_some());
     click_selector(&mut cx, "provider-key-input");
@@ -5557,6 +5561,51 @@ fn cancelled_run_shows_the_aborted_message(cx: &mut TestAppContext) {
         last.text.contains(worktable_ai::ABORTED_BY_USER),
         "the cancelled run reports why it stopped, got: {}",
         last.text
+    );
+}
+
+#[gpui::test]
+fn free_model_failure_shows_recovery_copy(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.chat_id = Some("free-model-chat".to_owned());
+        this.messages = vec![crate::assistant::ChatMessage::user("Try a free model")];
+        this.assistant_busy = true;
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFailed {
+                request_id: "req".to_owned(),
+                session_id: "free-model-chat".to_owned(),
+                run_id: "run".to_owned(),
+                error: "{\"error\":{\"type\":\"FreeUsageLimitError\"}}".to_owned(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let (status, last) = cx.read_entity(&view, |v, _| {
+        (v.settings_status.clone(), v.messages.last().cloned())
+    });
+    assert_eq!(
+        status.as_deref(),
+        Some("This free model only works in the OpenCode app. Choose a paid model or OpenCode Go.")
+    );
+    assert!(
+        last.as_ref()
+            .is_some_and(|message| message.text.contains("Choose a paid model or OpenCode Go")),
+        "the transcript should explain which free models Worktable can call"
+    );
+    assert!(
+        !last
+            .as_ref()
+            .is_some_and(|message| message.text.contains("FreeUsageLimitError")),
+        "the raw gateway error must not reach the transcript"
     );
 }
 

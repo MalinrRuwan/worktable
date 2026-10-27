@@ -395,6 +395,7 @@ Module ownership:
 | --- | --- |
 | `providers.rs` | provider identities, display names, client kinds, and authentication capabilities; no model lists |
 | `model_catalog.rs` | authenticated API model discovery, pagination, service grouping, and safe errors |
+| `model_metadata.rs` | OpenCode's live models.dev metadata: dialect, display name, free-tier cost, cached process-wide |
 | `model_state.rs` | cached API models and revision guards; never credentials or curated fallbacks |
 | `chatgpt.rs` | ChatGPT subscription OAuth and noninteractive refresh, backed by Worktable credentials |
 | `opencode.rs` | enabled services, API-advertised dialect routing, and clients; keeps the legacy `opencode-go` provider id |
@@ -415,21 +416,32 @@ Provider rules:
   and their snapshot models from authenticated API discovery; the UI neither
   fetches models nor fills in catalog fallbacks. A selection carries both
   provider id and the unchanged model id.
-- **OpenCode routes per service and dialect.** `opencode::route` owns Go/Zen
-  dispatch from the cached row's endpoint-owned group and optional `api`
-  metadata, never model-id guesses. Without protocol metadata, `/v1` uses
-  Chat Completions. Shared advertisements prefer Go. Missing model endpoints
-  show fetch failures instead of invented offerings. Configure → Model services changes the offered catalog, without
-  removing the saved key. Go clients send the stable per-conversation
-  `x-opencode-session` header.
+- **OpenCode routes per service and live metadata.** `opencode::route` owns
+  Go/Zen dispatch from the cached row's endpoint-owned group and the `api`
+  dialect supplied by `model_metadata.rs`, never model-id guesses. The live
+  `/models` endpoints list ids only, so the runtime fetches OpenCode's
+  `models.opencode.ai/api.json` once per process, classifies Chat Completions,
+  Responses, and Messages, and hides rows with missing or unsupported
+  metadata. Shared advertisements prefer Go. Zen free models are gated to the
+  OpenCode client and are not advertised; Go free models stay. The default
+  selection prefers a paid Chat model, then any Chat model. The model cache is
+  versioned; bump it when the row semantics change. Missing model endpoints
+  show fetch failures instead of invented offerings. Configure → Model
+  services changes the offered catalog without removing the saved key. Go
+  clients send the stable per-conversation `x-opencode-session` header.
+- **Free models are provider-gated.** OpenCode Zen free models only work
+  inside the OpenCode app, so Worktable does not advertise them. OpenCode Go
+  free models remain selectable. A `FreeUsageLimitError` maps to a recovery
+  message naming paid models or OpenCode Go.
 - **Adding a provider** means: a `ProviderSpec` in `providers.rs`, a client arm
   in `AgentRuntime::build_agent`, and a credential handled through
   `SqliteStore` (Worktable's database owns credentials; env vars are only a
   fallback). Read the rig provider docs and the source before writing the arm —
   do not infer signatures from examples.
 - **Keys and models stay consistent.** Saving a key activates the provider and
-  fetches its models; only a successful API result can auto-select the first
-  model. Loading and failure copy stays beside the picker, with Refresh models.
+  fetches its models; only a successful API result can auto-select the default
+  paid Chat model. Loading and failure copy stays beside the picker, with
+  Refresh models.
 - **ChatGPT subscription is separate from OpenAI API keys.** Sign-in is an
   explicit device OAuth action through pinned Rig's public `authorize` and
   `on_device_code` APIs. Worktable's database is the sole persistent credential

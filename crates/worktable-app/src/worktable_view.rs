@@ -2165,6 +2165,7 @@ impl WorktableView {
             }
             WorktableEvent::AiRunFailed { error, .. } | WorktableEvent::AiWorkerError { error } => {
                 let follow = self.transcript_follows_tail();
+                let error = friendly_ai_error(error);
                 self.providers_loading = false;
                 self.settings_status = Some(error.clone());
                 self.assistant_busy = false;
@@ -2183,7 +2184,7 @@ impl WorktableView {
                         }
                     }
                 }
-                if !self.messages.iter().any(|m| m.text.contains(error)) {
+                if !self.messages.iter().any(|m| m.text.contains(&error)) {
                     self.messages
                         .push(ChatMessage::assistant(format!("⚠ {error}")));
                 }
@@ -5828,6 +5829,20 @@ fn report_knowledge_status(
     });
 }
 
+/// Provider errors are usually actionable as-is. The one exception is the
+/// OpenCode free-tier gate: its JSON error is noise to a Worktable user, so
+/// say which models Worktable can actually call.
+fn friendly_ai_error(error: &str) -> String {
+    if error.contains("FreeUsageLimitError")
+        || error.to_ascii_lowercase().contains("free usage limit")
+    {
+        "This free model only works in the OpenCode app. Choose a paid model or OpenCode Go."
+            .to_owned()
+    } else {
+        error.to_owned()
+    }
+}
+
 /// Convert tool citations into UI references. Every `search_knowledge` hit is
 /// a library entry, so the click target is always the in-app
 /// `worktable-entry:` scheme — the app opens the morphing entry view, whose
@@ -7241,7 +7256,17 @@ impl Render for ProviderDialogView {
                 .child(div().text_xs().text_color(theme.muted_foreground).child(
                     "Choose which model catalogs the picker offers. \
                          Models available on both use OpenCode Go.",
-                ));
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .debug_selector(|| "opencode-free-note".into())
+                        .child(
+                            "OpenCode Zen free models only work inside the OpenCode app. \
+                             Worktable offers paid models and OpenCode Go free models.",
+                        ),
+                );
             for group in &provider.groups {
                 let main_for_group = main.clone();
                 let provider_id = provider.id.clone();
