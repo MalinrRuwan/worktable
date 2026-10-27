@@ -200,6 +200,7 @@ mod tests {
                     name: "Shared model name".into(),
                     group: group.map(str::to_owned),
                     api: None,
+                    free: false,
                 })
                 .collect(),
         }

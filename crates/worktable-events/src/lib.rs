@@ -30,6 +30,13 @@ pub struct ModelInfo {
     /// API-advertised protocol metadata; never inferred from a model's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// The provider's live metadata publishes no input or output cost.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub free: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A selectable subset of a provider's models. OpenCode, for example, offers
@@ -246,22 +253,22 @@ mod tests {
         let old: ModelInfo =
             serde_json::from_str(r#"{"id":"gpt-5-mini","name":"GPT-5 mini"}"#).unwrap();
         assert!(old.group.is_none());
-        assert!(
-            !serde_json::to_value(&old)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .contains_key("group")
-        );
+        assert!(!old.free, "old payloads are not free by default");
+        let encoded = serde_json::to_value(&old).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert!(!object.contains_key("group"));
+        assert!(!object.contains_key("free"), "false free is skipped");
 
         let grouped: ModelInfo = serde_json::from_str(
-            r#"{"id":"gpt-5-mini","name":"GPT-5 mini","group":"OpenCode Zen"}"#,
+            r#"{"id":"gpt-5-mini","name":"GPT-5 mini","group":"OpenCode Zen","free":true}"#,
         )
         .unwrap();
         assert_eq!(grouped.id, old.id);
+        assert!(grouped.free);
         let restored: ModelInfo =
             serde_json::from_str(&serde_json::to_string(&grouped).unwrap()).unwrap();
         assert_eq!(restored.group.as_deref(), Some("OpenCode Zen"));
+        assert!(restored.free);
     }
 
     #[tokio::test]

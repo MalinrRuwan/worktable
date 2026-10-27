@@ -110,6 +110,7 @@ impl WorktableService {
                                 name: format!("Server model {section}-{row}"),
                                 group: group.clone(),
                                 api: None,
+                                free: false,
                             })
                         })
                         .collect(),

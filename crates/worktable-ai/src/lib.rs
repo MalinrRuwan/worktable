@@ -3,6 +3,7 @@ pub mod chatgpt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod helix_tool;
 pub mod model_catalog;
+pub(crate) mod model_metadata;
 mod model_state;
 pub mod opencode;
 mod providers;

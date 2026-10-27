@@ -7,6 +7,7 @@
 //! - <https://api-docs.deepseek.com/api/list-models>
 //! - <https://platform.claude.com/docs/en/api/models/list> (2023-06-01)
 //! - <https://opencode.ai/docs/go/> and <https://opencode.ai/docs/zen/>
+//! - <https://models.opencode.ai/api.json> for OpenCode endpoint metadata
 //! - Codex `codex-api/src/endpoint/models.rs` and `protocol/src/openai_models.rs`
 //!   (<https://github.com/openai/codex/tree/main/codex-rs>).
 
@@ -18,7 +19,11 @@ use serde::Deserialize;
 use worktable_db::SqliteStore;
 use worktable_events::ModelInfo;
 
-use crate::{chatgpt, opencode, providers};
+use crate::{
+    chatgpt,
+    model_metadata::{self, ModelMetadata},
+    opencode, providers,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -81,6 +86,16 @@ async fn fetch_inner(store: SqliteStore, provider_id: String) -> Result<FetchedM
     if provider_id == opencode::ID {
         let mut rows = Vec::new();
         let mut warnings = Vec::new();
+        // `/models` lists ids only. One process-wide metadata fetch supplies
+        // every row's dialect, display name, and price; a failed fetch must not
+        // turn into a guessed protocol.
+        let metadata = match model_metadata::load().await {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                warnings.push(error);
+                model_metadata::cached()
+            }
+        };
         for service in opencode::SERVICES {
             let enabled = match service {
                 opencode::Service::Go => services.go,
@@ -112,7 +127,7 @@ async fn fetch_inner(store: SqliteStore, provider_id: String) -> Result<FetchedM
                 warnings.push(format!("{} returned no models.", service.name()));
             }
             // Preserve the advertising gateway; Go wins only shared advertisements.
-            rows.extend(advertised);
+            rows.extend(annotate_opencode(service, advertised, metadata));
         }
         return fetched(deduplicate(rows), warnings);
     }
@@ -232,8 +247,57 @@ fn advertised_models(models: Vec<ApiModel>, service: Option<opencode::Service>) 
             id: model.id,
             group: service.map(|service| service.name().to_string()),
             api: model.api,
+            free: false,
         })
         .collect()
+}
+
+/// Annotate the rows one OpenCode gateway actually advertised.
+///
+/// Zen's free models are restricted to OpenCode's own client, so they are not
+/// offered here. Go's free models are callable and stay. Rows without metadata
+/// or with an unsupported dialect are hidden rather than guessed; metadata
+/// never adds a row the `/models` response did not advertise.
+fn annotate_opencode(
+    service: opencode::Service,
+    rows: Vec<ModelInfo>,
+    metadata: Option<&ModelMetadata>,
+) -> Vec<ModelInfo> {
+    let Some(metadata) = metadata else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|mut row| {
+            let entry = metadata.entry(service, &row.id)?;
+            let api = entry.api()?;
+            if service == opencode::Service::Zen && entry.free {
+                return None;
+            }
+            if let Some(name) = entry.name.as_ref() {
+                row.name = name.clone();
+            }
+            row.api = Some(api.to_owned());
+            row.free = entry.free;
+            Some(row)
+        })
+        .collect()
+}
+
+/// Default selection for a provider's offered rows.
+///
+/// Paid Chat Completions rows come first; a free row is never auto-selected
+/// while a paid Chat row exists. The catalog is already sorted paid-first, but
+/// the explicit passes keep the intent independent of that ordering.
+pub(crate) fn default_model(models: &[ModelInfo]) -> Option<&ModelInfo> {
+    models
+        .iter()
+        .find(|model| !model.free && model.api.as_deref() == Some("chat"))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.api.as_deref() == Some("chat"))
+        })
+        .or_else(|| models.first())
 }
 
 #[derive(Deserialize)]
@@ -264,6 +328,7 @@ fn subscription_models(body: &[u8]) -> Result<Vec<ModelInfo>, String> {
             name: model.display_name,
             group: None,
             api: model.api,
+            free: false,
         });
     }
     Ok(deduplicate(rows))
@@ -282,7 +347,10 @@ fn deduplicate(rows: Vec<ModelInfo>) -> Vec<ModelInfo> {
             Some("OpenCode Zen") => 1,
             _ => 2,
         };
-        rank(a).cmp(&rank(b)).then_with(|| a.id.cmp(&b.id))
+        a.free
+            .cmp(&b.free)
+            .then_with(|| rank(a).cmp(&rank(b)))
+            .then_with(|| a.id.cmp(&b.id))
     });
     rows
 }
@@ -304,6 +372,188 @@ fn fetched(rows: Vec<ModelInfo>, warnings: Vec<String>) -> Result<FetchedModels,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opencode_metadata() -> ModelMetadata {
+        model_metadata::parse(
+            br#"{
+                "opencode": {
+                    "id": "opencode",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "api": "https://opencode.ai/inference/openai/v1",
+                    "models": {
+                        "zen-free": {"id": "zen-free", "name": "Zen Free", "cost": {"input": 0, "output": 0}},
+                        "zen-paid": {"id": "zen-paid", "name": "Zen Paid", "cost": {"input": 1, "output": 2}},
+                        "zen-claude": {"id": "zen-claude", "name": "Zen Claude", "cost": {"input": 2, "output": 10}, "provider": {"npm": "@ai-sdk/anthropic"}},
+                        "zen-responses": {"id": "zen-responses", "name": "Zen Responses", "cost": {"input": 2, "output": 12}, "provider": {"npm": "@ai-sdk/openai"}},
+                        "zen-gemini": {"id": "zen-gemini", "name": "Zen Gemini", "cost": {"input": 2, "output": 12}, "provider": {"npm": "@ai-sdk/google"}},
+                        "zen-metadata-only": {"id": "zen-metadata-only", "name": "Not advertised", "cost": {"input": 1, "output": 2}}
+                    }
+                },
+                "opencode-go": {
+                    "id": "opencode-go",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "api": "https://opencode.ai/inference/go/openai/v1",
+                    "models": {
+                        "go-free": {"id": "go-free", "name": "Go Free", "cost": {"input": 0, "output": 0}},
+                        "go-paid": {"id": "go-paid", "name": "Go Paid", "cost": {"input": 1, "output": 2}},
+                        "go-messages": {"id": "go-messages", "name": "Go Messages", "cost": {"input": 2, "output": 10}, "provider": {"npm": "@ai-sdk/anthropic"}},
+                        "go-gemini": {"id": "go-gemini", "name": "Go Gemini", "cost": {"input": 2, "output": 10}, "provider": {"npm": "@ai-sdk/google"}}
+                    }
+                }
+            }"#,
+        )
+        .expect("metadata fixture")
+    }
+
+    fn advertised(service: opencode::Service, id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.to_owned(),
+            name: format!("Advertised {id}"),
+            group: Some(service.name().to_owned()),
+            api: None,
+            free: false,
+        }
+    }
+
+    #[test]
+    fn zen_free_unknown_and_unsupported_rows_are_hidden() {
+        let metadata = opencode_metadata();
+        let rows = annotate_opencode(
+            opencode::Service::Zen,
+            vec![
+                advertised(opencode::Service::Zen, "zen-free"),
+                advertised(opencode::Service::Zen, "zen-paid"),
+                advertised(opencode::Service::Zen, "zen-unknown"),
+                advertised(opencode::Service::Zen, "zen-claude"),
+                advertised(opencode::Service::Zen, "zen-responses"),
+                advertised(opencode::Service::Zen, "zen-gemini"),
+            ],
+            Some(&metadata),
+        );
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["zen-paid", "zen-claude", "zen-responses"]);
+        assert_eq!(rows[0].name, "Zen Paid");
+        assert_eq!(rows[0].api.as_deref(), Some("chat"));
+        assert!(!rows[0].free);
+        assert_eq!(rows[1].api.as_deref(), Some("messages"));
+        assert_eq!(rows[2].api.as_deref(), Some("responses"));
+        assert!(
+            !rows.iter().any(|row| row.id == "zen-metadata-only"),
+            "metadata must never add an unadvertised model"
+        );
+    }
+
+    #[test]
+    fn go_keeps_free_rows_and_supported_paid_rows() {
+        let metadata = opencode_metadata();
+        let rows = annotate_opencode(
+            opencode::Service::Go,
+            vec![
+                advertised(opencode::Service::Go, "go-free"),
+                advertised(opencode::Service::Go, "go-paid"),
+                advertised(opencode::Service::Go, "go-messages"),
+                advertised(opencode::Service::Go, "go-gemini"),
+                advertised(opencode::Service::Go, "go-unknown"),
+            ],
+            Some(&metadata),
+        );
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["go-free", "go-paid", "go-messages"]);
+        assert!(rows[0].free);
+        assert_eq!(rows[0].api.as_deref(), Some("chat"));
+        assert_eq!(rows[2].api.as_deref(), Some("messages"));
+    }
+
+    #[test]
+    fn missing_metadata_keeps_the_catalog_empty_with_a_recovery_error() {
+        let rows = annotate_opencode(
+            opencode::Service::Zen,
+            vec![advertised(opencode::Service::Zen, "zen-paid")],
+            None,
+        );
+        assert!(
+            rows.is_empty(),
+            "unknown metadata must not fall back to Chat"
+        );
+        let error = model_metadata::parse(b"not-json").unwrap_err();
+        let error = fetched(rows, vec![error]).unwrap_err();
+        assert!(error.contains("metadata"), "unexpected error: {error}");
+        assert!(!error.contains("not-json"));
+    }
+
+    #[test]
+    fn paid_rows_sort_before_free_rows_then_group_then_id() {
+        let rows = deduplicate(vec![
+            ModelInfo {
+                id: "zen-paid".into(),
+                name: "Zen paid".into(),
+                group: Some(opencode::Service::Zen.name().into()),
+                api: Some("chat".into()),
+                free: false,
+            },
+            ModelInfo {
+                id: "go-free".into(),
+                name: "Go free".into(),
+                group: Some(opencode::Service::Go.name().into()),
+                api: Some("chat".into()),
+                free: true,
+            },
+            ModelInfo {
+                id: "go-paid".into(),
+                name: "Go paid".into(),
+                group: Some(opencode::Service::Go.name().into()),
+                api: Some("chat".into()),
+                free: false,
+            },
+        ]);
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["go-paid", "zen-paid", "go-free"]);
+    }
+
+    #[test]
+    fn default_selection_prefers_a_paid_chat_model() {
+        let models = vec![
+            ModelInfo {
+                id: "zen-free".into(),
+                name: "Zen free".into(),
+                group: Some(opencode::Service::Zen.name().into()),
+                api: Some("chat".into()),
+                free: true,
+            },
+            ModelInfo {
+                id: "zen-paid".into(),
+                name: "Zen paid".into(),
+                group: Some(opencode::Service::Zen.name().into()),
+                api: Some("chat".into()),
+                free: false,
+            },
+            ModelInfo {
+                id: "go-free".into(),
+                name: "Go free".into(),
+                group: Some(opencode::Service::Go.name().into()),
+                api: Some("chat".into()),
+                free: true,
+            },
+        ];
+        assert_eq!(
+            default_model(&models).map(|model| model.id.as_str()),
+            Some("zen-paid"),
+            "a free Zen model must not win the default"
+        );
+
+        let no_chat = vec![ModelInfo {
+            id: "responses".into(),
+            name: "Responses".into(),
+            group: None,
+            api: Some("responses".into()),
+            free: false,
+        }];
+        assert_eq!(
+            default_model(&no_chat).map(|model| model.id.as_str()),
+            Some("responses")
+        );
+        assert!(default_model(&[]).is_none());
+    }
 
     #[test]
     fn api_catalog_preserves_all_raw_ids_and_server_names() {

@@ -67,6 +67,17 @@ pub enum Dialect {
     Messages,
 }
 
+impl Dialect {
+    /// Canonical `ModelInfo.api` value used by the catalog.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Dialect::Chat => "chat",
+            Dialect::Responses => "responses",
+            Dialect::Messages => "messages",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Services {
     pub go: bool,
@@ -127,8 +138,9 @@ pub struct Route {
 
 /// Route from the API endpoint's service heading and advertised dialect.
 ///
-/// Disabled services are rejected, not replaced by another gateway. Discovery
-/// without dialect metadata follows the `/v1` Chat Completions convention.
+/// Disabled services are rejected, not replaced by another gateway. Rows with
+/// no dialect metadata or an unsupported one are rejected rather than routed
+/// to Chat by guesswork.
 pub fn route(model: &worktable_events::ModelInfo, services: Services) -> Option<Route> {
     let service = SERVICES
         .into_iter()
@@ -139,8 +151,8 @@ pub fn route(model: &worktable_events::ModelInfo, services: Services) -> Option<
     let dialect = match model.api.as_deref() {
         Some("responses" | "openai") => Dialect::Responses,
         Some("messages" | "anthropic") => Dialect::Messages,
-        Some("chat" | "openai-compatible" | "chat-completions") | None => Dialect::Chat,
-        Some(_) => return None,
+        Some("chat" | "openai-compatible" | "chat-completions") => Dialect::Chat,
+        Some(_) | None => return None,
     };
     Some(Route { service, dialect })
 }
@@ -250,13 +262,14 @@ mod tests {
             name: "Discovered model".into(),
             group: group.map(str::to_owned),
             api: api.map(str::to_owned),
+            free: false,
         }
     }
 
     #[test]
     fn route_requires_enabled_endpoint_owned_service() {
         for service in SERVICES {
-            let model = metadata(Some(service.name()), None);
+            let model = metadata(Some(service.name()), Some("chat"));
             assert_eq!(
                 route(&model, Services::default()),
                 Some(Route {
@@ -270,14 +283,16 @@ mod tests {
             );
         }
         for group in [None, Some("unknown"), Some("go")] {
-            assert_eq!(route(&metadata(group, None), Services::default()), None);
+            assert_eq!(
+                route(&metadata(group, Some("chat")), Services::default()),
+                None
+            );
         }
     }
 
     #[test]
     fn route_uses_only_advertised_dialects() {
         for (api, dialect) in [
-            (None, Dialect::Chat),
             (Some("chat"), Dialect::Chat),
             (Some("openai-compatible"), Dialect::Chat),
             (Some("chat-completions"), Dialect::Chat),
@@ -297,13 +312,14 @@ mod tests {
                 })
             );
         }
-        for api in ["unknown", ""] {
+        for api in [None, Some("unknown"), Some(""), Some("google")] {
             assert_eq!(
                 route(
-                    &metadata(Some(Service::Go.name()), Some(api)),
+                    &metadata(Some(Service::Go.name()), api),
                     Services::default()
                 ),
-                None
+                None,
+                "unknown dialects must not be routed as a guess: {api:?}"
             );
         }
     }

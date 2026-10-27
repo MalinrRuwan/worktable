@@ -14,12 +14,31 @@ pub type ModelLoader = Arc<
     dyn Fn(SqliteStore, String) -> BoxFuture<'static, Result<FetchedModels, String>> + Send + Sync,
 >;
 
-#[derive(Default, Serialize, Deserialize)]
+/// Bump whenever cached rows could carry semantics this build no longer
+/// accepts (for example rows without endpoint metadata or Zen free models).
+const CACHE_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
 pub(crate) struct ModelState {
+    /// Version of the row semantics, not of the provider's catalog.
+    #[serde(default)]
+    pub version: u32,
     pub revision: u64,
     pub models: Vec<ModelInfo>,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl Default for ModelState {
+    fn default() -> Self {
+        Self {
+            version: CACHE_VERSION,
+            revision: 0,
+            models: Vec::new(),
+            loading: false,
+            error: None,
+        }
+    }
 }
 
 fn key(provider_id: &str) -> String {
@@ -27,12 +46,15 @@ fn key(provider_id: &str) -> String {
 }
 
 pub(crate) fn read(store: &SqliteStore, provider_id: &str) -> ModelState {
-    store
+    let state = store
         .get_config(&key(provider_id))
         .ok()
         .flatten()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+        .and_then(|json| serde_json::from_str::<ModelState>(&json).ok());
+    match state {
+        Some(state) if state.version == CACHE_VERSION => state,
+        _ => ModelState::default(),
+    }
 }
 
 pub(crate) fn write(
@@ -70,9 +92,9 @@ mod tests {
                 name: "Server model".into(),
                 group: None,
                 api: None,
+                free: false,
             }],
-            loading: false,
-            error: None,
+            ..Default::default()
         };
         write(&store, "a", &state).unwrap();
         write(&store, "b", &state).unwrap();
@@ -80,5 +102,26 @@ mod tests {
         assert_eq!(read(&store, "a").revision, 8);
         assert!(read(&store, "a").models.is_empty());
         assert_eq!(read(&store, "b").models[0].id, "server-model");
+    }
+
+    #[test]
+    fn old_cache_without_metadata_version_is_ignored() {
+        let store = SqliteStore::connect(":memory:").unwrap();
+        store.migrate().unwrap();
+        store
+            .set_config(
+                &key("opencode-go"),
+                r#"{"revision":4,"models":[{"id":"big-pickle","name":"Big Pickle","group":"OpenCode Zen"}],"loading":false,"error":null}"#,
+            )
+            .unwrap();
+        let state = read(&store, "opencode-go");
+        assert_eq!(state.version, CACHE_VERSION);
+        assert_eq!(state.revision, 0);
+        assert!(
+            state.models.is_empty(),
+            "pre-metadata rows must not survive the cache version bump"
+        );
+        assert!(!state.loading);
+        assert!(state.error.is_none());
     }
 }
