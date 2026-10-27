@@ -142,13 +142,19 @@ pub fn entry_label_foreground(theme: &Theme, label: EntryLabelColor) -> Hsla {
     }
 }
 
+/// Hover treatment for a label dot: lift the lightness instead of painting a
+/// menu-row highlight, so only the circle under the pointer changes.
+pub fn entry_label_hover_color(theme: &Theme, label: EntryLabelColor) -> Hsla {
+    let swatch = entry_label_color(theme, label);
+    Hsla {
+        l: (swatch.l + 0.08).min(1.0),
+        ..swatch
+    }
+}
+
 /// Width of the horizontal entry-label color row in the card context menu.
 /// The row sets the menu width so the five dots can center with equal margins.
-pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(7.5);
-
-/// Aligns the color row's center with the menu's icon column. The menu item
-/// adds a fixed icon slot before the custom row, so this is a boundary offset.
-pub const ENTRY_LABEL_MENU_INSET: Pixels = gpui::px(-8.);
+pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(8.5);
 
 /// The content column's width for the current window: full width on small
 /// windows, then growing to the comfortable cap and stopping at the roomy cap
@@ -213,6 +219,11 @@ mod tests {
                     assert!(
                         (foreground.l - color.l).abs() > 0.2,
                         "the check mark must contrast with {:?} in {mode:?}",
+                        EntryLabelColor::ALL[index]
+                    );
+                    assert!(
+                        entry_label_hover_color(theme, EntryLabelColor::ALL[index]).l > color.l,
+                        "hover must brighten {:?} in {mode:?}",
                         EntryLabelColor::ALL[index]
                     );
                     for (other_index, other) in colors.iter().enumerate().skip(index + 1) {

@@ -6516,3 +6516,42 @@ fn control_assistant_and_chats_follow_the_view(cx: &mut TestAppContext) {
     );
     assert_eq!(response.state["assistant"]["busy"], false);
 }
+
+#[gpui::test]
+fn context_menu_color_dot_click_toggles_and_dismisses(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.set_entry_label("test-1000", Some(EntryLabelColor::Red), cx)
+    });
+    force_frame(&mut cx);
+    let center = first_card_center(&mut cx);
+    cx.simulate_mouse_move(center, None, Modifiers::default());
+    cx.simulate_event(MouseDownEvent {
+        position: center,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Right,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    let blue = cx
+        .debug_bounds("entry-label-dot:blue")
+        .expect("the blue label dot renders")
+        .center();
+    cx.simulate_click(blue, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        Some(EntryLabelColor::Blue),
+        "clicking a dot applies its color"
+    );
+    assert!(
+        cx.debug_bounds("entry-label-colors").is_none(),
+        "clicking a dot dismisses the context menu"
+    );
+}

@@ -204,10 +204,13 @@ treatment. The card's accessible name names the color rather than relying on
 color alone. Labels are presentation metadata, never entry content: the card
 context menu shows a horizontal row of five theme-colored dots below the copy
 actions, choosing the active dot clears the label, and there is no separate
-Clear label item. The choice applies only to the right-clicked entry even when
-several are selected. With an entry selected, the library menu exposes the same
-five checked color items as the keyboard path. Copy as list is hidden for a
-single entry. Deleting an entry removes its label in the same transaction.
+Clear label item. The color row is a disabled menu item, so the menu's row
+hover never paints; each dot brightens on hover and dispatches Escape after a
+click so the menu still closes. The choice applies only to the right-clicked
+entry even when several are selected. With an entry selected, the library menu
+exposes the same five checked color items as the keyboard path. Copy as list is
+hidden for a single entry. Deleting an entry removes its label in the same
+transaction.
 
 A new entry enters from the top with the list's push-down entrance: the
 existing rows start one card higher (their pre-insert places) and glide down
@@ -559,11 +562,14 @@ It must run on the main thread (it is a binary, not a libtest case). Use it to
 verify visual facts the semantic tree cannot express; it is not a substitute
 for the interaction tests.
 
-Known limitation: do not open an entry `ContextMenu` from an in-process test.
-The pinned GPUI Component revision leaks the menu entity through a refcount
-cycle in its dismiss subscription, so GPUI's leak detector fails the test even
-though app state is correct. Context-menu commands are covered through their
-keyboard equivalents; re-enable a direct test when the dependency is upgraded.
+Known limitation: do not open a general entry `ContextMenu` from an in-process
+test. The pinned GPUI Component revision leaks the menu entity through a
+refcount cycle in its dismiss subscription, so GPUI's leak detector fails the
+test even though app state is correct. Context-menu commands are covered through
+their keyboard equivalents; re-enable a direct test when the dependency is
+upgraded. The label color row is the exception: it is a disabled menu item that
+closes through Escape, and `context_menu_color_dot_click_toggles_and_dismisses`
+exercises that path directly.
 
 ## Agent CLI
 

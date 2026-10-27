@@ -6981,55 +6981,62 @@ fn render_entry_card(
                 )
             })
             .separator()
-            .item(PopupMenuItem::element(move |window, cx| {
-                let theme = cx.theme();
-                let row_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window);
-                let mut row = h_flex()
-                    .id("entry-label-colors")
-                    .debug_selector(|| "entry-label-colors".into())
-                    .w(row_width)
-                    .ml(design::ENTRY_LABEL_MENU_INSET)
-                    .items_center()
-                    .justify_between();
-                for color in EntryLabelColor::ALL {
-                    let swatch = design::entry_label_color(theme, color);
-                    let active = active_label == Some(color);
-                    let view = row_view.clone();
-                    let id = row_id.clone();
-                    let selector = format!("entry-label-dot:{}", color.key());
-                    let debug = selector.clone();
-                    row = row.child(
-                        div()
-                            .id(selector)
-                            .debug_selector(move || debug.clone())
-                            .role(Role::Button)
-                            .aria_label(format!("{} label", color.name()))
-                            .size_5()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(swatch)
-                            .border_1()
-                            .border_color(theme.border)
-                            .when(active, |el| {
-                                el.child(
-                                    Icon::new(IconName::Check)
-                                        .size_3()
-                                        .text_color(design::entry_label_foreground(theme, color)),
-                                )
-                            })
-                            .cursor_pointer()
-                            .on_click(move |_, _, cx| {
-                                let id = id.clone();
-                                view.update(cx, |this, cx| {
-                                    this.toggle_entry_label(&id, color, cx);
-                                });
-                            }),
-                    );
-                }
-                row
-            }))
+            .item(
+                PopupMenuItem::element(move |window, cx| {
+                    let theme = cx.theme();
+                    let row_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window);
+                    let mut row = h_flex()
+                        .id("entry-label-colors")
+                        .debug_selector(|| "entry-label-colors".into())
+                        .w(row_width)
+                        .items_center()
+                        .justify_center()
+                        .gap_2();
+                    for color in EntryLabelColor::ALL {
+                        let swatch = design::entry_label_color(theme, color);
+                        let hover_swatch = design::entry_label_hover_color(theme, color);
+                        let active = active_label == Some(color);
+                        let view = row_view.clone();
+                        let id = row_id.clone();
+                        let selector = format!("entry-label-dot:{}", color.key());
+                        let debug = selector.clone();
+                        row =
+                            row.child(
+                                div()
+                                    .id(selector)
+                                    .debug_selector(move || debug.clone())
+                                    .role(Role::Button)
+                                    .aria_label(format!("{} label", color.name()))
+                                    .size_5()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(swatch)
+                                    .hover(move |style| style.bg(hover_swatch))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .when(active, |el| {
+                                        el.child(Icon::new(IconName::Check).size_3().text_color(
+                                            design::entry_label_foreground(theme, color),
+                                        ))
+                                    })
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| {
+                                        let id = id.clone();
+                                        view.update(cx, |this, cx| {
+                                            this.toggle_entry_label(&id, color, cx);
+                                        });
+                                        if let Ok(escape) = Keystroke::parse("escape") {
+                                            window.dispatch_keystroke(escape, cx);
+                                        }
+                                    }),
+                            );
+                    }
+                    row
+                })
+                .disabled(true),
+            )
             .separator()
             .item(
                 PopupMenuItem::new(delete_label)
