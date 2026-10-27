@@ -60,6 +60,9 @@ pub struct WorktableService {
     /// Internal media library: added images are hard-linked here (falling back
     /// to a copy) so entries keep working when the original moves away.
     media_dir: PathBuf,
+    /// GitHub API root. Production is `https://api.github.com`; tests inject
+    /// a local mock so the dialog can be driven without network access.
+    github_api_base: String,
     command_tx: mpsc::UnboundedSender<AppCommand>,
     command_rx: Option<std::sync::Mutex<Option<mpsc::UnboundedReceiver<AppCommand>>>>,
 }
@@ -70,17 +73,20 @@ impl WorktableService {
     // runner and the test harness call this hermetic constructor.
     #[allow(dead_code)]
     pub fn new_for_test(db_path: &str) -> anyhow::Result<Self> {
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| anyhow!("failed to create Worktable Tokio runtime: {error}"))?,
-        );
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        // Direct connect for hermetic tests (no env var, no bootstrap side-effects).
+        Self::new_for_test_with_github_base(db_path, crate::github::DEFAULT_API_BASE)
+    }
+
+    /// Test constructor that points the GitHub integration at a local mock
+    /// server while keeping the hermetic model loader.
+    #[cfg(any(test, feature = "visual-tests"))]
+    #[allow(dead_code)]
+    pub fn new_for_test_with_github_base(
+        db_path: &str,
+        github_api_base: &str,
+    ) -> anyhow::Result<Self> {
+        // Generic fake API rows, never a production provider catalog.
         let loader: worktable_ai::ModelLoader = Arc::new(|store, provider_id| {
             Box::pin(async move {
-                // Generic fake API rows, never a production provider catalog.
                 let services = worktable_ai::opencode::Services::from_store(&store);
                 let groups = if provider_id == worktable_ai::opencode::ID {
                     worktable_ai::opencode::SERVICES
@@ -108,6 +114,45 @@ impl WorktableService {
                 })
             })
         });
+        Self::new_for_test_with_loader(db_path, github_api_base, loader)
+    }
+
+    /// Test constructor whose model loader fails only after the test releases
+    /// its gate. The gate keeps the Settings loading state visible long enough
+    /// to assert it, without ever contacting a provider.
+    #[cfg(any(test, feature = "visual-tests"))]
+    #[allow(dead_code)]
+    pub fn new_for_test_with_gated_models(
+        db_path: &str,
+    ) -> anyhow::Result<(Self, Arc<tokio::sync::Notify>)> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let loader_gate = Arc::clone(&gate);
+        let loader: worktable_ai::ModelLoader = Arc::new(move |_store, _provider_id| {
+            let gate = Arc::clone(&loader_gate);
+            Box::pin(async move {
+                gate.notified().await;
+                Err("Test models are unavailable.".to_owned())
+            })
+        });
+        let service =
+            Self::new_for_test_with_loader(db_path, crate::github::DEFAULT_API_BASE, loader)?;
+        Ok((service, gate))
+    }
+
+    #[cfg(any(test, feature = "visual-tests"))]
+    fn new_for_test_with_loader(
+        db_path: &str,
+        github_api_base: &str,
+        loader: worktable_ai::ModelLoader,
+    ) -> anyhow::Result<Self> {
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow!("failed to create Worktable Tokio runtime: {error}"))?,
+        );
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        // Direct connect for hermetic tests (no env var, no bootstrap side-effects).
         let runtime =
             tokio.block_on(WorktableRuntime::connect_with_model_loader(db_path, loader))?;
         let entries = tokio
@@ -124,6 +169,7 @@ impl WorktableService {
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir,
+            github_api_base: github_api_base.trim_end_matches('/').to_owned(),
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -149,6 +195,7 @@ impl WorktableService {
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir: resolve_media_dir(),
+            github_api_base: crate::github::DEFAULT_API_BASE.to_owned(),
             command_tx,
             command_rx: Some(std::sync::Mutex::new(Some(command_rx))),
         };
@@ -511,7 +558,7 @@ impl WorktableService {
         username: &str,
         token: Option<String>,
     ) -> Result<(usize, usize), String> {
-        self.import_starred_repos_with_base(username, token, "https://api.github.com")
+        self.import_starred_repos_with_base(username, token, &self.github_api_base)
             .await
     }
 
@@ -701,9 +748,12 @@ impl WorktableService {
     ) -> Result<(u64, Vec<crate::github::GithubRepo>), String> {
         let token = self.get_github_token().await;
         let username = username.to_owned();
+        let api_base = self.github_api_base.clone();
         let tokio = self.tokio.clone();
         tokio
-            .spawn(async move { crate::github::fetch_github_stars(&username, token).await })
+            .spawn(async move {
+                crate::github::fetch_github_stars_with_base(&username, token, &api_base).await
+            })
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())

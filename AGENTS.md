@@ -242,6 +242,10 @@ deep-links to Settings → Providers. Every step can be skipped; completing it
 stores `onboarding_completed=1` in config, and Settings → Appearance has a
 *Replay* control. List key commands stay disabled while the tour is open.
 
+While an OAuth sign-in is in progress, the Settings Providers panel shows the
+device code or prompt with a **Cancel sign-in** control; cancelling clears the
+pending login and reports `Sign-in cancelled.` in the panel's status.
+
 User message bubbles shrink to their text with an 85% max width. Assistant
 answers are plain documents on the transcript surface, with no bubble fill,
 radius, or padding; they keep an 85% measure for selectable rich text.
@@ -264,7 +268,10 @@ stream. Reasoning streams into a **collapsible thinking block**: long thoughts
 render in a capped, scrollable body, and the run folds every block back to its
 header when it finishes (the header stays clickable). The thinking cap exists
 for correctness, not only looks — laying out unbounded reasoning on the UI
-thread stalled the worker event channel and made later turns look hung.
+thread stalled the worker event channel and made later turns look hung. The
+composer also renders the last knowledge-build result as a muted `Status` line
+(`knowledge-status`); it is hidden while a build runs, when the G2 orb already
+carries the state.
 
 While a run is active the send button is the S1 orb; clicking it cancels the
 run (`WorkerRequest::Cancel`, handled synchronously by the agent runtime).

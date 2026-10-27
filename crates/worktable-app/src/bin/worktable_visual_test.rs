@@ -839,6 +839,25 @@ fn run_visual_tests() -> anyhow::Result<()> {
         });
     });
 
+    println!("— step 11g: knowledge build status —");
+    cx.update(|cx| {
+        view.update(cx, |this, cx| this.build_knowledge(cx));
+    });
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if !cx.read_entity(&view, |v, _| v.knowledge_building) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        cx.read_entity(&view, |v, _| v.knowledge_status.is_some()),
+        "the knowledge build should finish with a status line"
+    );
+    capture(&mut cx, handle, "worktable_agent_knowledge_status")?;
+
     // Reset chat and go back to entries.
     cx.update(|cx| {
         view.update(cx, |this, cx| {

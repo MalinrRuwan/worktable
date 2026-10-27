@@ -2684,6 +2684,7 @@ impl WorktableView {
                 this.logging_in.remove(&provider_id);
                 this.pending_prompt = None;
                 this.provider_dialog_status = Some("Sign-in cancelled.".to_owned());
+                this.settings_status = Some("Sign-in cancelled.".to_owned());
                 cx.notify();
             });
         })
@@ -4578,7 +4579,7 @@ fn render_settings(
         .iter()
         .next()
         .cloned()
-        .and_then(|provider_id| render_active_login(this, &view, &provider_id, cx));
+        .and_then(|provider_id| render_active_login(this, &view, &provider_id, cx, true));
     let models_loading = this
         .providers
         .iter()
@@ -4649,10 +4650,24 @@ fn render_settings(
             .debug_selector(|| "refresh-models".into())
             .on_click(cx.listener(|this, _, _, cx| this.refresh_providers(cx))),
     );
-    for (index, error) in model_errors.into_iter().enumerate() {
+    if models_loading {
         providers_section = providers_section.child(
             div()
-                .id(SharedString::from(format!("model-error-{index}")))
+                .id("providers-loading-status")
+                .debug_selector(|| "providers-loading".into())
+                .role(Role::Status)
+                .aria_label("Loading models…")
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Loading models…"),
+        );
+    }
+    for (index, error) in model_errors.into_iter().enumerate() {
+        let selector = format!("model-error-{index}");
+        providers_section = providers_section.child(
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
                 .role(Role::Alert)
                 .text_xs()
                 .text_color(theme.danger)
@@ -4845,6 +4860,7 @@ fn render_active_login(
     view: &gpui::Entity<WorktableView>,
     provider_id: &str,
     cx: &App,
+    show_cancel: bool,
 ) -> Option<gpui::AnyElement> {
     if !this.logging_in.contains(provider_id) {
         return None;
@@ -4997,7 +5013,26 @@ fn render_active_login(
     }
 
     if !has_content {
-        return None;
+        column = column.child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("Waiting for the provider to finish sign-in…"),
+        );
+    }
+
+    if show_cancel {
+        let cancel_view = view.clone();
+        column = column.child(
+            Button::new("settings-cancel-login")
+                .label("Cancel sign-in")
+                .ghost()
+                .h_9()
+                .debug_selector(|| "settings-cancel-login".into())
+                .on_click(move |_, _, cx| {
+                    cancel_view.update(cx, |this, cx| this.cancel_login(&provider_id, cx));
+                }),
+        );
     }
 
     Some(
@@ -5478,6 +5513,7 @@ fn render_entry_image(
         .bg(theme.muted.opacity(0.35))
         .child(
             img(source)
+                .id("entry-image")
                 .w_full()
                 .h_full()
                 .object_fit(ObjectFit::Contain)
@@ -6500,6 +6536,11 @@ fn render_chats_sheet(
 fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
     let theme = cx.theme().clone();
     let configured = this.agent_ready();
+    // The last build result stays beside the composer. While a build runs the
+    // G2 orb is the status, so the line yields to it.
+    let knowledge_status = (!this.knowledge_building)
+        .then(|| this.knowledge_status.clone())
+        .flatten();
 
     let mut messages = v_flex()
         .id("assistant-messages")
@@ -6555,6 +6596,7 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                         Button::new("assistant-setup-cta")
                             .label("Configure provider")
                             .icon(app_icon(IconName::Settings))
+                            .debug_selector(|| "assistant-setup-cta".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_settings_at(SettingsTab::Providers, cx)
                             })),
@@ -6720,6 +6762,18 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 .py_3()
                 .border_t_1()
                 .border_color(theme.border)
+                .when_some(knowledge_status, |el, status| {
+                    el.child(
+                        div()
+                            .id("knowledge-status")
+                            .debug_selector(|| "knowledge-status".into())
+                            .role(Role::Status)
+                            .aria_label(status.clone())
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(status),
+                    )
+                })
                 .child(
                     h_flex()
                         .gap_1()
@@ -6877,7 +6931,7 @@ impl Render for ProviderDialogView {
                 state.logging_in.contains(&provider.id),
             )
         };
-        let login_panel = render_active_login(main.read(cx), &main, &provider.id, cx);
+        let login_panel = render_active_login(main.read(cx), &main, &provider.id, cx, false);
 
         let mut column = v_flex()
             .debug_selector(|| "provider-dialog".into())
@@ -6983,6 +7037,7 @@ impl Render for ProviderDialogView {
                         .label("Cancel sign-in")
                         .ghost()
                         .h_9()
+                        .debug_selector(|| "provider-cancel-login".into())
                         .on_click(move |_, _, cx| {
                             let provider_id = provider_id.clone();
                             main_for_auth
@@ -7001,6 +7056,7 @@ impl Render for ProviderDialogView {
                         .primary()
                         .h_9()
                         .icon(app_icon(IconName::ExternalLink))
+                        .debug_selector(|| "provider-sign-in".into())
                         .on_click(move |_, _, cx| {
                             let provider_id = provider_id.clone();
                             main_for_auth.update(cx, |this, cx| this.login_oauth(&provider_id, cx));

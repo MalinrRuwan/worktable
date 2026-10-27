@@ -132,7 +132,41 @@ fn setup_view_with_db(
     window_size: Size<gpui::Pixels>,
 ) -> (Entity<WorktableView>, WindowHandle<Root>) {
     let service = Arc::new(WorktableService::new_for_test(&db).unwrap());
+    open_view_with_service(cx, service, window_size)
+}
 
+/// Build a window whose GitHub integration points at a local mock server.
+fn setup_view_with_github_base(
+    cx: &mut TestAppContext,
+    entries: Vec<WorktableEntry>,
+    github_api_base: &str,
+) -> (Entity<WorktableView>, WindowHandle<Root>) {
+    let db = seeded_db(entries);
+    let service =
+        Arc::new(WorktableService::new_for_test_with_github_base(&db, github_api_base).unwrap());
+    open_view_with_service(cx, service, TEST_WINDOW_SIZE)
+}
+
+/// Build a window whose model loader fails once released from a test gate.
+fn setup_view_with_gated_models(
+    cx: &mut TestAppContext,
+    entries: Vec<WorktableEntry>,
+) -> (
+    Entity<WorktableView>,
+    WindowHandle<Root>,
+    Arc<tokio::sync::Notify>,
+) {
+    let db = seeded_db(entries);
+    let (service, gate) = WorktableService::new_for_test_with_gated_models(&db).unwrap();
+    let (view, window) = open_view_with_service(cx, Arc::new(service), TEST_WINDOW_SIZE);
+    (view, window, gate)
+}
+
+fn open_view_with_service(
+    cx: &mut TestAppContext,
+    service: Arc<WorktableService>,
+    window_size: Size<gpui::Pixels>,
+) -> (Entity<WorktableView>, WindowHandle<Root>) {
     // `WorktableService` runs its own real Tokio workers, which complete config /
     // github / provider reads off-thread and wake GPUI futures from those worker
     // threads. GPUI's deterministic test scheduler rejects off-thread scheduling
@@ -151,6 +185,107 @@ fn setup_view_with_db(
     });
 
     (holder.borrow().clone().expect("view was built"), window)
+}
+
+/// A one-shot HTTP/1.1 server speaking enough of the GitHub starred-repos API
+/// for the fetch and import paths to run without network access.
+struct MockGithub {
+    addr: std::net::SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MockGithub {
+    fn start(body: &'static str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = shutdown.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        Self { addr, shutdown }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for MockGithub {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The same rows satisfy both GitHub endpoints: `fetch_github_stars` reads the
+/// flattened repo fields, while the import reads `starred_at` + `repo`.
+const STARRED_BODY: &str = r#"[
+    {
+        "starred_at": "2026-08-01T10:00:00Z",
+        "name": "gpui",
+        "full_name": "zed-industries/gpui",
+        "description": "Fast, productive tooling for building native apps",
+        "stargazers_count": 12000,
+        "html_url": "https://github.com/zed-industries/gpui",
+        "repo": {
+            "name": "gpui",
+            "full_name": "zed-industries/gpui",
+            "description": "Fast, productive tooling for building native apps",
+            "stargazers_count": 12000,
+            "html_url": "https://github.com/zed-industries/gpui"
+        }
+    },
+    {
+        "starred_at": "2026-07-15T08:30:00Z",
+        "name": "no-desc-repo",
+        "full_name": "someone/no-desc-repo",
+        "stargazers_count": 5,
+        "html_url": "https://github.com/someone/no-desc-repo",
+        "repo": {
+            "name": "no-desc-repo",
+            "full_name": "someone/no-desc-repo",
+            "stargazers_count": 5,
+            "html_url": "https://github.com/someone/no-desc-repo"
+        }
+    }
+]"#;
+
+/// A valid 8×8 PNG for image picker/viewer tests.
+const TEST_PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x08\x00\x00\x00\x08\x08\x02\x00\x00\x00\x4b\x6d\x29\xdc\x00\x00\x00\x25\x49\x44\x41\x54\x78\x9c\x63\x60\x60\x60\x50\x50\x50\x70\x70\x70\x48\x48\x48\x68\x68\x68\x58\xb0\x60\xc1\x81\x03\x07\x1e\x3c\x78\xc0\x30\xb4\x24\x00\x58\x99\x54\x01\x67\xf0\x51\x8b\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/// Read a config value straight from the database, independent of the view's
+/// async write. Poll until it lands so the assertion is not a race.
+fn config_value(db: &str, key: &str) -> Option<String> {
+    let store = worktable_db::SqliteStore::connect(db).ok()?;
+    store.migrate().ok()?;
+    store.get_config(key).ok()?
+}
+
+fn wait_for_config(db: &str, key: &str, value: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if config_value(db, key).as_deref() == Some(value) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Render a frame, then flush all work so hit targets and async loads settle.
@@ -4574,4 +4709,751 @@ fn answer_copy_command_handles_plain_cited_and_streaming_text(cx: &mut TestAppCo
             text
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Verification-gap coverage
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn search_clear_shortcut_restores_the_library(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    focus_view(&mut cx, &view);
+    cx.simulate_keystrokes("cmd-f");
+    cx.simulate_input("neg");
+    assert_eq!(cx.read_entity(&view, |v, _| v.query.clone()), "neg");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.visible_entries().len()),
+        1,
+        "the query should filter the list"
+    );
+
+    cx.simulate_keystrokes("cmd-shift-p");
+    assert!(
+        cx.read_entity(&view, |v, _| v.query.is_empty()),
+        "⌘⇧P should clear the query"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.visible_entries().len()),
+        3,
+        "clearing the search restores every entry"
+    );
+}
+
+#[gpui::test]
+fn copy_shortcuts_write_the_selected_entry_and_link(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let entries = vec![
+        WorktableEntry {
+            id: "copy-text".into(),
+            content: "The text entry body".into(),
+            title: None,
+            source: "Worktable".into(),
+            created_at: 200,
+        },
+        WorktableEntry {
+            id: "copy-link".into(),
+            content: "https://example.com/worktable".into(),
+            title: None,
+            source: "Worktable".into(),
+            created_at: 100,
+        },
+    ];
+    let (view, window) = setup_view(cx, entries);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, _| this.select_at("copy-text".into(), false));
+    focus_view(&mut cx, &view);
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("The text entry body".to_owned()),
+        "⌘C copies the selected entry"
+    );
+
+    view.update(&mut cx, |this, _| this.select_at("copy-link".into(), false));
+    focus_view(&mut cx, &view);
+    cx.simulate_keystrokes("cmd-shift-c");
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("https://example.com/worktable".to_owned()),
+        "⇧⌘C copies the selected link"
+    );
+}
+
+#[gpui::test]
+fn image_picker_adds_a_picked_file(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let dir = std::env::temp_dir().join(format!("worktable-pick-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("picked.png");
+    std::fs::write(&path, TEST_PNG).unwrap();
+
+    view.update(&mut cx, |this, cx| this.pick_image(cx));
+    assert!(
+        cx.did_prompt_for_paths(),
+        "the plus button should open the system picker"
+    );
+    cx.simulate_path_prompt_response(|_| Some(vec![path]));
+    let media = cx.read_entity(&view, |v, _| v.service.media_dir().to_path_buf());
+    let stored = media.join("picked.png");
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.entries
+                    .iter()
+                    .any(|entry| std::path::Path::new(&entry.content) == stored && stored.is_file())
+            })
+        }),
+        "the picked image should become an entry linked into the media library"
+    );
+    assert!(stored.is_file(), "the media library should hold the image");
+}
+
+#[gpui::test]
+fn image_viewer_opens_from_the_detail(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let path = std::env::temp_dir().join(format!("worktable-viewer-{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&path, TEST_PNG).unwrap();
+    let entry = WorktableEntry {
+        id: "viewer-image".into(),
+        content: path.to_string_lossy().into_owned(),
+        title: None,
+        source: "Selection".into(),
+        created_at: 100,
+    };
+    let (view, window) = setup_view(cx, vec![entry]);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.open_entry_modal(
+            "viewer-image",
+            Bounds::new(Point::default(), Size::default()),
+            cx,
+        );
+    });
+    force_frame(&mut cx);
+    // Let the morph finish: the growing panel swallows clicks while it is
+    // still smaller than the laid-out content.
+    std::thread::sleep(worktable_ui::MODAL_OPEN.total());
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    let frame = cx
+        .debug_bounds("entry-image-frame")
+        .expect("the detail image frame renders")
+        .center();
+    cx.simulate_mouse_move(frame, None, Modifiers::default());
+
+    cx.simulate_event(MouseDownEvent {
+        position: frame,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: frame,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 2,
+    });
+    let main_handle = *window.deref();
+    assert!(
+        wait_for(&mut cx, 5, |cx| cx.windows().len() == 2),
+        "double-clicking the detail image should open the viewer window"
+    );
+    let viewer_handle = cx
+        .windows()
+        .into_iter()
+        .find(|handle| *handle != main_handle)
+        .expect("the viewer window exists");
+
+    let mut viewer_cx = VisualTestContext::from_window(viewer_handle, &cx);
+    viewer_cx.update(|window, _| window.refresh());
+    viewer_cx.run_until_parked();
+    assert!(
+        viewer_cx.debug_bounds("image-viewer").is_some(),
+        "the popup renders the viewer surface"
+    );
+    assert!(
+        viewer_cx.debug_bounds("image-viewer-image").is_some(),
+        "the popup renders the image"
+    );
+
+    let close = viewer_cx
+        .debug_bounds("image-viewer-close")
+        .expect("the viewer has a close control")
+        .center();
+    viewer_cx.simulate_click(close, Modifiers::default());
+    viewer_cx.run_until_parked();
+    assert_eq!(
+        cx.windows().len(),
+        1,
+        "Close dismisses the viewer window without closing the main window"
+    );
+}
+
+#[gpui::test]
+fn library_menu_sort_rows_change_order(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    settle_strip(&mut cx);
+
+    // Settings is item 0, Time item 1, Alpha item 2.
+    click_selector(&mut cx, "library-menu");
+    cx.simulate_keystrokes("down down down enter");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| (v.sort_mode, v.sort_ascending)),
+        (SortMode::Alpha, true),
+        "choosing A to Z selects Alpha ascending"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.visible_entry_ids()),
+        vec!["test-800", "test-1000", "test-900"],
+        "A–Z order follows the entry text"
+    );
+
+    // Choosing the active mode again flips the direction (Z to A).
+    click_selector(&mut cx, "library-menu");
+    cx.simulate_keystrokes("down down down enter");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| (v.sort_mode, v.sort_ascending)),
+        (SortMode::Alpha, false),
+        "choosing the active row flips the direction"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.visible_entry_ids()),
+        vec!["test-900", "test-1000", "test-800"],
+        "Z–A order reverses the list"
+    );
+}
+
+#[gpui::test]
+fn appearance_replay_button_opens_the_tour(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Appearance, cx)
+    });
+    force_frame(&mut cx);
+    click_selector(&mut cx, "show-onboarding");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Welcome),
+        "Replay starts the tour at the welcome step"
+    );
+    assert!(cx.debug_bounds("onboarding").is_some());
+}
+
+#[gpui::test]
+fn github_fetch_and_import_drive_the_dialog(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mock = MockGithub::start(STARRED_BODY);
+    let (view, window) = setup_view_with_github_base(cx, Vec::new(), &mock.base_url());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Data, cx)
+    });
+    force_frame(&mut cx);
+    click_selector(&mut cx, "configure-github-stars");
+    assert!(cx.debug_bounds("github-dialog").is_some());
+
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            let input = this.github_input.clone();
+            input.update(cx, |state, cx| state.set_value("octocat", window, cx));
+        });
+    });
+    cx.run_until_parked();
+    click_selector(&mut cx, "github-fetch");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| v.github_repos.len() == 2)
+        }),
+        "the dialog fetches starred repositories from the mock API"
+    );
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("github-repos").is_some());
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v
+            .github_repos
+            .iter()
+            .map(|repo| repo.name.clone())
+            .collect::<Vec<_>>()),
+        vec!["zed-industries/gpui", "someone/no-desc-repo"],
+        "the fetch lists the repositories by star count"
+    );
+
+    click_selector(&mut cx, "github-import-stars");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.entries
+                    .iter()
+                    .filter(|entry| entry.source == "github-star")
+                    .count()
+                    == 2
+            })
+        }),
+        "the import turns both stars into entries"
+    );
+    assert!(cx.read_entity(&view, |v, _| {
+        v.entries
+            .iter()
+            .filter(|entry| entry.source == "github-star")
+            .any(|entry| entry.title.as_deref() == Some("zed-industries/gpui"))
+    }));
+}
+
+#[gpui::test]
+fn settings_cancel_sign_in_clears_the_login(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for_providers(&mut cx, &view, 10));
+
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Providers, cx);
+        this.logging_in.insert(worktable_ai::chatgpt::ID.to_owned());
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("settings-cancel-login").is_some(),
+        "the Settings sign-in panel offers a cancel control"
+    );
+    click_selector(&mut cx, "settings-cancel-login");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                !v.logging_in.contains(worktable_ai::chatgpt::ID)
+                    && v.settings_status.as_deref() == Some("Sign-in cancelled.")
+            })
+        }),
+        "cancelling from Settings clears the login and reports it"
+    );
+    assert!(cx.debug_bounds("settings-cancel-login").is_none());
+}
+
+#[gpui::test]
+fn provider_sign_in_and_cancel_from_the_dialog(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for_providers(&mut cx, &view, 10));
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Providers, cx)
+    });
+    force_frame(&mut cx);
+    let configure_selector: &'static str =
+        Box::leak(format!("configure:{}", worktable_ai::chatgpt::ID).into_boxed_str());
+    click_selector(&mut cx, configure_selector);
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("provider-sign-in").is_some(),
+        "the dialog offers the OAuth sign-in action"
+    );
+
+    // Model the in-flight device login instead of starting a real OAuth
+    // request: the cancel control and its state transition are what this test
+    // proves, and tests must never contact the provider.
+    view.update(&mut cx, |this, cx| {
+        this.logging_in.insert(worktable_ai::chatgpt::ID.to_owned());
+        this.provider_dialog_status = Some("Starting sign-in for chatgpt…".to_owned());
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("provider-cancel-login").is_some(),
+        "an in-progress login renders the dialog cancel control"
+    );
+    click_selector(&mut cx, "provider-cancel-login");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                !v.logging_in.contains(worktable_ai::chatgpt::ID)
+                    && v.provider_dialog_status.as_deref() == Some("Sign-in cancelled.")
+            })
+        }),
+        "cancelling from the dialog clears the login and reports it"
+    );
+}
+
+#[gpui::test]
+fn assistant_setup_cta_opens_provider_settings(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| this.show_assistant(cx));
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+
+    assert!(
+        cx.debug_bounds("assistant-setup-cta").is_some(),
+        "an unconfigured assistant shows the setup action"
+    );
+    click_selector(&mut cx, "assistant-setup-cta");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| (v.mode, v.settings_tab)),
+        (AppMode::Settings, Some(super::SettingsTab::Providers)),
+        "the setup action lands on the Providers page"
+    );
+}
+
+#[gpui::test]
+fn chat_save_retry_clears_the_error(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.chat_id = Some("retry-chat".to_owned());
+        this.messages = vec![
+            crate::assistant::ChatMessage::user("Save this chat"),
+            crate::assistant::ChatMessage::assistant("Saved answer"),
+        ];
+        this.chat_save_error = Some("Couldn't save this chat. Try again.".into());
+        cx.notify();
+    });
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("retry-chat-save").is_some());
+
+    click_selector(&mut cx, "retry-chat-save");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.chat_save_error.is_none() && !v.chat_save_pending
+            })
+        }),
+        "Retry clears the error after a successful save"
+    );
+}
+
+#[gpui::test]
+fn long_thinking_body_is_capped(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.show_thinking = true;
+        let mut message = crate::assistant::ChatMessage::assistant("A short answer");
+        message.thinking = "reasoning "
+            .repeat(crate::assistant::THINKING_SCROLL_THRESHOLD / "reasoning ".len() + 10);
+        this.messages = vec![message];
+        cx.notify();
+    });
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+
+    let body = cx
+        .debug_bounds("thinking-body-0")
+        .expect("long reasoning renders its capped body");
+    let max = cx.update(|window, _| design::to_pixels(design::THINKING_MAX_HEIGHT, window));
+    assert!(
+        body.size.height <= max + px(1.),
+        "the thinking body must stay capped: {} > {max}",
+        body.size.height
+    );
+    assert!(body.size.height > px(0.));
+}
+
+#[gpui::test]
+fn cancelled_run_shows_the_aborted_message(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.assistant_busy = true;
+        this.chat_id = Some("cancelled-chat".to_owned());
+        let mut answer = crate::assistant::ChatMessage::assistant("Partial answer");
+        answer.streaming = true;
+        this.messages = vec![crate::assistant::ChatMessage::user("Answer this"), answer];
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFailed {
+                request_id: "req".to_owned(),
+                session_id: "cancelled-chat".to_owned(),
+                run_id: "run".to_owned(),
+                error: worktable_ai::ABORTED_BY_USER.to_owned(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let (busy, last) = cx.read_entity(&view, |v, _| (v.assistant_busy, v.messages.last().cloned()));
+    assert!(!busy, "a cancelled run clears the busy state");
+    let last = last.expect("the transcript ends with a message");
+    assert!(
+        last.text.contains(worktable_ai::ABORTED_BY_USER),
+        "the cancelled run reports why it stopped, got: {}",
+        last.text
+    );
+}
+
+#[gpui::test]
+fn knowledge_status_line_shows_the_build_result(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let entries = vec![WorktableEntry {
+        id: "knowledge-status-entry".into(),
+        content: "Knowledge status coverage".into(),
+        title: None,
+        source: "Worktable".into(),
+        created_at: 100,
+    }];
+    let (view, window) = setup_view(cx, entries);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| this.show_assistant(cx));
+    settle_strip(&mut cx);
+
+    view.update(&mut cx, |this, cx| this.build_knowledge(cx));
+    assert!(
+        wait_for(&mut cx, 15, |cx| {
+            cx.read_entity(&view, |v, _| {
+                !v.knowledge_building && v.knowledge_status.is_some()
+            })
+        }),
+        "the build finishes with a status"
+    );
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("knowledge-status").is_some(),
+        "a finished build shows its result beside the composer"
+    );
+
+    view.update(&mut cx, |this, cx| {
+        this.knowledge_building = true;
+        this.knowledge_status = Some("Building knowledge…".to_owned());
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("knowledge-status").is_none(),
+        "the status line yields to the G2 orb while a build runs"
+    );
+    assert!(cx.debug_bounds("knowledge-building").is_some());
+}
+
+#[gpui::test]
+fn refresh_models_shows_loading_and_failure_copy(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window, gate) = setup_view_with_gated_models(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for_providers(&mut cx, &view, 10));
+    view.update(&mut cx, |this, cx| {
+        this.show_settings_at(super::SettingsTab::Providers, cx)
+    });
+    force_frame(&mut cx);
+
+    // Configure an API-key provider so model discovery runs against the
+    // failing loader.
+    click_selector(&mut cx, "configure:openai");
+    force_frame(&mut cx);
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            let input = this.api_key_input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("test-key-models-fail", window, cx)
+            });
+        });
+    });
+    cx.run_until_parked();
+    click_selector(&mut cx, "save-provider-key");
+    assert!(wait_for(&mut cx, 5, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.providers
+                .iter()
+                .any(|provider| provider.id == "openai" && provider.api_key_set)
+        })
+    }));
+
+    // The gate holds the loader open, so the loading copy is deterministic.
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("providers-loading").is_some(),
+        "saving a key shows that models are loading"
+    );
+    gate.notify_one();
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.providers.iter().any(|provider| {
+                    provider.id == "openai"
+                        && provider
+                            .models_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Test models are unavailable"))
+                })
+            })
+        }),
+        "the loader failure lands in the provider state"
+    );
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("model-error-0").is_some(),
+        "the failure copy renders beside the model picker"
+    );
+    click_selector(&mut cx, "provider-dialog-close");
+    force_frame(&mut cx);
+
+    // Refresh models drives the same loading/failure cycle from the button.
+    click_selector(&mut cx, "refresh-models");
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.providers
+                    .iter()
+                    .any(|provider| provider.id == "openai" && provider.models_loading)
+            })
+        }),
+        "Refresh models starts a new discovery pass"
+    );
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("providers-loading").is_some(),
+        "Refresh models shows the loading state"
+    );
+    gate.notify_one();
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.providers.iter().any(|provider| {
+                    provider.id == "openai"
+                        && provider
+                            .models_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Test models are unavailable"))
+                })
+            })
+        }),
+        "the refresh failure copy comes back"
+    );
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("model-error-0").is_some());
+}
+
+#[gpui::test]
+fn onboarding_check_again_skip_each_step_and_persist(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+
+    // First view: Accessibility step, check again, then skip.
+    let db = seeded_db_with_config(sample_entries(), false);
+    let (view, window) = setup_view_with_db(cx, db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| v.onboarding.is_some())
+        }),
+        "a fresh database opens the tour"
+    );
+
+    // List commands stay inert while the tour is open: no selection, no delete.
+    let before = cx.read_entity(&view, |v, _| v.entries.len());
+    focus_view(&mut cx, &view);
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("backspace");
+    assert!(
+        cx.read_entity(&view, |v, _| v.selected.is_empty()),
+        "arrow navigation stays inert behind the tour"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entries.len()),
+        before,
+        "Backspace must not delete an entry behind the tour"
+    );
+
+    click_selector(&mut cx, "onboarding-next");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Accessibility)
+    );
+    click_selector(&mut cx, "onboarding-check-accessibility");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.onboarding.as_ref().map(|state| state.step)),
+        Some(super::OnboardingStep::Accessibility),
+        "Check again re-reads the permission without advancing"
+    );
+    click_selector(&mut cx, "onboarding-skip");
+    assert!(cx.read_entity(&view, |v, _| v.onboarding.is_none()));
+    assert!(
+        wait_for_config(&db, "onboarding_completed", "1"),
+        "skipping Accessibility persists completion"
+    );
+
+    // Second view: Provider step, skip there too.
+    let provider_db = seeded_db_with_config(sample_entries(), false);
+    let (provider_view, provider_window) =
+        setup_view_with_db(&mut cx, provider_db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*provider_window.deref(), &cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &provider_view);
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&provider_view, |v, _| v.onboarding.is_some())
+        }),
+        "the second fresh database opens the tour"
+    );
+    click_selector(&mut cx, "onboarding-next");
+    click_selector(&mut cx, "onboarding-next");
+    assert_eq!(
+        cx.read_entity(&provider_view, |v, _| {
+            v.onboarding.as_ref().map(|state| state.step)
+        }),
+        Some(super::OnboardingStep::Provider)
+    );
+    click_selector(&mut cx, "onboarding-skip");
+    assert!(cx.read_entity(&provider_view, |v, _| v.onboarding.is_none()));
+    assert!(
+        wait_for_config(&provider_db, "onboarding_completed", "1"),
+        "skipping Provider persists completion"
+    );
 }

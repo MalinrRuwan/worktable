@@ -94,7 +94,7 @@ mod saved_citations {
 
 /// How long reasoning may get before the block switches to a fixed-height
 /// scroll area. Short thoughts render fully; long ones never blow up layout.
-const THINKING_SCROLL_THRESHOLD: usize = 1_200;
+pub(crate) const THINKING_SCROLL_THRESHOLD: usize = 1_200;
 
 /// Callback for the thinking header toggle (the caller owns the index).
 pub type ThinkingToggle = Rc<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App)>;

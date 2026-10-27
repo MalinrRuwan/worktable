@@ -49,18 +49,26 @@ struct RepoResponse {
     html_url: String,
 }
 
+/// Production GitHub API root. Tests and the visual harness inject a local
+/// mock root through [`fetch_github_stars_with_base`].
+pub const DEFAULT_API_BASE: &str = "https://api.github.com";
+
 /// Fetch the repositories `username` **starred** and return their total stars
 /// plus a per-repo breakdown.
 ///
-/// - Uses `https://api.github.com/users/{username}/starred?per_page=100&page=N`
+/// - Uses `{api_base}/users/{username}/starred?per_page=100&page=N`
 ///   with `application/vnd.github.star+json` so `starred_at` comes along.
 /// - Handles pagination via `Link` header (`rel="next"`) and via `len < 100` heuristic.
 /// - Sends `User-Agent: Worktable/0.1.0` (required by GitHub API).
 /// - If `token` is `Some`, sends `Authorization: Bearer <token>` (raises anon limit 60/h → 5000/h).
 /// - Returns `(total_stars, starred_repos_sorted_by_stars_desc)`.
-pub async fn fetch_github_stars(
+///
+/// The API root is injectable so the dialog and service can be driven against
+/// a local mock server. Production passes [`DEFAULT_API_BASE`].
+pub async fn fetch_github_stars_with_base(
     username: &str,
     token: Option<String>,
+    api_base: &str,
 ) -> anyhow::Result<(u64, Vec<GithubRepo>)> {
     let username = username.trim();
     if username.is_empty() {
@@ -81,8 +89,10 @@ pub async fn fetch_github_stars(
 
     loop {
         let url = format!(
-            "https://api.github.com/users/{}/starred?per_page=100&page={}",
-            username, page
+            "{}/users/{}/starred?per_page=100&page={}",
+            api_base.trim_end_matches('/'),
+            username,
+            page
         );
 
         let mut req = client
