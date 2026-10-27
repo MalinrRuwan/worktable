@@ -418,25 +418,27 @@ fn run_visual_tests() -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(300));
     cx.run_until_parked();
 
-    println!("— step 2: menu button opens the library menu —");
+    println!("— step 2: library menu with the Accessibility warning row —");
+    // The runner is not an app bundle, so its real grant is not a reliable
+    // fixture. Force the off state for the menu capture, then return to the
+    // live value once the menu has navigated.
+    cx.update(|_cx| {
+        worktable_view::set_accessibility_trust_override(Some(false));
+    });
     cx.simulate_click(
         handle,
         point(px(MENU_BUTTON_CENTER.0), px(MENU_BUTTON_CENTER.1)),
         Modifiers::default(),
     );
     cx.run_until_parked();
-    capture(&mut cx, handle, "worktable_menu_open")?;
+    capture(&mut cx, handle, "worktable_menu_accessibility")?;
 
-    println!("— step 3: Settings navigates (menu: Down, Enter) —");
-    // The library menu prepends the Accessibility warning while this process
-    // lacks the real grant (the runner is not an app bundle, so that is the
-    // normal case); skip it to land on Settings.
-    if !status_item::accessibility_trusted() {
-        cx.simulate_keystrokes(handle, "down");
-    }
-    cx.simulate_keystrokes(handle, "down");
-    cx.simulate_keystrokes(handle, "enter");
+    println!("— step 3: Settings navigates (warning then Settings: Down, Down, Enter) —");
+    cx.simulate_keystrokes(handle, "down down enter");
     cx.run_until_parked();
+    cx.update(|_cx| {
+        worktable_view::set_accessibility_trust_override(None);
+    });
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
     capture(&mut cx, handle, "worktable_settings")?;
 

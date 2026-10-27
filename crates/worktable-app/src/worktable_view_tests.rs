@@ -420,11 +420,26 @@ fn library_menu_dismisses_with_escape(cx: &mut TestAppContext) {
 /// On an untrusted host it is the first menu item and opens the dialog; on a
 /// trusted host (and hosts where the grant cannot be observed) the dialog is
 /// covered through the forced-trust test below.
+/// Forces the view's Accessibility reads for one test and restores the live
+/// value even when an assertion panics. Threads can run several tests.
+struct AccessibilityTrustGuard;
+
+impl AccessibilityTrustGuard {
+    fn set(trusted: bool) -> Self {
+        super::set_accessibility_trust_override(Some(trusted));
+        Self
+    }
+}
+
+impl Drop for AccessibilityTrustGuard {
+    fn drop(&mut self) {
+        super::set_accessibility_trust_override(None);
+    }
+}
+
 #[gpui::test]
 fn library_menu_accessibility_warning_opens_the_dialog(cx: &mut TestAppContext) {
-    if super::accessibility_trusted() {
-        return;
-    }
+    let _trust = AccessibilityTrustGuard::set(false);
     cx.update(gpui_component::init);
     let (view, window) = setup_view(cx, sample_entries());
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);

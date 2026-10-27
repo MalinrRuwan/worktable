@@ -253,6 +253,10 @@ fn app_icon(name: IconName) -> Icon {
 /// macOS Accessibility trust, stubbed off-platform so the view compiles
 /// everywhere.
 fn accessibility_trusted() -> bool {
+    #[cfg(any(test, feature = "visual-tests"))]
+    if let Some(forced) = ACCESSIBILITY_TRUST_OVERRIDE.with(|value| value.get()) {
+        return forced;
+    }
     #[cfg(target_os = "macos")]
     {
         crate::status_item::accessibility_trusted()
@@ -261,6 +265,22 @@ fn accessibility_trusted() -> bool {
     {
         false
     }
+}
+
+#[cfg(any(test, feature = "visual-tests"))]
+thread_local! {
+    /// Tests and the visual runner cannot change the host's TCC grant. This
+    /// thread-local lets the menu warning path be driven with both values.
+    static ACCESSIBILITY_TRUST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the view's Accessibility reads for a test or visual capture. Pass
+/// `None` to return to the real system grant.
+#[cfg(any(test, feature = "visual-tests"))]
+#[allow(dead_code)] // used by the visual-test binary, not the main bin
+pub(crate) fn set_accessibility_trust_override(forced: Option<bool>) {
+    ACCESSIBILITY_TRUST_OVERRIDE.with(|value| value.set(forced));
 }
 
 /// Open the Accessibility pane in System Settings, stubbed off-platform.
@@ -1846,8 +1866,7 @@ impl WorktableView {
         forced_trust: Option<bool>,
     ) {
         let main = cx.entity();
-        let dialog_view =
-            cx.new(|cx| AccessibilityDialogView::new(main.downgrade(), forced_trust, cx));
+        let dialog_view = cx.new(|cx| AccessibilityDialogView::new(main, forced_trust, cx));
         let width = dialog_width(window, design::PROVIDER_DIALOG_WIDTH);
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -8629,16 +8648,13 @@ struct AccessibilityDialogView {
 
 impl AccessibilityDialogView {
     fn new(
-        main: WeakEntity<WorktableView>,
+        main: Entity<WorktableView>,
         forced_trust: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let main_entity = main
-            .upgrade()
-            .expect("the main view exists while its dialog opens");
-        let subscription = cx.observe(&main_entity, |_, _, cx| cx.notify());
+        let subscription = cx.observe(&main, |_, _, cx| cx.notify());
         Self {
-            main,
+            main: main.downgrade(),
             forced_trust,
             _subscription: subscription,
         }
