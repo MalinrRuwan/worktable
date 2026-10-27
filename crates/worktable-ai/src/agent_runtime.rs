@@ -551,21 +551,22 @@ impl AgentRuntime {
                 }
                 // Keep the selected id only if the authenticated API still
                 // offers it. Otherwise default within this provider, not from
-                // a second static catalog.
+                // a second static catalog. Paid Chat Completions wins so an
+                // old free auto-selection never survives an upgrade.
+                let active_model = store.get_config("active_model").ok().flatten();
+                let selected = active_model.as_deref();
                 if store
                     .get_config("active_provider")
                     .ok()
                     .flatten()
                     .as_deref()
                     == Some(task_id.as_str())
-                    && !state.models.iter().any(|model| {
-                        store.get_config("active_model").ok().flatten().as_deref()
-                            == Some(model.id.as_str())
-                    })
-                {
-                    let model = state
+                    && !state
                         .models
-                        .first()
+                        .iter()
+                        .any(|model| selected == Some(model.id.as_str()))
+                {
+                    let model = crate::model_catalog::default_model(&state.models)
                         .map(|model| model.id.as_str())
                         .unwrap_or("");
                     let _ = store.set_config("active_model", model);
@@ -1290,7 +1291,8 @@ mod tests {
                                     id: format!("server-model-{section}-{row}"),
                                     name: format!("Server model {section}-{row}"),
                                     group: group.clone(),
-                                    api: None,
+                                    api: Some("chat".to_owned()),
+                                    free: false,
                                 })
                             })
                             .collect(),
@@ -1576,7 +1578,8 @@ mod tests {
                     id: "server-model-0-0".to_owned(),
                     name: "Server model 0-0".to_owned(),
                     group: Some(opencode::Service::Go.name().to_owned()),
-                    api: None,
+                    api: Some("chat".to_owned()),
+                    free: false,
                 }],
                 warning: None,
             }))
@@ -1764,6 +1767,7 @@ mod tests {
                     name: "Server model".to_owned(),
                     group: Some(service.name().to_owned()),
                     api: Some(api.to_owned()),
+                    free: false,
                 };
                 let route = opencode::route(&model, services).unwrap();
                 assert_eq!(route.service, service);
@@ -1844,6 +1848,7 @@ mod tests {
                     name: "Legacy server model".to_owned(),
                     group: Some(opencode::Service::Go.name().to_owned()),
                     api: Some("chat".to_owned()),
+                    free: false,
                 }],
                 ..Default::default()
             },

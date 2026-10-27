@@ -192,6 +192,7 @@ mod tests {
                     name: "Claude Sonnet 4.5".to_owned(),
                     group: None,
                     api: None,
+                    free: false,
                 }],
                 models_loading: false,
                 models_error: None,
