@@ -25,12 +25,46 @@ const BLINK_PERIOD_MS: u128 = 1_000;
 
 /// Per-element reveal progress, kept in GPUI element state so nothing is
 /// allocated per frame and the text never restarts while it grows.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Reveal {
     /// Shared-clock time the current text started revealing.
     started: Duration,
     /// Bytes revealed so far (always kept on a char boundary).
     shown: usize,
+}
+
+impl Reveal {
+    /// Start the reveal at the current shared-clock time. This is what makes
+    /// the first frame show zero characters instead of every character the
+    /// clock has accumulated since `Duration::ZERO` (the process start).
+    fn start(now: Duration) -> Self {
+        Self {
+            started: now,
+            shown: 0,
+        }
+    }
+
+    /// Advance the reveal for this frame. Pure, so the first-frame contract is
+    /// unit-testable without a window.
+    fn advance(self, now: Duration, streaming: bool, rate: f32, text_len: usize) -> Self {
+        let mut state = self;
+        // A shorter text is a replaced message, not a shrinking one: restart
+        // the reveal from the beginning.
+        if text_len < state.shown {
+            state.started = now;
+            state.shown = 0;
+        }
+        state.shown = if streaming {
+            StreamingText::revealed_bytes(
+                now.saturating_sub(state.started).as_secs_f32(),
+                rate,
+                text_len,
+            )
+        } else {
+            text_len
+        };
+        state
+    }
 }
 
 /// Typewriter text with a caret.
@@ -148,22 +182,13 @@ impl RenderOnce for StreamingText {
         let id = self.id.clone();
         let shown = window.with_global_id(id, |global_id, window| {
             window.with_element_state(global_id, |state: Option<Reveal>, _window| {
-                let mut state = state.unwrap_or_default();
-                // A shorter text is a replaced message, not a shrinking one:
-                // restart the reveal from the beginning.
-                if text.len() < state.shown {
-                    state.started = now;
-                    state.shown = 0;
-                }
-                state.shown = if streaming {
-                    Self::revealed_bytes(
-                        now.saturating_sub(state.started).as_secs_f32(),
-                        rate,
-                        text.len(),
-                    )
-                } else {
-                    text.len()
-                };
+                // First render starts at the current clock, never at zero.
+                let state = state.unwrap_or_else(|| Reveal::start(now)).advance(
+                    now,
+                    streaming,
+                    rate,
+                    text.len(),
+                );
                 (state.shown, state)
             })
         });
@@ -204,6 +229,22 @@ mod tests {
         assert_eq!(StreamingText::revealed_bytes(0.0, 222.0, 100), 0);
         assert_eq!(StreamingText::revealed_bytes(0.045, 222.0, 100), 9);
         assert_eq!(StreamingText::revealed_bytes(1.0, 222.0, 100), 100);
+    }
+
+    #[test]
+    fn stale_clock_does_not_reveal_on_the_first_frame() {
+        // The shared clock can already be minutes old when an element mounts.
+        // Starting at zero would reveal a whole chunk on the first frame.
+        let stale = Duration::from_secs(300);
+        let state = Reveal::start(stale).advance(stale, true, 222.0, 1_000);
+        assert_eq!(
+            state.shown, 0,
+            "the first frame starts at the first character"
+        );
+
+        // A later frame advances only by its own elapsed time.
+        let state = state.advance(stale + Duration::from_millis(50), true, 100.0, 1_000);
+        assert_eq!(state.shown, 5, "50ms at 100 chars/s reveals 5 characters");
     }
 
     #[test]

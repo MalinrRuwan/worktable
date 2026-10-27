@@ -92,6 +92,20 @@ impl WorktableRuntime {
         self.store.list_entries(limit)
     }
 
+    pub async fn list_entry_labels(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, worktable_db::EntryLabelColor>> {
+        self.store.list_entry_labels()
+    }
+
+    pub async fn set_entry_label(
+        &self,
+        entry_id: &str,
+        color: Option<worktable_db::EntryLabelColor>,
+    ) -> anyhow::Result<()> {
+        self.store.set_entry_label(entry_id, color)
+    }
+
     pub async fn insert_entry(&self, entry: &worktable_db::Entry) -> anyhow::Result<()> {
         self.store.insert_entry(entry)?;
 

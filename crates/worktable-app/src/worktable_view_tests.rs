@@ -22,6 +22,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use worktable_ai::WorktableEntry;
+use worktable_db::EntryLabelColor;
 
 use super::{AppMode, SortMode, WorktableView};
 use crate::design;
@@ -288,6 +289,38 @@ fn wait_for_config(db: &str, key: &str, value: &str) -> bool {
     }
 }
 
+/// Poll the database until it reports `expected` for `entry_id`. Label writes
+/// run through the service's Tokio worker, so assertions poll instead of
+/// assuming the write landed in the same tick.
+fn wait_for_entry_label(
+    cx: &mut VisualTestContext,
+    db: &str,
+    entry_id: &str,
+    expected: Option<EntryLabelColor>,
+) -> bool {
+    let store = match worktable_db::SqliteStore::connect(db) {
+        Ok(store) => store,
+        Err(_) => return false,
+    };
+    let _ = store.migrate();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // The write is driven by a GPUI-spawned future; pump it between polls.
+        cx.run_until_parked();
+        if store
+            .list_entry_labels()
+            .map(|labels| labels.get(entry_id).copied() == expected)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Render a frame, then flush all work so hit targets and async loads settle.
 fn settle(cx: &mut VisualTestContext) {
     cx.update(|window, _| window.refresh());
@@ -375,6 +408,116 @@ fn library_menu_dismisses_with_escape(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
+}
+
+/// The library menu is the keyboard path to labels: choosing a color toggles
+/// it on the selected entry, and choosing the active color again clears it.
+#[gpui::test]
+fn library_menu_labels_selected_entry_through_the_keyboard(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.select_at("test-1000".to_owned(), false);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Settings, three sort rows, then the first label row.
+    click_selector(&mut cx, "library-menu");
+    for _ in 0..5 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        Some(EntryLabelColor::Red),
+        "the first label row colors the selected entry"
+    );
+
+    click_selector(&mut cx, "library-menu");
+    for _ in 0..5 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        None,
+        "choosing the active color again clears the label"
+    );
+}
+
+/// Labels persist through the real service and database: toggle, clear, and
+/// delete cleanup all update both the map and a fresh store connection.
+#[gpui::test]
+fn entry_labels_persist_and_clear_with_the_entry(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    let db = cx.read_entity(&view, |v, _| v.service.database_path());
+
+    view.update(&mut cx, |this, cx| {
+        this.toggle_entry_label("test-1000", EntryLabelColor::Amber, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        Some(EntryLabelColor::Amber),
+        "the map updates optimistically"
+    );
+    assert!(
+        wait_for_entry_label(&mut cx, &db, "test-1000", Some(EntryLabelColor::Amber)),
+        "a fresh store sees the persisted label"
+    );
+
+    view.update(&mut cx, |this, cx| {
+        this.toggle_entry_label("test-1000", EntryLabelColor::Amber, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        None
+    );
+    assert!(
+        wait_for_entry_label(&mut cx, &db, "test-1000", None),
+        "choosing the active color clears the stored label"
+    );
+
+    view.update(&mut cx, |this, cx| {
+        this.set_entry_label("test-1000", Some(EntryLabelColor::Green), cx);
+    });
+    assert!(wait_for_entry_label(
+        &mut cx,
+        &db,
+        "test-1000",
+        Some(EntryLabelColor::Green)
+    ));
+
+    view.update(&mut cx, |this, cx| {
+        this.select_at("test-1000".to_owned(), false);
+        this.delete_selected(cx);
+    });
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        None,
+        "deleting removes the label from the view map"
+    );
+    assert!(
+        wait_for_entry_label(&mut cx, &db, "test-1000", None),
+        "the deleted entry no longer exposes a label"
+    );
+    assert!(
+        wait_for(&mut cx, 5, |cx| cx.read_entity(&view, |v, _| v
+            .entries
+            .iter()
+            .all(|entry| entry.id != "test-1000"))),
+        "the entry itself is deleted"
+    );
 }
 
 #[gpui::test]
@@ -3604,6 +3747,190 @@ fn run_finish_collapses_thoughts(cx: &mut TestAppContext) {
     assert!(
         cx.read_entity(&view, |v, _| v.messages[0].thinking_collapsed),
         "the run finishing collapses the thoughts"
+    );
+}
+
+/// A conversation long enough to scroll; the last answer is still streaming.
+fn scrolling_transcript() -> Vec<crate::assistant::ChatMessage> {
+    let mut messages = Vec::new();
+    for index in 0..10 {
+        messages.push(crate::assistant::ChatMessage::user(format!(
+            "Prompt {index}: summarize the notes I saved about the project"
+        )));
+        messages.push(crate::assistant::ChatMessage::assistant(
+            "A long answer that wraps across several lines so the transcript \
+             overflows its viewport and can be scrolled."
+                .repeat(4),
+        ));
+    }
+    messages.push(crate::assistant::ChatMessage {
+        role: crate::assistant::Role::Assistant,
+        text: "Streaming answer".to_owned(),
+        thinking: "The user wants the current state.".to_owned(),
+        streaming: true,
+        citations: Vec::new(),
+        thinking_collapsed: false,
+    });
+    messages
+}
+
+/// Scrolling up releases follow: a new delta must not snap the reader back to
+/// the tail.
+#[gpui::test]
+fn delta_keeps_a_scrolled_up_transcript_in_place(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.messages = scrolling_transcript();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+
+    let max = view.update(&mut cx, |this, _| {
+        assert!(
+            this.assistant_scroll.max_offset().y > px(0.),
+            "the test transcript must overflow its viewport"
+        );
+        this.assistant_scroll.set_offset(point(px(0.), px(0.)));
+        this.assistant_scroll.max_offset().y
+    });
+    assert!(max > px(0.));
+
+    view.update(&mut cx, |this, cx| {
+        this.on_event(
+            &worktable_events::WorktableEvent::AiMessageDelta {
+                request_id: "req".to_owned(),
+                session_id: "wt-session".to_owned(),
+                delta: " more".to_owned(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+
+    let (offset, text) = view.update(&mut cx, |this, _| {
+        (
+            this.assistant_scroll.offset().y,
+            this.messages.last().map(|message| message.text.clone()),
+        )
+    });
+    assert_eq!(
+        offset,
+        px(0.),
+        "the scrolled-up transcript keeps its position"
+    );
+    assert_eq!(text.as_deref(), Some("Streaming answer more"));
+}
+
+/// A brand-new turn always reveals its user message, even from a scrolled-up
+/// previous answer.
+#[gpui::test]
+fn submitting_a_prompt_scrolls_the_new_turn_into_view(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let before = view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.messages = scrolling_transcript();
+        cx.notify();
+        this.messages.len()
+    });
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    view.update(&mut cx, |this, _| {
+        this.assistant_scroll.set_offset(point(px(0.), px(0.)));
+    });
+
+    view.update(&mut cx, |this, cx| {
+        this.submit_assistant_prompt("A new question".to_owned(), cx);
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+
+    let (offset, max, last) = view.update(&mut cx, |this, _| {
+        (
+            this.assistant_scroll.offset().y,
+            this.assistant_scroll.max_offset().y,
+            this.messages
+                .get(before)
+                .map(|message| message.text.clone()),
+        )
+    });
+    assert_eq!(
+        last.as_deref(),
+        Some("A new question"),
+        "the user message is appended before the new turn"
+    );
+    assert!(max > px(0.), "the transcript still overflows");
+    assert_eq!(
+        offset, -max,
+        "submitting scrolls the transcript to the new turn"
+    );
+}
+
+/// Finishing a run folds reasoning only for a reader at the tail; a reader who
+/// scrolled up keeps the visible answer exactly where it was.
+#[gpui::test]
+fn finish_does_not_move_a_scrolled_up_answer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.show_thinking = true;
+        this.messages = scrolling_transcript();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle_strip(&mut cx);
+    force_frame(&mut cx);
+    view.update(&mut cx, |this, _| {
+        assert!(this.assistant_scroll.max_offset().y > px(0.));
+        this.assistant_scroll.set_offset(point(px(0.), px(0.)));
+    });
+
+    view.update(&mut cx, |this, cx| {
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFinished {
+                request_id: "req".to_owned(),
+                session_id: "wt-session".to_owned(),
+                run_id: "run".to_owned(),
+                state: "completed".to_owned(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    force_frame(&mut cx);
+
+    let (offset, streaming, collapsed) = view.update(&mut cx, |this, _| {
+        let last = this.messages.last().expect("the transcript has an answer");
+        (
+            this.assistant_scroll.offset().y,
+            last.streaming,
+            last.thinking_collapsed,
+        )
+    });
+    assert_eq!(offset, px(0.), "the scrolled-up answer does not jump");
+    assert!(!streaming, "the run still ends its streaming state");
+    assert!(
+        !collapsed,
+        "reasoning stays expanded while the reader is away from the tail"
     );
 }
 

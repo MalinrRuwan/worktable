@@ -28,12 +28,13 @@ use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::switch::Switch;
 use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Selectable, Side, Sizable,
     VirtualListScrollHandle, WindowExt as _, h_flex, v_flex, v_virtual_list,
 };
 
 use crate::design;
 use worktable_ai::WorktableEntry;
+use worktable_db::EntryLabelColor;
 use worktable_events::{
     AuthNotifyKind, AuthPromptKind, KnowledgeCitation, ProviderInfo, ProvidersSnapshot,
     WorktableEvent,
@@ -312,6 +313,10 @@ pub struct WorktableView {
 
     // Entries — multi-select (Shift+click, Shift+Right drag)
     pub(crate) entries: Vec<WorktableEntry>,
+    /// Presentation metadata: the color stroke painted on an entry's card.
+    /// Labels are never part of the entry's content.
+    pub(crate) entry_labels: HashMap<String, EntryLabelColor>,
+    entry_label_status: Option<String>,
     pub(crate) selected: HashSet<String>,
     selected_anchor: Option<String>,
     pub(crate) search_input: Entity<InputState>,
@@ -485,6 +490,8 @@ impl WorktableView {
             focus_handle,
             mode: AppMode::Entries,
             entries: Vec::new(),
+            entry_labels: HashMap::new(),
+            entry_label_status: None,
             selected: HashSet::new(),
             selected_anchor: None,
             search_input,
@@ -565,6 +572,7 @@ impl WorktableView {
         view.focus_handle.focus(window, cx);
         view.subscribe(window, cx);
         view.load_entries(cx);
+        view.load_entry_labels(cx);
         view.refresh_providers(cx);
         view.load_github_username(cx);
         view.load_preferences(window, cx);
@@ -732,6 +740,24 @@ impl WorktableView {
                 cx.notify();
             });
         })
+        .detach();
+    }
+
+    /// Load the stored card labels once at startup. Labels are presentation
+    /// metadata, so a failure leaves the library usable (unlabeled cards).
+    fn load_entry_labels(&mut self, cx: &mut Context<Self>) {
+        let service = Arc::clone(&self.service);
+        cx.spawn(
+            async move |view, cx| match service.list_entry_labels().await {
+                Ok(labels) => {
+                    let _ = view.update(cx, |this, cx| {
+                        this.entry_labels = labels;
+                        cx.notify();
+                    });
+                }
+                Err(error) => eprintln!("Worktable: failed to load entry labels: {error}"),
+            },
+        )
         .detach();
     }
 
@@ -1669,6 +1695,9 @@ impl WorktableView {
         }
         let ids: Vec<String> = self.selected.iter().cloned().collect();
         self.entries.retain(|entry| !ids.contains(&entry.id));
+        for id in &ids {
+            self.entry_labels.remove(id);
+        }
         self.rebuild_topic_cache();
         self.selected.clear();
         self.selected_anchor = None;
@@ -1678,6 +1707,63 @@ impl WorktableView {
         cx.spawn(async move |_view, _cx| {
             for id in ids {
                 let _ = service.delete_entry(&id).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Choosing the active color again clears the label; any other color
+    /// replaces it.
+    pub(crate) fn toggle_entry_label(
+        &mut self,
+        id: &str,
+        color: EntryLabelColor,
+        cx: &mut Context<Self>,
+    ) {
+        let next = (self.entry_labels.get(id).copied() != Some(color)).then_some(color);
+        self.set_entry_label(id, next, cx);
+    }
+
+    /// Paint one entry's card stroke. The map updates optimistically so the
+    /// menu closes onto the new color without waiting for the write; a failed
+    /// write reverts only if no newer choice replaced the attempted value.
+    pub(crate) fn set_entry_label(
+        &mut self,
+        id: &str,
+        color: Option<EntryLabelColor>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = id.to_owned();
+        let previous = self.entry_labels.get(&id).copied();
+        match color {
+            Some(color) => {
+                self.entry_labels.insert(id.clone(), color);
+            }
+            None => {
+                self.entry_labels.remove(&id);
+            }
+        }
+        self.entry_label_status = None;
+        cx.notify();
+
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            if let Err(error) = service.set_entry_label(&id, color).await {
+                let _ = view.update(cx, |this, cx| {
+                    if this.entry_labels.get(&id).copied() == color {
+                        match previous {
+                            Some(previous) => {
+                                this.entry_labels.insert(id.clone(), previous);
+                            }
+                            None => {
+                                this.entry_labels.remove(&id);
+                            }
+                        }
+                    }
+                    this.entry_label_status =
+                        Some(format!("Couldn't save the label. Try again. ({error})"));
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -1925,6 +2011,16 @@ impl WorktableView {
         }
     }
 
+    /// Whether the transcript is at its bottom edge. The offset is measured
+    /// from the top and is negative when scrolled down, so the tail is
+    /// `-offset == max_offset`. A tiny epsilon absorbs subpixel layout noise.
+    pub(crate) fn transcript_follows_tail(&self) -> bool {
+        let max = self.assistant_scroll.max_offset().y;
+        let offset = self.assistant_scroll.offset().y;
+        let epsilon = Pixels::from(1.0);
+        max <= epsilon || -offset >= max - epsilon
+    }
+
     pub fn on_event(&mut self, event: &WorktableEvent, cx: &mut Context<Self>) {
         let session_id = match event {
             WorktableEvent::AiRunStarted { session_id, .. }
@@ -1951,7 +2047,9 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiThoughtDelta { delta, .. } => {
-                self.assistant_scroll.scroll_to_bottom();
+                // Follow only while the reader is already at the tail; a
+                // reader who scrolled up keeps their place.
+                let follow = self.transcript_follows_tail();
                 match self.messages.last_mut().filter(|m| m.streaming) {
                     Some(message) => message.thinking.push_str(delta),
                     None => self.messages.push(ChatMessage {
@@ -1963,10 +2061,13 @@ impl WorktableView {
                         thinking_collapsed: false,
                     }),
                 }
+                if follow {
+                    self.assistant_scroll.scroll_to_bottom();
+                }
                 cx.notify();
             }
             WorktableEvent::AiMessageDelta { delta, .. } => {
-                self.assistant_scroll.scroll_to_bottom();
+                let follow = self.transcript_follows_tail();
                 match self.messages.last_mut().filter(|m| m.streaming) {
                     Some(message) => {
                         message.text.push_str(delta);
@@ -1985,6 +2086,9 @@ impl WorktableView {
                         });
                         self.active_tool = None;
                     }
+                }
+                if follow {
+                    self.assistant_scroll.scroll_to_bottom();
                 }
                 cx.notify();
             }
@@ -2021,6 +2125,10 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiRunFinished { .. } => {
+                // A reader at the tail gets the folded reasoning; a reader who
+                // scrolled up keeps the blocks as they are, so the visible
+                // answer does not jump under them.
+                let follow = self.transcript_follows_tail();
                 self.assistant_busy = false;
                 self.active_tool = None;
                 for message in self.messages.iter_mut().rev() {
@@ -2029,10 +2137,12 @@ impl WorktableView {
                         break;
                     }
                 }
-                // The answer is in: fold the reasoning away by default.
-                for message in self.messages.iter_mut() {
-                    if !message.thinking.is_empty() {
-                        message.thinking_collapsed = true;
+                if follow {
+                    // The answer is in: fold the reasoning away by default.
+                    for message in self.messages.iter_mut() {
+                        if !message.thinking.is_empty() {
+                            message.thinking_collapsed = true;
+                        }
                     }
                 }
                 // Defensive: if citations arrived before any answer message
@@ -2054,6 +2164,7 @@ impl WorktableView {
                 cx.notify();
             }
             WorktableEvent::AiRunFailed { error, .. } | WorktableEvent::AiWorkerError { error } => {
+                let follow = self.transcript_follows_tail();
                 self.providers_loading = false;
                 self.settings_status = Some(error.clone());
                 self.assistant_busy = false;
@@ -2065,9 +2176,11 @@ impl WorktableView {
                         break;
                     }
                 }
-                for message in self.messages.iter_mut() {
-                    if !message.thinking.is_empty() {
-                        message.thinking_collapsed = true;
+                if follow {
+                    for message in self.messages.iter_mut() {
+                        if !message.thinking.is_empty() {
+                            message.thinking_collapsed = true;
+                        }
                     }
                 }
                 if !self.messages.iter().any(|m| m.text.contains(error)) {
@@ -2513,6 +2626,9 @@ impl WorktableView {
             .get_or_insert_with(crate::service::new_entry_id)
             .clone();
         self.messages.push(ChatMessage::user(text.clone()));
+        // A new turn always reveals its user message, even if the reader was
+        // scrolled up in the previous answer.
+        self.assistant_scroll.scroll_to_bottom();
         if !self.agent_ready() {
             self.messages.push(ChatMessage::assistant(
                 "The AI assistant isn't configured yet — pick a provider, add an API key, and choose a model in Settings.",
@@ -3672,6 +3788,15 @@ fn render_entry_modal(
         return None;
     }
     let theme = cx.theme().clone();
+    // The label is presentation metadata looked up on every frame, so the
+    // panel follows a color change without snapshotting it into the modal.
+    // Header and footer separators keep the neutral border.
+    let panel_border = this
+        .entry_labels
+        .get(&modal.entry_id)
+        .copied()
+        .map(|label| design::entry_label_color(&theme, label))
+        .unwrap_or(theme.border);
     let viewport = window.viewport_size();
     let pane_w = design::content_column_width(window);
     let edge = design::to_pixels(rems(0.75), window);
@@ -3954,7 +4079,7 @@ fn render_entry_modal(
                     .overflow_hidden()
                     .rounded(theme.radius_tokens().lg)
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(panel_border)
                     .bg(theme.tokens.popover)
                     // The whole panel fades with the tween so the morph reads
                     // as a materialization, not a pop.
@@ -4195,6 +4320,13 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
         this.sort_mode == SortMode::Topic,
     );
     let ascending = this.sort_ascending;
+    // The keyboard path for labels: the selected entry and its active color.
+    // No selection means no label commands; the menu then keeps its usual
+    // Settings/sort/Quit shape.
+    let label_target = (this.mode == AppMode::Entries && this.entry_modal.is_none())
+        .then(|| this.selected_entry())
+        .flatten()
+        .map(|entry| (entry.id.clone(), this.entry_labels.get(&entry.id).copied()));
 
     Button::new("library-menu")
         .icon(app_icon(IconName::Menu))
@@ -4249,6 +4381,37 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
                         view.update(cx, |this, cx| this.set_sort_mode(mode, cx));
                     },
                 ));
+            }
+            if let Some((entry_id, active)) = label_target.clone() {
+                menu = menu.separator();
+                for color in EntryLabelColor::ALL {
+                    let view = view.clone();
+                    let entry_id = entry_id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(color.menu_label())
+                            .checked(active == Some(color))
+                            .on_click(move |_, _, cx| {
+                                let entry_id = entry_id.clone();
+                                view.update(cx, |this, cx| {
+                                    this.toggle_entry_label(&entry_id, color, cx);
+                                });
+                            }),
+                    );
+                }
+                if active.is_some() {
+                    let view = view.clone();
+                    let entry_id = entry_id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("Clear label")
+                            .icon(Icon::new(IconName::Close))
+                            .on_click(move |_, _, cx| {
+                                let entry_id = entry_id.clone();
+                                view.update(cx, |this, cx| {
+                                    this.set_entry_label(&entry_id, None, cx);
+                                });
+                            }),
+                    );
+                }
             }
             menu.separator().item(
                 PopupMenuItem::new("Quit Worktable")
@@ -5214,13 +5377,17 @@ fn render_entries_pane(
                                 let topic = this.primary_topic(entry);
                                 let bounds_map = this.card_bounds.clone();
                                 let entry_id = entry.id.clone();
+                                let label = this.entry_labels.get(&entry.id).copied();
                                 let card = render_entry_card(
                                     entry,
                                     &topic,
                                     &this.selected,
-                                    show_topic,
-                                    *height,
-                                    *body_lines,
+                                    EntryCardOptions {
+                                        show_topic,
+                                        label,
+                                        height: *height,
+                                        max_body_lines: *body_lines,
+                                    },
                                     cx,
                                 );
                                 let card = if inserting
@@ -5369,6 +5536,18 @@ fn render_entries_pane(
             .into_any_element()
     };
 
+    let label_status = this.entry_label_status.clone().map(|status| {
+        div()
+            .id("entry-label-status")
+            .debug_selector(|| "entry-label-status".into())
+            .role(Role::Alert)
+            .px_4()
+            .pb_2()
+            .text_xs()
+            .text_color(theme.danger)
+            .child(status)
+    });
+
     v_flex()
         .id("entries-pane")
         .debug_selector(|| "entries-pane".into())
@@ -5376,6 +5555,7 @@ fn render_entries_pane(
         .min_h_0()
         .size_full()
         .child(body)
+        .when_some(label_status, |pane, status| pane.child(status))
         .child(composer_bar(this, cx).into_any_element())
         .into_any_element()
 }
@@ -5769,6 +5949,14 @@ fn entry_card_metrics(
     (height, body_lines)
 }
 
+/// Presentation inputs for one entry card.
+struct EntryCardOptions {
+    show_topic: bool,
+    label: Option<EntryLabelColor>,
+    height: Pixels,
+    max_body_lines: usize,
+}
+
 /// One entry card: top-aligned, height derived from its content within the
 /// design bounds. Selection circle's tick is centered; the whole card carries
 /// the click/context-menu wiring.
@@ -5776,16 +5964,25 @@ fn render_entry_card(
     entry: &WorktableEntry,
     topic: &str,
     selected: &HashSet<String>,
-    show_topic: bool,
-    height: Pixels,
-    max_body_lines: usize,
+    options: EntryCardOptions,
     cx: &mut Context<WorktableView>,
 ) -> gpui::AnyElement {
+    let EntryCardOptions {
+        show_topic,
+        label,
+        height,
+        max_body_lines,
+    } = options;
     let theme = cx.theme().clone();
     let view = cx.entity();
     let is_selected = selected.contains(&entry.id);
     let topic = topic.to_owned();
     let is_image = content_is_image(&entry.content);
+    // A label changes only the stroke; background, radius, padding, selection
+    // and hover remain the shared card treatment.
+    let border_color = label
+        .map(|label| design::entry_label_color(&theme, label))
+        .unwrap_or(theme.border);
 
     let selection = div()
         .size_5()
@@ -5974,13 +6171,18 @@ fn render_entry_card(
     let entry_id = entry.id.clone();
     // The accessible name is the entry's title when it has one; otherwise a
     // bounded preview, so screen readers announce the object, not the raw row.
-    let card_label = entry.title.clone().unwrap_or_else(|| {
+    let mut card_label = entry.title.clone().unwrap_or_else(|| {
         let mut preview: String = entry.content.chars().take(120).collect();
         if entry.content.chars().count() > 120 {
             preview.push('…');
         }
         preview
     });
+    if let Some(label) = label {
+        // The stroke is not the only signal: the accessible name names the
+        // color, so the label is not communicated by color alone.
+        card_label = format!("{} label. {card_label}", label.name());
+    }
     let card = h_flex()
         .id(format!("entry:{}", entry.id))
         .debug_selector({
@@ -5999,7 +6201,7 @@ fn render_entry_card(
         .rounded(theme.radius_tokens().md)
         .bg(theme.popover)
         .border_1()
-        .border_color(theme.border)
+        .border_color(border_color)
         .on_click(cx.listener({
             let entry_id = entry_id.clone();
             move |this, event: &ClickEvent, window, cx| {
@@ -6089,6 +6291,14 @@ fn render_entry_card(
     let content_for_menu = entry.content.clone();
     let id_del = entry.id.clone();
     let id_view = entry.id.clone();
+    let id_label = entry.id.clone();
+    // Labels are per-entry even when a multi-selection was right-clicked; only
+    // the menu's copy/delete actions carry the selection count.
+    let active_label = label;
+    let label_swatches: Vec<(EntryLabelColor, gpui::Hsla)> = EntryLabelColor::ALL
+        .iter()
+        .map(|color| (*color, design::entry_label_color(&theme, *color)))
+        .collect();
     // A right click on a selected card keeps the selection, so the menu's
     // actions apply to every selected entry.
     let menu_multi = selected.contains(&entry.id) && selected.len() > 1;
@@ -6109,14 +6319,17 @@ fn render_entry_card(
         let is_link_menu = content_is_link(&content_for_menu);
         let id_del2 = id_del.clone();
         let id_view_menu = id_view.clone();
+        let id_label_menu = id_label.clone();
         let view_for_view = view.clone();
         let view_del = view.clone();
         let view_copy_list = view.clone();
         let view_copy_menu = view.clone();
+        let view_clear_label = view.clone();
         let copy_label = copy_label.clone();
         let delete_label = delete_label.clone();
         let menu_multi = menu_multi;
-        menu.item(
+        // Checks sit on the right so the left slot keeps the color circle.
+        let mut menu = menu.check_side(Side::Right).item(
             PopupMenuItem::new("View entry")
                 .icon(Icon::new(IconName::Eye))
                 .on_click(move |_event, _window, cx| {
@@ -6126,44 +6339,79 @@ fn render_entry_card(
                         this.open_entry_modal(&id, origin, cx);
                     });
                 }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(copy_label)
-                .icon(Icon::new(IconName::Copy))
-                .on_click(move |_event, _window, cx| {
-                    if menu_multi {
-                        view_copy_menu.update(cx, |this, cx| this.copy_selected(cx));
-                    } else {
-                        cx.write_to_clipboard(ClipboardItem::new_string(content_copy.clone()));
-                    }
-                }),
-        )
-        .item(
-            PopupMenuItem::new("Copy as list")
-                .icon(Icon::new(IconName::Copy))
-                .on_click(move |_event, _window, cx| {
-                    view_copy_list.update(cx, |this, cx| this.copy_entries_as_list(cx));
-                }),
-        )
-        .when(is_link_menu, |m| {
-            m.item(
-                PopupMenuItem::new("Open link")
-                    .icon(Icon::new(IconName::ExternalLink))
+        );
+        menu = menu.separator();
+        for (color, swatch) in &label_swatches {
+            let view_label = view.clone();
+            let id_label_menu = id_label_menu.clone();
+            let color = *color;
+            let checked = active_label == Some(color);
+            menu = menu.item(
+                PopupMenuItem::new(color.menu_label())
+                    .icon(
+                        Icon::default()
+                            .path(crate::assets::LABEL_CIRCLE_PATH)
+                            .text_color(*swatch),
+                    )
+                    .checked(checked)
                     .on_click(move |_event, _window, cx| {
-                        cx.open_url(&url_open);
+                        let id = id_label_menu.clone();
+                        view_label.update(cx, |this, cx| {
+                            this.toggle_entry_label(&id, color, cx);
+                        });
+                    }),
+            );
+        }
+        if active_label.is_some() {
+            let id = id_label.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Clear label")
+                    .icon(Icon::new(IconName::Close))
+                    .on_click(move |_event, _window, cx| {
+                        let id = id.clone();
+                        view_clear_label.update(cx, |this, cx| {
+                            this.set_entry_label(&id, None, cx);
+                        });
+                    }),
+            );
+        }
+        menu.separator()
+            .item(
+                PopupMenuItem::new(copy_label)
+                    .icon(Icon::new(IconName::Copy))
+                    .on_click(move |_event, _window, cx| {
+                        if menu_multi {
+                            view_copy_menu.update(cx, |this, cx| this.copy_selected(cx));
+                        } else {
+                            cx.write_to_clipboard(ClipboardItem::new_string(content_copy.clone()));
+                        }
                     }),
             )
-        })
-        .separator()
-        .item(
-            PopupMenuItem::new(delete_label)
-                .icon(Icon::new(IconName::Delete))
-                .on_click(move |_event, _window, cx| {
-                    let id = id_del2.clone();
-                    view_del.update(cx, |this, cx| this.delete_context_target(id, cx));
-                }),
-        )
+            .item(
+                PopupMenuItem::new("Copy as list")
+                    .icon(Icon::new(IconName::Copy))
+                    .on_click(move |_event, _window, cx| {
+                        view_copy_list.update(cx, |this, cx| this.copy_entries_as_list(cx));
+                    }),
+            )
+            .when(is_link_menu, |m| {
+                m.item(
+                    PopupMenuItem::new("Open link")
+                        .icon(Icon::new(IconName::ExternalLink))
+                        .on_click(move |_event, _window, cx| {
+                            cx.open_url(&url_open);
+                        }),
+                )
+            })
+            .separator()
+            .item(
+                PopupMenuItem::new(delete_label)
+                    .icon(Icon::new(IconName::Delete))
+                    .on_click(move |_event, _window, cx| {
+                        let id = id_del2.clone();
+                        view_del.update(cx, |this, cx| this.delete_context_target(id, cx));
+                    }),
+            )
     });
 
     card.into_any_element()

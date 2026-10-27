@@ -20,8 +20,9 @@
 //! | `md`      | `theme.radius`      | rows, cards, ordinary controls     |
 //! | `lg`      | `theme.radius_lg`   | menus, popovers, floating surfaces |
 
-use gpui::{App, Pixels, Rems, Window, rems};
+use gpui::{App, Hsla, Pixels, Rems, Window, rems};
 use gpui_component::{Theme, ThemeRegistry};
+use worktable_db::EntryLabelColor;
 
 /// Install the bundled palette before the first frame. Disk watching can
 /// replace it later, but a missing theme directory must not leave blue defaults.
@@ -115,6 +116,18 @@ pub fn to_pixels(value: Rems, window: &Window) -> Pixels {
     value.to_pixels(window.rem_size())
 }
 
+/// The stroke color for an entry label. Labels are presentation metadata, so
+/// they borrow semantic theme roles instead of introducing raw palette colors.
+pub fn entry_label_color(theme: &Theme, label: EntryLabelColor) -> Hsla {
+    match label {
+        EntryLabelColor::Red => theme.danger,
+        EntryLabelColor::Amber => theme.warning,
+        EntryLabelColor::Green => theme.success,
+        EntryLabelColor::Blue => theme.blue,
+        EntryLabelColor::Purple => theme.magenta,
+    }
+}
+
 /// The content column's width for the current window: full width on small
 /// windows, then growing to the comfortable cap and stopping at the roomy cap
 /// so fullscreen windows keep proportional side margins.
@@ -155,6 +168,35 @@ mod tests {
                     !theme.focus_ring,
                     "focus uses a thin edge, not an outside halo"
                 );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn entry_label_colors_are_pairwise_distinct_in_both_modes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            Theme::change(ThemeMode::Light, None, cx);
+            load_theme(cx).expect("bundled theme");
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                Theme::change(mode, None, cx);
+                apply_registered_theme(cx);
+                let theme = Theme::global(cx);
+                let colors: Vec<Hsla> = EntryLabelColor::ALL
+                    .iter()
+                    .map(|label| entry_label_color(theme, *label))
+                    .collect();
+                for (index, color) in colors.iter().enumerate() {
+                    for (other_index, other) in colors.iter().enumerate().skip(index + 1) {
+                        assert_ne!(
+                            color,
+                            other,
+                            "{:?} and {:?} must read differently in {mode:?}",
+                            EntryLabelColor::ALL[index],
+                            EntryLabelColor::ALL[other_index]
+                        );
+                    }
+                }
             }
         });
     }

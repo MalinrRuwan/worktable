@@ -35,7 +35,9 @@ in-app splash and onboarding. `assets.rs` layers the logo over the component ass
 source; `status_item` owns the AppKit images and blinks the menu-bar glyph
 twice when a triple-Shift capture is delivered. The Entries|Agent toggle's
 sparkle is Lucide's `sparkles` SVG (`worktable-sparkles.svg`) served the same
-way, tinted through `text_color` (`currentColor`).
+way, tinted through `text_color` (`currentColor`); `label-circle.svg` is the
+filled dot used as the entry-label color swatch in the context and library
+menus.
 
 The `karpathy-guidelines` agent skill is installed globally. Apply it while
 working here: think before coding, surface assumptions, make surgical changes,
@@ -192,6 +194,17 @@ unselected card collapses the selection to that entry first. Commands are
 tested through `delete_context_target` because in-process menus cannot be
 opened at the pinned GPUI revision.
 
+Entries carry one optional presentation label — Red, Amber, Green, Blue, or
+Purple — stored in `wt_entry_labels` under stable lowercase keys. A label paints
+only the card's 1px stroke (and the detail panel's outer border); background,
+radius, padding, selection, and hover stay the shared treatment, and the card's
+accessible name names the color rather than relying on color alone. Labels are
+presentation metadata, never entry content: the context menu lists the five
+colors after *View entry*, choosing the active color clears it, and the choice
+applies only to the right-clicked entry even when several are selected. With an
+entry selected, the library menu exposes the same five checked color items as
+the keyboard path. Deleting an entry removes its label in the same transaction.
+
 A new entry enters from the top with the list's push-down entrance: the
 existing rows start one card higher (their pre-insert places) and glide down
 over `RESIZE` while the newcomer fades in over `FADE_IN` — both on the shared
@@ -264,9 +277,13 @@ a chat after restart continues its actual model context. Older builds did not
 save chat transcripts, so only conversations made with this feature appear.
 
 The assistant transcript owns an explicit edge scrollbar and follows the
-stream. Reasoning streams into a **collapsible thinking block**: long thoughts
-render in a capped, scrollable body, and the run folds every block back to its
-header when it finishes (the header stays clickable). The thinking cap exists
+stream only while the reader is at the tail. Scrolling up releases follow, so
+later deltas keep the reader's place; submitting a prompt reveals the new turn
+by scrolling to its user message, and finishing a run does not move a reader
+who is scrolled up (reasoning blocks stay as they are instead of folding under
+them). Reasoning streams into a **collapsible thinking block**: long thoughts
+render in a capped, scrollable body, and a run at the tail folds every block
+back to its header when it finishes (the header stays clickable). The thinking cap exists
 for correctness, not only looks — laying out unbounded reasoning on the UI
 thread stalled the worker event channel and made later turns look hung. The
 composer also renders the last knowledge-build result as a muted `Status` line

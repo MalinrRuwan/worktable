@@ -239,6 +239,47 @@ fn run_visual_tests() -> anyhow::Result<()> {
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
     capture(&mut cx, handle, "worktable_entries")?;
 
+    println!("— step 1-label: five-color entry labels —");
+    let labeled = [
+        ("visual-1000", worktable_db::EntryLabelColor::Red),
+        ("visual-900", worktable_db::EntryLabelColor::Amber),
+        ("visual-800", worktable_db::EntryLabelColor::Green),
+    ];
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            for (id, color) in labeled {
+                this.set_entry_label(id, Some(color), cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    capture(&mut cx, handle, "worktable_entry_labels")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            let origin = this.entry_origin("visual-1000");
+            this.open_entry_modal("visual-1000", origin, cx);
+        });
+    });
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_entry_label_modal")?;
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.close_entry_modal(cx);
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            for (id, _) in labeled {
+                this.set_entry_label(id, None, cx);
+            }
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    cx.run_until_parked();
+
     println!("— step 1a: onboarding — welcome, accessibility, provider —");
     cx.update(|cx| {
         view.update(cx, |this, cx| this.start_onboarding(cx));

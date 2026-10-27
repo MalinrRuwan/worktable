@@ -91,6 +91,12 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS wt_entry_labels (
+        entry_id TEXT PRIMARY KEY,
+        color TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Chat storage: the picker's transcripts and the model context behind them.
@@ -169,6 +175,74 @@ pub struct Entry {
     pub title: Option<String>,
     pub source: String,
     pub created_at: i64,
+}
+
+/// Presentation-only label for an entry. Labels never alter the entry's
+/// content; the UI paints the card's stroke with the chosen color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryLabelColor {
+    Red,
+    Amber,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl EntryLabelColor {
+    /// Every label, in the order the menus present them.
+    pub const ALL: [Self; 5] = [
+        Self::Red,
+        Self::Amber,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+    ];
+
+    /// Stable lowercase key stored in the database.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Amber => "amber",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+        }
+    }
+
+    /// Display name used in labels and accessible text.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Amber => "Amber",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+        }
+    }
+
+    /// The menu item label for this color.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::Red => "Red label",
+            Self::Amber => "Amber label",
+            Self::Green => "Green label",
+            Self::Blue => "Blue label",
+            Self::Purple => "Purple label",
+        }
+    }
+
+    /// Read a stored key, ignoring values this build does not know.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "red" => Some(Self::Red),
+            "amber" => Some(Self::Amber),
+            "green" => Some(Self::Green),
+            "blue" => Some(Self::Blue),
+            "purple" => Some(Self::Purple),
+            _ => None,
+        }
+    }
 }
 
 /// A stored AI provider credential (serialized into `wt_ai_provider_credentials`).
@@ -411,10 +485,70 @@ impl SqliteStore {
     }
 
     pub fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
-        let connection = self.connection.lock().expect("sqlite lock poisoned");
-        connection
+        let mut connection = self.connection.lock().expect("sqlite lock poisoned");
+        let transaction = connection
+            .transaction()
+            .context("failed to start entry deletion")?;
+        transaction
+            .execute("DELETE FROM wt_entry_labels WHERE entry_id = ?", [id])
+            .context("failed to delete Worktable entry label")?;
+        transaction
             .execute("DELETE FROM wt_entries WHERE id = ?", [id])
             .context("failed to delete Worktable entry")?;
+        transaction
+            .commit()
+            .context("failed to commit entry deletion")?;
+
+        Ok(())
+    }
+
+    /// Labels for entries that still exist. The join hides orphan rows left by
+    /// an interrupted delete or an older build.
+    pub fn list_entry_labels(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, EntryLabelColor>> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT labels.entry_id, labels.color
+                 FROM wt_entry_labels labels
+                 JOIN wt_entries entries ON entries.id = labels.entry_id",
+            )
+            .context("failed to prepare entry label list")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed to query entry labels")?;
+        let mut labels = std::collections::HashMap::new();
+        for row in rows {
+            let (entry_id, color) = row.context("failed to read entry label row")?;
+            if let Some(color) = EntryLabelColor::from_key(&color) {
+                labels.insert(entry_id, color);
+            }
+        }
+        Ok(labels)
+    }
+
+    /// Set or clear one entry's label.
+    pub fn set_entry_label(
+        &self,
+        entry_id: &str,
+        color: Option<EntryLabelColor>,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("sqlite lock poisoned");
+        match color {
+            Some(color) => connection
+                .execute(
+                    "INSERT INTO wt_entry_labels (entry_id, color) VALUES (?, ?)
+                     ON CONFLICT(entry_id) DO UPDATE SET color = excluded.color",
+                    params![entry_id, color.key()],
+                )
+                .context("failed to save Worktable entry label")?,
+            None => connection
+                .execute("DELETE FROM wt_entry_labels WHERE entry_id = ?", [entry_id])
+                .context("failed to clear Worktable entry label")?,
+        };
 
         Ok(())
     }
@@ -771,6 +905,7 @@ pub struct SqliteStore {
 #[derive(Default)]
 struct WasmInner {
     entries: Vec<Entry>,
+    labels: std::collections::HashMap<String, EntryLabelColor>,
     credentials: std::collections::HashMap<String, ProviderCredential>,
     config: std::collections::HashMap<String, String>,
     chats: std::collections::HashMap<String, StoredChat>,
@@ -892,6 +1027,38 @@ impl SqliteStore {
     pub fn delete_entry(&self, id: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().expect("wasm lock poisoned");
         inner.entries.retain(|e| e.id != id);
+        inner.labels.remove(id);
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
+    pub fn list_entry_labels(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, EntryLabelColor>> {
+        let inner = self.inner.lock().expect("wasm lock poisoned");
+        Ok(inner
+            .labels
+            .iter()
+            .filter(|(entry_id, _)| inner.entries.iter().any(|entry| &entry.id == *entry_id))
+            .map(|(entry_id, color)| (entry_id.clone(), *color))
+            .collect())
+    }
+
+    pub fn set_entry_label(
+        &self,
+        entry_id: &str,
+        color: Option<EntryLabelColor>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        match color {
+            Some(color) => {
+                inner.labels.insert(entry_id.to_owned(), color);
+            }
+            None => {
+                inner.labels.remove(entry_id);
+            }
+        }
         drop(inner);
         self.save_to_storage();
         Ok(())
@@ -1111,6 +1278,12 @@ impl SqliteStore {
                             {
                                 inner.entries = entries;
                             }
+                            if let Some(labels) = saved
+                                .get("labels")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            {
+                                inner.labels = labels;
+                            }
                             if let Some(creds) = saved
                                 .get("credentials")
                                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1150,6 +1323,7 @@ impl SqliteStore {
                     let inner = self.inner.lock().expect("wasm lock poisoned");
                     let payload = serde_json::json!({
                         "entries": inner.entries,
+                        "labels": inner.labels,
                         "credentials": inner.credentials,
                         "config": inner.config,
                         "chats": inner.chats,
@@ -1218,6 +1392,104 @@ mod tests {
 
         let limited = store.list_entries(1).unwrap();
         assert_eq!(limited.len(), 1, "limit is honored");
+    }
+
+    #[test]
+    fn entry_labels_roundtrip_replace_clear_and_delete_cleanup() {
+        let store = store();
+        store.insert_entry(&entry("a", 100)).unwrap();
+        store.insert_entry(&entry("b", 90)).unwrap();
+        assert!(store.list_entry_labels().unwrap().is_empty());
+
+        store
+            .set_entry_label("a", Some(EntryLabelColor::Amber))
+            .unwrap();
+        store
+            .set_entry_label("b", Some(EntryLabelColor::Blue))
+            .unwrap();
+        let labels = store.list_entry_labels().unwrap();
+        assert_eq!(labels.get("a"), Some(&EntryLabelColor::Amber));
+        assert_eq!(labels.get("b"), Some(&EntryLabelColor::Blue));
+
+        // Replacing keeps one row per entry.
+        store
+            .set_entry_label("a", Some(EntryLabelColor::Green))
+            .unwrap();
+        let labels = store.list_entry_labels().unwrap();
+        assert_eq!(labels.get("a"), Some(&EntryLabelColor::Green));
+
+        // Clearing removes the row.
+        store.set_entry_label("b", None).unwrap();
+        let labels = store.list_entry_labels().unwrap();
+        assert!(!labels.contains_key("b"));
+
+        // Orphan rows (no matching entry) never surface.
+        store
+            .set_entry_label("missing", Some(EntryLabelColor::Red))
+            .unwrap();
+        let labels = store.list_entry_labels().unwrap();
+        assert!(!labels.contains_key("missing"));
+
+        // Deleting the entry removes its label row in the same transaction.
+        store.delete_entry("a").unwrap();
+        assert!(!store.list_entry_labels().unwrap().contains_key("a"));
+        let connection = store.connection.lock().unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM wt_entry_labels WHERE entry_id = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "delete_entry must remove the label row");
+    }
+
+    #[test]
+    fn entry_label_keys_are_stable_lowercase_names() {
+        let expected = [
+            (EntryLabelColor::Red, "red", "Red", "Red label"),
+            (EntryLabelColor::Amber, "amber", "Amber", "Amber label"),
+            (EntryLabelColor::Green, "green", "Green", "Green label"),
+            (EntryLabelColor::Blue, "blue", "Blue", "Blue label"),
+            (EntryLabelColor::Purple, "purple", "Purple", "Purple label"),
+        ];
+        assert_eq!(EntryLabelColor::ALL.len(), expected.len());
+        for (color, key, name, menu_label) in expected {
+            assert_eq!(color.key(), key);
+            assert_eq!(color.name(), name);
+            assert_eq!(color.menu_label(), menu_label);
+            assert_eq!(EntryLabelColor::from_key(key), Some(color));
+        }
+        assert_eq!(EntryLabelColor::from_key("crimson"), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn entry_labels_survive_reopening_the_database() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("worktable-labels-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("labels.db").to_string_lossy().into_owned();
+        {
+            let store = SqliteStore::connect(&path).unwrap();
+            store.migrate().unwrap();
+            store.insert_entry(&entry("a", 10)).unwrap();
+            store
+                .set_entry_label("a", Some(EntryLabelColor::Purple))
+                .unwrap();
+        }
+        let reopened = SqliteStore::connect(&path).unwrap();
+        reopened.migrate().unwrap();
+        assert_eq!(
+            reopened.list_entry_labels().unwrap().get("a"),
+            Some(&EntryLabelColor::Purple)
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

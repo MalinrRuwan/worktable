@@ -16,6 +16,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use worktable_ai::{WorktableEntry, WorktableRuntime};
+use worktable_db::EntryLabelColor;
 use worktable_events::WorktableEvent;
 
 /// Config key holding the JSON array of GitHub `full_name`s that have ever
@@ -56,6 +57,8 @@ pub struct WorktableService {
     memory: Arc<tokio::sync::Mutex<Vec<WorktableEntry>>>,
     /// In-memory config fallback when the database is unavailable.
     memory_config: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// In-memory label fallback when the database is unavailable.
+    memory_labels: Arc<tokio::sync::Mutex<HashMap<String, EntryLabelColor>>>,
     memory_chats: tokio::sync::Mutex<HashMap<String, worktable_db::StoredChat>>,
     /// Internal media library: added images are hard-linked here (falling back
     /// to a copy) so entries keep working when the original moves away.
@@ -158,6 +161,9 @@ impl WorktableService {
         let entries = tokio
             .block_on(runtime.list_entries(500))
             .unwrap_or_default();
+        let labels = tokio
+            .block_on(runtime.list_entry_labels())
+            .unwrap_or_default();
         // Start AI worker so the runtime is prompt-ready in tests (best-effort).
         start_ai_worker(&tokio, &runtime);
         let runtime = Some(Arc::new(runtime));
@@ -167,6 +173,7 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(entries)),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            memory_labels: Arc::new(tokio::sync::Mutex::new(labels)),
             memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir,
             github_api_base: github_api_base.trim_end_matches('/').to_owned(),
@@ -193,6 +200,7 @@ impl WorktableService {
             runtime,
             memory: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             memory_config: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            memory_labels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             memory_chats: tokio::sync::Mutex::new(HashMap::new()),
             media_dir: resolve_media_dir(),
             github_api_base: crate::github::DEFAULT_API_BASE.to_owned(),
@@ -367,6 +375,44 @@ impl WorktableService {
         }
         let mut memory = self.memory.lock().await;
         memory.retain(|entry| entry.id != id);
+        drop(memory);
+        self.memory_labels.lock().await.remove(id);
+        Ok(())
+    }
+
+    /// Every entry label, keyed by entry id.
+    pub async fn list_entry_labels(&self) -> Result<HashMap<String, EntryLabelColor>, String> {
+        if let Some(runtime) = &self.runtime {
+            runtime
+                .list_entry_labels()
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(self.memory_labels.lock().await.clone())
+        }
+    }
+
+    /// Set or clear one entry's label.
+    pub async fn set_entry_label(
+        &self,
+        entry_id: &str,
+        color: Option<EntryLabelColor>,
+    ) -> EmptyResult {
+        if let Some(runtime) = &self.runtime {
+            runtime
+                .set_entry_label(entry_id, color)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut labels = self.memory_labels.lock().await;
+        match color {
+            Some(color) => {
+                labels.insert(entry_id.to_owned(), color);
+            }
+            None => {
+                labels.remove(entry_id);
+            }
+        }
         Ok(())
     }
 

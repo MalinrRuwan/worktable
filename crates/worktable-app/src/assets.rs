@@ -18,6 +18,9 @@ pub const SPARKLES_PATH: &str = "worktable-sparkles.svg";
 /// Lucide-style conversation glyph for the saved chat picker.
 pub const CHATS_PATH: &str = "worktable-chats.svg";
 
+/// Filled circle used as the color swatch in entry-label menus.
+pub const LABEL_CIRCLE_PATH: &str = "worktable-label-circle.svg";
+
 /// The app's asset source.
 pub struct AppAssets;
 
@@ -33,6 +36,11 @@ impl AssetSource for AppAssets {
         }
         if path == CHATS_PATH {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/chats.svg"))));
+        }
+        if path == LABEL_CIRCLE_PATH {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/label-circle.svg"
+            ))));
         }
         gpui_kit_assets::Assets.load(path)
     }
