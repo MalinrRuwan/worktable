@@ -15,7 +15,7 @@ use gpui::{
     Pixels, Point, PressureStage, Render, Role, ScrollHandle, SharedString, Size,
     StatefulInteractiveElement as _, Styled, StyledImage as _, Subscription, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img,
-    linear_color_stop, linear_gradient, point, rems, size, svg,
+    linear_color_stop, linear_gradient, point, px, rems, size, svg,
 };
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -6313,7 +6313,11 @@ fn render_entry_card(
     } else {
         "Delete".to_owned()
     };
-    let card = card.context_menu(move |menu, _window, _cx| {
+    let card = card.context_menu(move |menu, window, _cx| {
+        // The popup adds 4px and each item adds 8px on both sides. Matching
+        // that total makes the fixed color row fill the content width, so its
+        // left and right margins are equal.
+        let menu_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window) + px(24.);
         let content_copy = content_for_menu.clone();
         let url_open = content_for_menu.clone();
         let is_link_menu = content_is_link(&content_for_menu);
@@ -6327,7 +6331,7 @@ fn render_entry_card(
         let copy_label = copy_label.clone();
         let delete_label = delete_label.clone();
         let menu_multi = menu_multi;
-        let mut menu = menu.item(
+        let mut menu = menu.min_w(menu_width).max_w(menu_width).item(
             PopupMenuItem::new("View entry")
                 .icon(Icon::new(IconName::Eye))
                 .on_click(move |_event, _window, cx| {
@@ -6379,6 +6383,7 @@ fn render_entry_card(
                     .id("entry-label-colors")
                     .debug_selector(|| "entry-label-colors".into())
                     .w(row_width)
+                    .ml(design::ENTRY_LABEL_MENU_INSET)
                     .items_center()
                     .justify_between();
                 for color in EntryLabelColor::ALL {
@@ -6395,13 +6400,19 @@ fn render_entry_card(
                             .role(Role::Button)
                             .aria_label(format!("{} label", color.name()))
                             .size_5()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .rounded_full()
                             .bg(swatch)
-                            .border_2()
-                            .border_color(if active {
-                                theme.foreground
-                            } else {
-                                theme.border
+                            .border_1()
+                            .border_color(theme.border)
+                            .when(active, |el| {
+                                el.child(
+                                    Icon::new(IconName::Check)
+                                        .size_3()
+                                        .text_color(design::entry_label_foreground(theme, color)),
+                                )
                             })
                             .cursor_pointer()
                             .on_click(move |_, _, cx| {
