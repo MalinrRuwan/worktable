@@ -195,16 +195,17 @@ opened at the pinned GPUI revision.
 
 Entries carry one optional presentation label — Red, Amber, Green, Blue, or
 Purple — stored in `wt_entry_labels` under stable lowercase keys. A label paints
-only the card's 1px stroke (and the detail panel's outer border); background,
-radius, padding, selection, and hover stay the shared treatment, and the card's
-accessible name names the color rather than relying on color alone. Labels are
-presentation metadata, never entry content: the card context menu shows a
-horizontal row of five theme-colored dots below the copy actions, choosing the
-active dot clears the label, and there is no separate Clear label item. The
-choice applies only to the right-clicked entry even when several are selected.
-With an entry selected, the library menu exposes the same five checked color
-items as the keyboard path. Copy as list is hidden for a single entry. Deleting
-an entry removes its label in the same transaction.
+the card's 2px stroke (1px when unlabeled) and the detail panel's outer border;
+the selected card's check circle uses the label color as its fill with a
+contrasting check, while background, radius, padding, and hover stay the shared
+treatment. The card's accessible name names the color rather than relying on
+color alone. Labels are presentation metadata, never entry content: the card
+context menu shows a horizontal row of five theme-colored dots below the copy
+actions, choosing the active dot clears the label, and there is no separate
+Clear label item. The choice applies only to the right-clicked entry even when
+several are selected. With an entry selected, the library menu exposes the same
+five checked color items as the keyboard path. Copy as list is hidden for a
+single entry. Deleting an entry removes its label in the same transaction.
 
 A new entry enters from the top with the list's push-down entrance: the
 existing rows start one card higher (their pre-insert places) and glide down

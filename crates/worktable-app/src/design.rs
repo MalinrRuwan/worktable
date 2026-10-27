@@ -128,6 +128,24 @@ pub fn entry_label_color(theme: &Theme, label: EntryLabelColor) -> Hsla {
     }
 }
 
+/// A check-mark color that contrasts with the label dot. Pick whichever theme
+/// extreme is farther in lightness from the label, so the same rule works in
+/// the light and dark Ayu variants.
+pub fn entry_label_foreground(theme: &Theme, label: EntryLabelColor) -> Hsla {
+    let swatch = entry_label_color(theme, label);
+    let light = theme.background;
+    let dark = theme.foreground;
+    if (swatch.l - light.l).abs() >= (swatch.l - dark.l).abs() {
+        light
+    } else {
+        dark
+    }
+}
+
+/// Width of the horizontal entry-label color row in the card context menu.
+/// The row sets the menu width so the five dots can center with equal margins.
+pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(9.0);
+
 /// The content column's width for the current window: full width on small
 /// windows, then growing to the comfortable cap and stopping at the roomy cap
 /// so fullscreen windows keep proportional side margins.
@@ -187,6 +205,12 @@ mod tests {
                     .map(|label| entry_label_color(theme, *label))
                     .collect();
                 for (index, color) in colors.iter().enumerate() {
+                    let foreground = entry_label_foreground(theme, EntryLabelColor::ALL[index]);
+                    assert!(
+                        (foreground.l - color.l).abs() > 0.2,
+                        "the check mark must contrast with {:?} in {mode:?}",
+                        EntryLabelColor::ALL[index]
+                    );
                     for (other_index, other) in colors.iter().enumerate().skip(index + 1) {
                         assert_ne!(
                             color,

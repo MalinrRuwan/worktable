@@ -3792,10 +3792,8 @@ fn render_entry_modal(
     // The label is presentation metadata looked up on every frame, so the
     // panel follows a color change without snapshotting it into the modal.
     // Header and footer separators keep the neutral border.
-    let panel_border = this
-        .entry_labels
-        .get(&modal.entry_id)
-        .copied()
+    let panel_label = this.entry_labels.get(&modal.entry_id).copied();
+    let panel_border = panel_label
         .map(|label| design::entry_label_color(&theme, label))
         .unwrap_or(theme.border);
     let viewport = window.viewport_size();
@@ -4080,6 +4078,7 @@ fn render_entry_modal(
                     .overflow_hidden()
                     .rounded(theme.radius_tokens().lg)
                     .border_1()
+                    .when(panel_label.is_some(), |el| el.border_2())
                     .border_color(panel_border)
                     .bg(theme.tokens.popover)
                     // The whole panel fades with the tween so the morph reads
@@ -5981,9 +5980,12 @@ fn render_entry_card(
     let is_image = content_is_image(&entry.content);
     // A label changes only the stroke; background, radius, padding, selection
     // and hover remain the shared card treatment.
-    let border_color = label
-        .map(|label| design::entry_label_color(&theme, label))
-        .unwrap_or(theme.border);
+    let label_color = label.map(|label| design::entry_label_color(&theme, label));
+    let border_color = label_color.unwrap_or(theme.border);
+    let tick_color = label_color.unwrap_or(theme.primary);
+    let tick_foreground = label
+        .map(|label| design::entry_label_foreground(&theme, label))
+        .unwrap_or(theme.primary_foreground);
 
     let selection = div()
         .size_5()
@@ -5993,12 +5995,12 @@ fn render_entry_card(
         .flex_shrink_0()
         .rounded_full()
         .border_1()
-        .border_color(theme.primary.opacity(0.55))
+        .border_color(tick_color.opacity(0.55))
         .when(is_selected, |this| {
-            this.bg(theme.primary).child(
+            this.bg(tick_color).child(
                 Icon::new(IconName::Check)
                     .size_3()
-                    .text_color(theme.primary_foreground),
+                    .text_color(tick_foreground),
             )
         });
 
@@ -6202,6 +6204,7 @@ fn render_entry_card(
         .rounded(theme.radius_tokens().md)
         .bg(theme.popover)
         .border_1()
+        .when(label.is_some(), |el| el.border_2())
         .border_color(border_color)
         .on_click(cx.listener({
             let entry_id = entry_id.clone();
@@ -6369,14 +6372,16 @@ fn render_entry_card(
                 )
             })
             .separator()
-            .item(PopupMenuItem::element(move |_, cx| {
+            .item(PopupMenuItem::element(move |window, cx| {
                 let theme = cx.theme();
+                let row_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window);
                 let mut row = h_flex()
                     .id("entry-label-colors")
                     .debug_selector(|| "entry-label-colors".into())
+                    .w(row_width)
                     .items_center()
-                    .gap_2()
-                    .px_1();
+                    .justify_center()
+                    .gap_2();
                 for color in EntryLabelColor::ALL {
                     let swatch = design::entry_label_color(theme, color);
                     let active = active_label == Some(color);
