@@ -276,35 +276,6 @@ fn app_menus() -> Vec<Menu> {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_menu_lists_check_for_updates_directly_below_settings() {
-        let menus = app_menus();
-        let app = menus.first().expect("the app menu exists");
-        assert_eq!(app.name, "Worktable");
-        let actions: Vec<&str> = app
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                MenuItem::Action { name, .. } => Some(name.as_ref()),
-                _ => None,
-            })
-            .collect();
-        let settings = actions
-            .iter()
-            .position(|name| *name == "Settings…")
-            .expect("Settings is in the app menu");
-        assert_eq!(
-            actions.get(settings + 1).copied(),
-            Some("Check for Updates…"),
-            "Check for Updates sits directly below Settings"
-        );
-    }
-}
-
 /// Start the local control socket when `WORKTABLE_CONTROL_SOCKET` is set and
 /// drive its requests on the GPUI main thread.
 fn start_control(cx: &mut App, service: Arc<WorktableService>, visible: Arc<AtomicBool>) {
@@ -562,4 +533,33 @@ fn open_main_window(
     )?;
     cx.set_global(MainWindow(window.into()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_menu_lists_check_for_updates_directly_below_settings() {
+        let menus = app_menus();
+        let app = menus.first().expect("the app menu exists");
+        assert_eq!(app.name, "Worktable");
+        let actions: Vec<&str> = app
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let settings = actions
+            .iter()
+            .position(|name| *name == "Settings…")
+            .expect("Settings is in the app menu");
+        assert_eq!(
+            actions.get(settings + 1).copied(),
+            Some("Check for Updates…"),
+            "Check for Updates sits directly below Settings"
+        );
+    }
 }

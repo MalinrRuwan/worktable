@@ -84,6 +84,10 @@ pub(crate) enum UpdateState {
 struct ComposerResize {
     from_rows: f32,
     to_rows: f32,
+    /// Restarts the height animation when the target rows change.
+    generation: u64,
+    /// Wall-clock start used only to fall back to the settled height after the
+    /// animation window; the element animation itself runs on GPUI's clock.
     started: Instant,
 }
 
@@ -385,6 +389,7 @@ pub struct WorktableView {
     /// already on screen.
     composer_rows: usize,
     composer_resize: Option<ComposerResize>,
+    composer_resize_generation: u64,
     assistant_input: Entity<InputState>,
 
     // Assistant
@@ -514,6 +519,9 @@ impl WorktableView {
             TextareaState::new(window, cx)
                 .placeholder("Add a note")
                 .submit_on_enter(true)
+                // Past four rows the field scrolls; the animated box below
+                // mirrors the same 1–4 row range.
+                .auto_grow(design::COMPOSER_MIN_ROWS, design::COMPOSER_MAX_ROWS)
         });
         let assistant_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -570,6 +578,7 @@ impl WorktableView {
             composer_body,
             composer_rows: 1,
             composer_resize: None,
+            composer_resize_generation: 0,
             assistant_input,
             messages: Vec::new(),
             assistant_busy: false,
@@ -715,6 +724,10 @@ impl WorktableView {
                     let input = this.composer_body.clone();
                     if this.queue_composer_entry(cx) {
                         this.set_composer_value_in(&input, "", composer_window, cx);
+                        // Clearing via `set_value` suppresses Change, so the
+                        // bar would otherwise stay at four lines after a
+                        // multi-line note was submitted.
+                        this.animate_composer_to(1, cx);
                     }
                 }
                 if matches!(event, InputEvent::Change) {
@@ -1899,6 +1912,21 @@ impl WorktableView {
             self.open_update_dialog(window, cx);
         }
         self.start_update_check(cx);
+    }
+
+    /// Visual-runner entry point: show the update dialog with a fixed state
+    /// without contacting GitHub. Test builds only.
+    #[cfg(any(test, feature = "visual-tests"))]
+    #[allow(dead_code)]
+    pub(crate) fn show_update_dialog_for_visual_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        state: UpdateState,
+    ) {
+        self.update_state = Some(state);
+        self.update_self_install = true;
+        self.open_update_dialog(window, cx);
     }
 
     fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3402,6 +3430,7 @@ impl WorktableView {
         }
         let input = self.composer_body.clone();
         input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.animate_composer_to(1, cx);
     }
 
     /// The note field's row count: one row per explicit line, capped at the
@@ -3420,44 +3449,23 @@ impl WorktableView {
     /// snapping back.
     fn begin_composer_resize(&mut self, cx: &mut Context<Self>) {
         let rows = self.composer_row_count(cx);
+        self.animate_composer_to(rows, cx);
+    }
+
+    fn animate_composer_to(&mut self, rows: usize, cx: &mut Context<Self>) {
         if rows == self.composer_rows {
             return;
         }
         let from_rows = self.composer_rows as f32;
         self.composer_rows = rows;
+        self.composer_resize_generation += 1;
         self.composer_resize = Some(ComposerResize {
             from_rows,
             to_rows: rows as f32,
+            generation: self.composer_resize_generation,
             started: Instant::now(),
         });
         cx.notify();
-        cx.spawn(async move |view, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(8))
-                    .await;
-                let keep_going = view
-                    .update(cx, |this, cx| {
-                        if this.composer_resize.as_ref().is_none_or(|resize| {
-                            resize.started.elapsed() >= worktable_ui::RESIZE.total()
-                        }) {
-                            // Park at the target row count; the field's own
-                            // text layout owns the settled height.
-                            this.composer_resize = None;
-                            cx.notify();
-                            false
-                        } else {
-                            cx.notify();
-                            true
-                        }
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn set_composer_value_in(
@@ -6406,26 +6414,13 @@ fn composer_bar(
     cx: &mut Context<WorktableView>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    // The textarea keeps its natural line layout; we animate the box height in
-    // whole rows so the list above it glides instead of jumping when a new
-    // Shift+Enter line appears.
-    let rows = match this.composer_resize.as_ref() {
-        Some(resize) if resize.started.elapsed() < worktable_ui::RESIZE.total() => {
-            let _ = worktable_ui::activity_now(cx.entity_id(), cx);
-            let raw =
-                resize.started.elapsed().as_secs_f32() / worktable_ui::RESIZE.total().as_secs_f32();
-            let progress = if worktable_ui::reduced_motion(cx) {
-                1.0
-            } else {
-                worktable_ui::RESIZE.progress(raw)
-            };
-            resize.from_rows + (resize.to_rows - resize.from_rows) * progress
-        }
-        _ => this.composer_rows as f32,
-    };
-    let field_height = window.line_height() * rows
-        + design::to_pixels(design::COMPOSER_FIELD_PADDING, window) * 2.0
-        + px(2.);
+    // The textarea keeps its natural line layout; the box animates in whole
+    // rows so the list above it glides instead of jumping when a new
+    // Shift+Enter line appears. `with_animation` drives the frames on GPUI's
+    // clock (a timer task does not advance in the interaction tests).
+    let line_height = window.line_height();
+    let field_padding = design::to_pixels(design::COMPOSER_FIELD_PADDING, window) * 2.0 + px(2.);
+    let field_height = line_height * this.composer_rows as f32 + field_padding;
     h_flex()
         .id("composer-bar")
         .debug_selector(|| "composer-bar".into())
@@ -6444,22 +6439,45 @@ fn composer_bar(
                 .debug_selector("add-image")
                 .on_click(cx.listener(|this, _, _, cx| this.pick_image(cx))),
         )
-        .child(
-            div()
+        .child({
+            let input = div()
                 .flex_1()
                 .min_w_0()
+                .min_h_0()
+                .h(field_height)
+                .max_h(field_height)
+                .overflow_hidden()
                 .debug_selector(|| "composer-input".into())
                 .child(
                     Textarea::new(&this.composer_body)
                         .w_full()
-                        .h(field_height)
+                        .h_full()
                         .overflow_hidden()
                         .appearance(true)
                         .border_color(theme.muted)
                         .bg(theme.muted)
                         .text_color(theme.foreground),
-                ),
-        )
+                );
+            match this.composer_resize.as_ref() {
+                Some(resize) if resize.started.elapsed() < worktable_ui::RESIZE.total() => {
+                    let from = resize.from_rows;
+                    let to = resize.to_rows;
+                    let padding = field_padding;
+                    input
+                        .with_animation(
+                            ("composer-resize", resize.generation),
+                            worktable_ui::RESIZE.animation(),
+                            move |el, progress| {
+                                let rows = from + (to - from) * progress;
+                                el.h(line_height * rows + padding)
+                                    .max_h(line_height * rows + padding)
+                            },
+                        )
+                        .into_any_element()
+                }
+                _ => input.into_any_element(),
+            }
+        })
         .child(
             CircleAction::new("add-note")
                 .primary()
@@ -8757,9 +8775,7 @@ impl Render for UpdateDialogView {
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "Worktable checks the public releases on GitHub. You're on {current}."
-                    )),
+                    .child("Worktable checks the public releases on GitHub."),
             );
 
         match state {

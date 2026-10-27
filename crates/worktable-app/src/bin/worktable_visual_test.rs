@@ -478,6 +478,40 @@ fn run_visual_tests() -> anyhow::Result<()> {
         .ok();
     cx.run_until_parked();
 
+    println!("— step 3d: software update dialog —");
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |this, cx| {
+            this.show_update_dialog_for_visual_test(
+                window,
+                cx,
+                worktable_view::UpdateState::Available(updates::ReleaseInfo {
+                    version: updates::Version::parse("1.6.0").unwrap(),
+                    tag: "v1.6.0".to_owned(),
+                    name: "Worktable 1.6.0".to_owned(),
+                    notes:
+                        "Faster knowledge builds, a calmer transcript, and a fix for the note bar."
+                            .to_owned(),
+                    page_url: "https://github.com/MalinrRuwan/worktable/releases/tag/v1.6.0"
+                        .to_owned(),
+                    dmg: updates::ReleaseAsset {
+                        name: "Worktable-1.6.0.dmg".to_owned(),
+                        url: "https://example.test/Worktable-1.6.0.dmg".to_owned(),
+                    },
+                    checksum: updates::ReleaseAsset {
+                        name: "Worktable-1.6.0.dmg.sha256".to_owned(),
+                        url: "https://example.test/Worktable-1.6.0.dmg.sha256".to_owned(),
+                    },
+                }),
+            )
+        });
+    })
+    .ok();
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_update_dialog")?;
+    cx.update_window(handle, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
     println!("— step 3c: provider configuration dialog —");
     cx.update(|cx| {
         view.update(cx, |this, cx| {

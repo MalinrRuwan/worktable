@@ -1975,10 +1975,20 @@ fn note_bar_shift_enter_grows_to_four_lines(cx: &mut TestAppContext) {
         "the note field stops growing at four rows"
     );
 
-    let grew = wait_for(&mut cx, 2, |cx| {
-        cx.debug_bounds("composer-input")
+    let mut grew = false;
+    for _ in 0..40 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cx.update(|window, _| window.refresh());
+        force_frame(&mut cx);
+        if cx
+            .debug_bounds("composer-input")
             .is_some_and(|bounds| bounds.size.height > one_line + px(20.))
-    });
+        {
+            grew = true;
+            break;
+        }
+    }
     assert!(
         grew,
         "the note field grows taller as lines are added; one line was {one_line}"
@@ -1992,6 +2002,32 @@ fn note_bar_shift_enter_grows_to_four_lines(cx: &mut TestAppContext) {
     assert!(
         four_lines >= one_line + px(50.),
         "three extra lines add real height, got {four_lines} from {one_line}"
+    );
+
+    // Submitting clears the field and shrinks the box back to one row.
+    cx.simulate_keystrokes("enter");
+    assert!(wait_for(&mut cx, 2, |cx| {
+        cx.read_entity(&view, |v, cx| {
+            v.composer_rows == 1 && v.composer_body.read(cx).value().is_empty()
+        })
+    }));
+    let mut shrunk = false;
+    for _ in 0..40 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cx.update(|window, _| window.refresh());
+        force_frame(&mut cx);
+        if cx
+            .debug_bounds("composer-input")
+            .is_some_and(|bounds| bounds.size.height <= four_lines - px(40.))
+        {
+            shrunk = true;
+            break;
+        }
+    }
+    assert!(
+        shrunk,
+        "submitting returns the note bar to its one-line height"
     );
 }
 
