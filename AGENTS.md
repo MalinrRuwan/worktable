@@ -744,15 +744,34 @@ It runs `cargo build --release -p worktable-app`, assembles
 asset), signs it, and writes a drag-to-Applications
 `dist/Worktable-<version>.dmg` plus a `.sha256`. `dist/` stays git-ignored.
 
-Ad-hoc signing (`CODESIGN_IDENTITY` unset or `-`) passes the bundle identifier
-and a stable designated requirement (`designated => identifier
-"com.worktable.app"`), then verifies the signature and prints that requirement.
-This keeps the code requirement stable when `/Applications/Worktable.app` is
-replaced, so macOS is more likely to keep the Accessibility grant. It is best
-effort: TCC may still ask for Accessibility once after an update. A Developer
-ID identity keeps the normal signature (the certificate/Team ID is already the
-stable requirement); a Developer ID + notarized build is the reliable TCC
-path.
+The default `CODESIGN_IDENTITY` is **Worktable Self-Signed Code Signing**.
+`scripts/ensure-self-signed-identity.sh` creates — or idempotently reuses — that
+identity in its own keychain at
+`~/.worktable/codesign/worktable-codesign.keychain-db`, with the password,
+certificate PEM, and trust settings under the same directory; nothing is
+created in or trusted from the login keychain. The script generates a
+2048-bit RSA self-signed certificate (10 years, critical code-signing EKU),
+imports it with legacy PKCS#12 (macOS `security` rejects modern encryption),
+allows `/usr/bin/codesign`, and trusts it only as a code-signing root in the
+user domain. It prints only the keychain path on stdout.
+
+The package script temporarily adds that keychain to the user keychain search
+list, signs with `codesign --force --deep --sign "$CODESIGN_IDENTITY"
+--identifier "$BUNDLE_ID"` and **no** custom `--requirements`, verifies
+`--deep --strict`, prints the designated requirement, and restores the original
+search list on success and failure (trap). The resulting requirement is
+anchored to the certificate leaf
+(`designated => identifier "com.worktable.app" and certificate leaf = H"…"`)
+instead of an ad-hoc cdhash, so replacing `/Applications/Worktable.app` keeps
+the same requirement. Losing or recreating the keychain changes that leaf and
+may cost one Accessibility re-grant. This is best effort: TCC may still ask
+once after an update, and remove/re-add is the recovery step.
+
+Set `CODESIGN_IDENTITY` to a Developer ID Application identity to keep the
+normal signature (the certificate/Team ID is already the stable requirement).
+A Developer ID + notarized build remains the reliable TCC path. Ad-hoc signing
+is no longer a supported release path: `CODESIGN_IDENTITY=-` exits with a clear
+error instead of signing.
 
 The app-menu **Check for Updates…** path is the packaged counterpart: it reads
 GitHub's latest stable release, verifies the DMG checksum and signature,

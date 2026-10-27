@@ -5,6 +5,8 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 APP_NAME=${APP_NAME:-Worktable}
 BUNDLE_DIR=${BUNDLE_DIR:-"$ROOT_DIR/dist/$APP_NAME.app"}
 BUNDLE_ID=${BUNDLE_ID:-com.worktable.app}
+SELF_SIGNED_IDENTITY="Worktable Self-Signed Code Signing"
+CODESIGN_IDENTITY=${CODESIGN_IDENTITY:-$SELF_SIGNED_IDENTITY}
 # Default the installer version to the app crate's version, so the DMG and
 # Info.plist cannot drift from the binary that was built.
 DEFAULT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/crates/worktable-app/Cargo.toml" | head -1)
@@ -13,6 +15,13 @@ DMG_PATH=${DMG_PATH:-"$ROOT_DIR/dist/$APP_NAME-$VERSION.dmg"}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "This script packages a macOS app and must run on macOS." >&2
+  exit 1
+fi
+
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  echo "Ad-hoc signing is no longer a supported release path." >&2
+  echo "Unset CODESIGN_IDENTITY to use the self-signed identity, or set it to a" >&2
+  echo "Developer ID Application identity for a notarized release." >&2
   exit 1
 fi
 
@@ -76,25 +85,64 @@ PLIST
 
 chmod 755 "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 
-CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
 strip -S -x "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null || true
-# Ad-hoc signatures are keyed by their code requirement, so replacing the app
-# invalidates any Accessibility grant macOS stored for the old cdhash. A
-# stable identifier plus designated requirement keeps the requirement — and
-# the TCC decision keyed to it — stable across ad-hoc replacements. A real
-# Developer ID identity keeps the normal signature: its certificate and Team
-# ID are the stable requirement.
-if [ "$CODESIGN_IDENTITY" = "-" ]; then
-  codesign --force --deep --sign - \
+
+# The user keychain search list is a global, temporary change: capture it and
+# restore it even when signing or verification fails.
+KEYCHAIN_SEARCH_LIST=$(mktemp)
+# `security` prints quoted paths, usually one per line but not always. Split
+# on the quotes so a multi-entry line cannot collapse into one path.
+security list-keychains -d user \
+  | tr '"' '\n' \
+  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+  | sed '/^$/d' > "$KEYCHAIN_SEARCH_LIST"
+
+restore_keychain_search_list() {
+  if [ -f "$KEYCHAIN_SEARCH_LIST" ]; then
+    set --
+    while IFS= read -r keychain; do
+      if [ -n "$keychain" ]; then
+        set -- "$@" "$keychain"
+      fi
+    done < "$KEYCHAIN_SEARCH_LIST"
+    if [ "$#" -gt 0 ]; then
+      security list-keychains -d user -s "$@" >/dev/null 2>&1 || true
+    fi
+    rm -f "$KEYCHAIN_SEARCH_LIST"
+  fi
+}
+trap 'restore_keychain_search_list' EXIT INT TERM
+
+if [ "$CODESIGN_IDENTITY" = "$SELF_SIGNED_IDENTITY" ]; then
+  KEYCHAIN=$("$ROOT_DIR/scripts/ensure-self-signed-identity.sh")
+  # codesign resolves an identity by name through the search list; add the
+  # dedicated keychain only for this run.
+  set --
+  if [ -s "$KEYCHAIN_SEARCH_LIST" ]; then
+    while IFS= read -r keychain; do
+      if [ -n "$keychain" ] && [ "$keychain" != "$KEYCHAIN" ]; then
+        set -- "$@" "$keychain"
+      fi
+    done < "$KEYCHAIN_SEARCH_LIST"
+  fi
+  security list-keychains -d user -s "$KEYCHAIN" "$@" >/dev/null
+  # No custom --requirements: the certificate leaf is the stable anchor, and
+  # replacing the bundle keeps the same designated requirement.
+  codesign --force --deep --sign "$CODESIGN_IDENTITY" \
     --identifier "$BUNDLE_ID" \
-    --requirements "=designated => identifier \"$BUNDLE_ID\"" \
     "$BUNDLE_DIR"
 else
+  # A Developer ID identity keeps its normal signature; its certificate and
+  # Team ID already form a stable requirement.
   codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
 fi
+
 codesign --verify --deep --strict "$BUNDLE_DIR"
 echo "Designated requirement:"
 codesign -d -r- "$BUNDLE_DIR" 2>&1 | sed -n '/^designated =>/p'
+
+restore_keychain_search_list
+trap - EXIT INT TERM
 
 # Drag-to-Applications disk image.
 STAGING=$(mktemp -d)

@@ -173,6 +173,7 @@ Worktable stores its library locally. By default:
 | `~/.worktable/media/` | Imported images, hard-linked when possible and copied across devices |
 | `~/.worktable/images/` | Images saved by global capture |
 | `~/.worktable/logs/worktable.log` | Diagnostic log, written only after you turn on Settings → General → Diagnostic logs |
+| `~/.worktable/codesign/` | Self-signed code-signing identity, keychain, and password used by local release packaging |
 
 Diagnostic logging is off by default. When enabled, it appends startup and
 background errors (including database migration failures) to the log file;
@@ -275,18 +276,34 @@ dist/
 └── Worktable-1.5.1.dmg.sha256
 ```
 
-Packaging uses the host architecture and ad-hoc signing by default; it does
-not notarize the app. Generated files in `dist/` are ignored by Git.
+Packaging uses the host architecture and a dedicated self-signed identity by
+default; it does not notarize the app. Generated files in `dist/` are ignored
+by Git.
 
-Ad-hoc builds carry a stable bundle identifier and designated requirement
-(`designated => identifier "com.worktable.app"`) so replacing the app in
-`/Applications` is more likely to keep its Accessibility grant. That is best
-effort: macOS may still require enabling Accessibility once after an update,
-and if capture stays blocked, remove Worktable from System Settings → Privacy &
-Security → Accessibility and add it again. A Developer ID-signed and notarized
-build is the reliable TCC path. Worktable also records `last_run_version` and
-`accessibility_granted`, so an update can offer the recovery step once when a
-grant that used to work is gone.
+The default identity is **Worktable Self-Signed Code Signing**. The first
+package run creates it in its own keychain at
+`~/.worktable/codesign/worktable-codesign.keychain-db` and stores the
+certificate and keychain password beside it. Signing uses the certificate leaf
+as the designated requirement
+(`designated => identifier "com.worktable.app" and certificate leaf = H"…"`)
+rather than an ad-hoc cdhash, so replacing the app in `/Applications` keeps the
+same requirement. Losing or recreating that keychain creates a new certificate,
+changes the requirement, and may cost one Accessibility re-grant. To use a
+Developer ID instead, set `CODESIGN_IDENTITY` to the identity name:
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Name (TEAMID)" \
+  VERSION=1.5.1 sh scripts/package-macos.sh
+```
+
+A Developer ID-signed and notarized build remains the reliable TCC path for
+keeping Accessibility across updates. The self-signed build is best effort:
+macOS may still require enabling Accessibility once after an update, and if
+capture stays blocked, remove Worktable from System Settings → Privacy &
+Security → Accessibility and add it again. Ad-hoc signing is no longer a
+supported release path; the packaging script rejects `CODESIGN_IDENTITY=-`.
+Worktable also records `last_run_version` and `accessibility_granted`, so an
+update can offer the recovery step once when a grant that used to work is gone.
 
 ### Contributing
 
