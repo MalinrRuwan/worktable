@@ -6380,8 +6380,7 @@ fn render_entry_card(
                     .debug_selector(|| "entry-label-colors".into())
                     .w(row_width)
                     .items_center()
-                    .justify_center()
-                    .gap_2();
+                    .justify_between();
                 for color in EntryLabelColor::ALL {
                     let swatch = design::entry_label_color(theme, color);
                     let active = active_label == Some(color);
@@ -6395,7 +6394,7 @@ fn render_entry_card(
                             .debug_selector(move || debug.clone())
                             .role(Role::Button)
                             .aria_label(format!("{} label", color.name()))
-                            .size_4()
+                            .size_5()
                             .rounded_full()
                             .bg(swatch)
                             .border_2()

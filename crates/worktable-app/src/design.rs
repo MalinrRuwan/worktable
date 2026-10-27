@@ -144,7 +144,7 @@ pub fn entry_label_foreground(theme: &Theme, label: EntryLabelColor) -> Hsla {
 
 /// Width of the horizontal entry-label color row in the card context menu.
 /// The row sets the menu width so the five dots can center with equal margins.
-pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(9.0);
+pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(8.75);
 
 /// The content column's width for the current window: full width on small
 /// windows, then growing to the comfortable cap and stopping at the roomy cap
