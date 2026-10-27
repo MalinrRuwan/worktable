@@ -682,7 +682,7 @@ to `stderr` as a fallback, so a release build without the setting stays quiet.
 `scripts/package-macos.sh` builds the release bundle and its installer:
 
 ```sh
-VERSION=0.1.0 sh scripts/package-macos.sh
+VERSION=1.5.0 sh scripts/package-macos.sh
 ```
 
 It runs `cargo build --release -p worktable-app`, assembles

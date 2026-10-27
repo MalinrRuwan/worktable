@@ -5,7 +5,10 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 APP_NAME=${APP_NAME:-Worktable}
 BUNDLE_DIR=${BUNDLE_DIR:-"$ROOT_DIR/dist/$APP_NAME.app"}
 BUNDLE_ID=${BUNDLE_ID:-com.worktable.app}
-VERSION=${VERSION:-0.1.0}
+# Default the installer version to the app crate's version, so the DMG and
+# Info.plist cannot drift from the binary that was built.
+DEFAULT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/crates/worktable-app/Cargo.toml" | head -1)
+VERSION=${VERSION:-$DEFAULT_VERSION}
 DMG_PATH=${DMG_PATH:-"$ROOT_DIR/dist/$APP_NAME-$VERSION.dmg"}
 
 if [ "$(uname -s)" != "Darwin" ]; then

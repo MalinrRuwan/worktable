@@ -12246,7 +12246,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "worktable-ai"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -12264,7 +12264,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-app"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -12292,7 +12292,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-cli"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "serde",
@@ -12302,7 +12302,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-control"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -12310,7 +12310,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-db"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
@@ -12324,7 +12324,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-events"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -12334,7 +12334,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-helix"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "helix-db",
@@ -12347,7 +12347,7 @@ dependencies = [
 
 [[package]]
 name = "worktable-ui"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "gpui-base",

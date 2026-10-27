@@ -248,7 +248,7 @@ Visual snapshots complement interaction tests; they do not replace them.
 Set the version you want to package:
 
 ```sh
-VERSION=1.3.0 sh scripts/package-macos.sh
+VERSION=1.5.0 sh scripts/package-macos.sh
 ```
 
 The script builds the release binary, bundles themes and the app icon, signs
@@ -257,8 +257,8 @@ the app, and creates:
 ```text
 dist/
 ├── Worktable.app
-├── Worktable-1.3.0.dmg
-└── Worktable-1.3.0.dmg.sha256
+├── Worktable-1.5.0.dmg
+└── Worktable-1.5.0.dmg.sha256
 ```
 
 Packaging uses the host architecture and ad-hoc signing by default; it does
