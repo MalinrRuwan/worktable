@@ -6989,6 +6989,7 @@ fn render_entry_card(
                         .id("entry-label-colors")
                         .debug_selector(|| "entry-label-colors".into())
                         .w(row_width)
+                        .ml(design::ENTRY_LABEL_MENU_ICON_OFFSET)
                         .items_center()
                         .justify_center()
                         .gap_2();

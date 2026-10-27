@@ -156,6 +156,12 @@ pub fn entry_label_hover_color(theme: &Theme, label: EntryLabelColor) -> Hsla {
 /// The row sets the menu width so the five dots can center with equal margins.
 pub const ENTRY_LABEL_MENU_ROW_WIDTH: Rems = rems(8.5);
 
+/// Width of the menu item's leading icon column (16px icon + 4px gap). The
+/// custom color row shifts left by this amount so it spans the full menu
+/// content instead of starting after the icon column and pushing the last dot
+/// against the right edge.
+pub const ENTRY_LABEL_MENU_ICON_OFFSET: Pixels = gpui::px(-24.);
+
 /// The content column's width for the current window: full width on small
 /// windows, then growing to the comfortable cap and stopping at the roomy cap
 /// so fullscreen windows keep proportional side margins.
