@@ -50,6 +50,11 @@ use crate::assistant::{
     render_message, welcome_panel,
 };
 use crate::service::WorktableService;
+use worktable_control::{
+    AssistantAction, ChatsAction, Command, KnowledgeAction, LabelColor, OnboardingAction, Page,
+    Response, SettingsTab as ControlSettingsTab, SortMode as ControlSortMode,
+    ThemeMode as ControlThemeMode,
+};
 
 struct ChatRow {
     id: String,
@@ -1773,18 +1778,32 @@ impl WorktableView {
         if !self.list_actions_allowed() {
             return;
         }
-        if self.selected.len() > 1 {
-            self.copy_entries_as_list(cx);
-            return;
-        }
-        if let Some(entry) = self.selected_entry() {
-            let text = entry
-                .title
-                .as_deref()
-                .map(|title| format!("{title}\n{}", entry.content))
-                .unwrap_or_else(|| entry.content.clone());
+        if let Some(text) = self.selected_copy_text() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
+    }
+
+    /// The clipboard text for the current selection: one entry's
+    /// `title\ncontent`, or the selected visible entries joined as a list.
+    fn selected_copy_text(&self) -> Option<String> {
+        if self.selected.len() > 1 {
+            let entries: Vec<&WorktableEntry> = self
+                .visible_entries()
+                .into_iter()
+                .filter(|entry| self.selected.contains(&entry.id))
+                .collect();
+            if entries.is_empty() {
+                return None;
+            }
+            return Some(
+                entries
+                    .iter()
+                    .map(|entry| control_entry_copy_text(entry))
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n"),
+            );
+        }
+        self.selected_entry().map(control_entry_copy_text)
     }
 
     pub fn copy_selected_link(&mut self, cx: &mut Context<Self>) {
@@ -2887,13 +2906,28 @@ impl WorktableView {
             return false;
         };
 
+        self.queue_new_entry(content, None, "Worktable", cx);
+        true
+    }
+
+    /// Insert one note through the same optimistic path the note bar uses and
+    /// return its id immediately. The database write happens in the spawned
+    /// task; the view updates (and selects) the entry when it succeeds.
+    fn queue_new_entry(
+        &mut self,
+        content: String,
+        title: Option<String>,
+        source: &str,
+        cx: &mut Context<Self>,
+    ) -> String {
         let entry = WorktableEntry {
             id: crate::service::new_entry_id(),
             content,
-            title: None,
-            source: "Worktable".to_owned(),
+            title,
+            source: source.to_owned(),
             created_at: crate::service::unix_time_ms(),
         };
+        let entry_id = entry.id.clone();
 
         cx.notify();
 
@@ -2915,7 +2949,7 @@ impl WorktableView {
             });
         })
         .detach();
-        true
+        entry_id
     }
 
     /// Focus the always-visible note input. Test/visual-runner helper: the
@@ -3061,32 +3095,7 @@ impl WorktableView {
         let Some(content) = trim_opt(&text) else {
             return;
         };
-
-        let entry = WorktableEntry {
-            id: crate::service::new_entry_id(),
-            content,
-            title: None,
-            source: "Selection".to_owned(),
-            created_at: crate::service::unix_time_ms(),
-        };
-        let service = Arc::clone(&self.service);
-        let entry_id_for_anim = entry.id.clone();
-        cx.spawn(async move |view, cx| {
-            let result = service.insert_entry(entry.clone()).await;
-            let _ = view.update(cx, |this, cx| {
-                if result.is_ok() {
-                    this.entries.insert(0, entry.clone());
-                    this.rebuild_topic_cache();
-                    this.selected.clear();
-                    this.selected.insert(entry.id.clone());
-                    this.selected_anchor = Some(entry.id);
-                    this.mode = AppMode::Entries;
-                    this.mark_entry_inserted(&entry_id_for_anim, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.queue_new_entry(content, None, "Selection", cx);
     }
 
     /// Insert an image captured from another application. The file is
@@ -3104,31 +3113,7 @@ impl WorktableView {
             .import_image(std::path::Path::new(&path))
             .map(|stored| stored.to_string_lossy().into_owned())
             .unwrap_or(path);
-        let entry = WorktableEntry {
-            id: crate::service::new_entry_id(),
-            content,
-            title: None,
-            source: "Selection".to_owned(),
-            created_at: crate::service::unix_time_ms(),
-        };
-        let service = Arc::clone(&self.service);
-        let entry_id_for_anim = entry.id.clone();
-        cx.spawn(async move |view, cx| {
-            let result = service.insert_entry(entry.clone()).await;
-            let _ = view.update(cx, |this, cx| {
-                if result.is_ok() {
-                    this.entries.insert(0, entry.clone());
-                    this.rebuild_topic_cache();
-                    this.selected.clear();
-                    this.selected.insert(entry.id.clone());
-                    this.selected_anchor = Some(entry.id);
-                    this.mode = AppMode::Entries;
-                    this.mark_entry_inserted(&entry_id_for_anim, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.queue_new_entry(content, None, "Selection", cx);
     }
 
     /// Copy selected entries (when multi-selected) else all visible entries as a joined list.
@@ -3147,16 +3132,549 @@ impl WorktableView {
         }
         let text = entries
             .iter()
-            .map(|entry| {
-                if let Some(title) = &entry.title {
-                    format!("{title}\n{}", entry.content)
-                } else {
-                    entry.content.clone()
-                }
-            })
+            .map(|entry| control_entry_copy_text(entry))
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Execute one local control command against the real view.
+    ///
+    /// The command surface deliberately reuses the same action methods as the
+    /// UI (buttons, menus, keybindings), so automation cannot drift from what
+    /// a user can do. `Window` and `Quit` are handled by the app shell because
+    /// they own window visibility and process exit.
+    pub(crate) fn control(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Response {
+        match command {
+            Command::Ping => {
+                Response::ok(serde_json::json!({ "ready": true })).with_message("pong")
+            }
+            Command::State => Response::ok(self.control_state(window, cx)),
+            Command::Page { page } => {
+                match page {
+                    Page::Entries => self.show_entries(cx),
+                    Page::Assistant => self.show_assistant(cx),
+                    Page::Settings => self.show_settings(cx),
+                }
+                Response::ok(self.control_state(window, cx)).with_message("Page shown")
+            }
+            Command::Settings { tab } => {
+                match tab {
+                    Some(tab) => self.show_settings_at(control_settings_tab(tab), cx),
+                    None => self.show_settings(cx),
+                }
+                Response::ok(self.control_state(window, cx)).with_message("Settings shown")
+            }
+            Command::Back => {
+                let message = if self.entry_modal.is_some() {
+                    self.close_entry_modal(cx);
+                    "Closing the entry view"
+                } else if self.chats_sheet.is_some() {
+                    self.close_chats(window, cx);
+                    "Closing chats"
+                } else if self.onboarding.is_some() {
+                    self.back_onboarding(cx);
+                    "Previous tour step"
+                } else if self.mode == AppMode::Settings {
+                    if self.settings_tab.is_some() {
+                        self.settings_tab = None;
+                        cx.notify();
+                        "Settings"
+                    } else {
+                        self.show_entries(cx);
+                        "Entries"
+                    }
+                } else if self.mode == AppMode::Assistant {
+                    self.show_entries(cx);
+                    "Entries"
+                } else {
+                    "Already on Entries"
+                };
+                Response::ok(self.control_state(window, cx)).with_message(message)
+            }
+            Command::AddNote { content, title } => {
+                let Some(content) = trim_opt(&content) else {
+                    return Response::error("Add a note with some content.");
+                };
+                let title = title.and_then(|title| trim_opt(&title));
+                let id = self.queue_new_entry(content, title, "Worktable", cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "id": id });
+                Response::ok(state).with_message("Note queued")
+            }
+            Command::AddImage { path } => {
+                let path = path.trim().to_owned();
+                if path.is_empty() {
+                    return Response::error("Add an image with a file path.");
+                }
+                let Some(mime) = image_mime_for(std::path::Path::new(&path)) else {
+                    return Response::error(format!(
+                        "Unsupported image: {path}. Use a PNG, JPEG, GIF, WebP, or SVG file."
+                    ));
+                };
+                if !std::path::Path::new(&path).is_file() {
+                    return Response::error(format!("Image not found: {path}"));
+                }
+                self.add_captured_image(path.clone(), mime.to_owned(), cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "path": path });
+                Response::ok(state).with_message("Image queued")
+            }
+            Command::Search { query } => {
+                self.show_entries(cx);
+                let input = self.search_input.clone();
+                input.update(cx, |state, cx| state.set_value(&query, window, cx));
+                self.query = query;
+                // `InputState::set_value` does not emit `InputEvent::Change`,
+                // so mirror the subscription's selection cleanup here.
+                let visible: HashSet<String> = self.visible_entry_ids().into_iter().collect();
+                self.selected.retain(|id| visible.contains(id));
+                if self
+                    .selected_anchor
+                    .as_ref()
+                    .is_some_and(|id| !visible.contains(id))
+                {
+                    self.selected_anchor = None;
+                }
+                cx.notify();
+                Response::ok(self.control_state(window, cx)).with_message("Search applied")
+            }
+            Command::ClearSearch => {
+                self.clear_search(cx);
+                let input = self.search_input.clone();
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                self.query.clear();
+                cx.notify();
+                Response::ok(self.control_state(window, cx)).with_message("Search cleared")
+            }
+            Command::Select { id, extend } => {
+                if !self.entries.iter().any(|entry| entry.id == id) {
+                    return Response::error(format!("No entry with id {id}."));
+                }
+                self.select_at(id, extend);
+                cx.notify();
+                Response::ok(self.control_state(window, cx)).with_message("Entry selected")
+            }
+            Command::Open { id } => {
+                let id = match id {
+                    Some(id) => {
+                        if !self.entries.iter().any(|entry| entry.id == id) {
+                            return Response::error(format!("No entry with id {id}."));
+                        }
+                        id
+                    }
+                    None => {
+                        if !self.list_actions_allowed() {
+                            return Response::error(
+                                "Open is only available on the Entries page with no entry view open.",
+                            );
+                        }
+                        let Some(entry) = self.selected_entry() else {
+                            return Response::error("Select an entry to open.");
+                        };
+                        entry.id.clone()
+                    }
+                };
+                if self.entry_modal.is_some() {
+                    return Response::error("An entry is already open. Close it first.");
+                }
+                let origin = self.entry_origin(&id);
+                self.open_entry_modal(&id, origin, cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "id": id });
+                Response::ok(state).with_message("Entry opened")
+            }
+            Command::Entry { id } => {
+                let Some(entry) = self.entries.iter().find(|entry| entry.id == id) else {
+                    return Response::error(format!("No entry with id {id}."));
+                };
+                let value = control_entry_value(
+                    entry,
+                    self.entry_labels.get(&id).copied(),
+                    self.selected.contains(&id),
+                    true,
+                );
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "entry": value });
+                Response::ok(state)
+            }
+            Command::Close => {
+                let message = if self.entry_modal.is_some() {
+                    self.close_entry_modal(cx);
+                    "Closing the entry view"
+                } else if self.chats_sheet.is_some() {
+                    self.close_chats(window, cx);
+                    "Closing chats"
+                } else {
+                    "Nothing to close"
+                };
+                Response::ok(self.control_state(window, cx)).with_message(message)
+            }
+            Command::Edit { content } => {
+                let Some(id) = self
+                    .entry_modal
+                    .as_ref()
+                    .map(|modal| modal.entry_id.clone())
+                else {
+                    return Response::error("Open an entry before editing it.");
+                };
+                if !self.entry_editing {
+                    self.start_entry_edit(window, cx);
+                }
+                let input = self.entry_edit_input.clone();
+                input.update(cx, |state, cx| state.set_value(&content, window, cx));
+                self.save_entry_edit(cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "id": id });
+                Response::ok(state).with_message("Entry edit queued")
+            }
+            Command::Delete { id } => {
+                if !self.list_actions_allowed() {
+                    return Response::error(
+                        "Delete is only available on the Entries page with no entry view open.",
+                    );
+                }
+                let explicit_id = id.is_some();
+                let ids: Vec<String> = match id {
+                    Some(id) => {
+                        if !self.entries.iter().any(|entry| entry.id == id) {
+                            return Response::error(format!("No entry with id {id}."));
+                        }
+                        vec![id]
+                    }
+                    None => self.selected.iter().cloned().collect(),
+                };
+                if ids.is_empty() {
+                    return Response::error("Select an entry to delete.");
+                }
+                if explicit_id {
+                    // An explicit id deletes just that entry even when other
+                    // entries are selected.
+                    self.selected.clear();
+                    self.selected.insert(ids[0].clone());
+                    self.selected_anchor = Some(ids[0].clone());
+                }
+                self.delete_context_target(ids[0].clone(), cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "ids": ids });
+                Response::ok(state).with_message("Entries deleted")
+            }
+            Command::Label { id, color } => {
+                let id = match id {
+                    Some(id) => {
+                        if !self.entries.iter().any(|entry| entry.id == id) {
+                            return Response::error(format!("No entry with id {id}."));
+                        }
+                        id
+                    }
+                    None => {
+                        let Some(entry) = self.selected_entry() else {
+                            return Response::error("Select an entry or pass an id to label it.");
+                        };
+                        entry.id.clone()
+                    }
+                };
+                self.set_entry_label(&id, control_label_color(color), cx);
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({
+                    "id": id,
+                    "color": control_label_key(color),
+                });
+                Response::ok(state).with_message("Label updated")
+            }
+            Command::Copy { id } => {
+                let text = match id {
+                    Some(id) => self
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .map(control_entry_copy_text),
+                    None => {
+                        if !self.list_actions_allowed() {
+                            return Response::error(
+                                "Copy is only available on the Entries page with no entry view open.",
+                            );
+                        }
+                        self.selected_copy_text()
+                    }
+                };
+                let Some(text) = text else {
+                    return Response::error("Select an entry or pass an id to copy it.");
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                let mut state = self.control_state(window, cx);
+                state["result"] = serde_json::json!({ "text": text });
+                Response::ok(state).with_message("Copied")
+            }
+            Command::Sort { mode, ascending } => {
+                let mode = control_sort_mode(mode);
+                match ascending {
+                    Some(ascending) => {
+                        self.sort_mode = mode;
+                        self.sort_ascending = ascending;
+                        cx.notify();
+                    }
+                    None => self.set_sort_mode(mode, cx),
+                }
+                Response::ok(self.control_state(window, cx)).with_message("Sort updated")
+            }
+            Command::Theme { mode } => {
+                self.set_theme_mode(control_theme_mode(mode), window, cx);
+                Response::ok(self.control_state(window, cx)).with_message("Theme updated")
+            }
+            Command::ToggleTheme => {
+                self.toggle_theme(cx);
+                Response::ok(self.control_state(window, cx)).with_message("Theme toggled")
+            }
+            Command::Background { enabled } => {
+                if self.background_on_close != enabled {
+                    self.toggle_background_on_close(cx);
+                }
+                Response::ok(self.control_state(window, cx))
+                    .with_message("Background preference updated")
+            }
+            Command::Onboarding { intent } => {
+                match intent {
+                    OnboardingAction::Start => self.start_onboarding(cx),
+                    OnboardingAction::Next => self.advance_onboarding(cx),
+                    OnboardingAction::Back => self.back_onboarding(cx),
+                    OnboardingAction::Skip => self.skip_onboarding(cx),
+                }
+                Response::ok(self.control_state(window, cx)).with_message("Onboarding updated")
+            }
+            Command::Assistant { intent, text } => match intent {
+                AssistantAction::Ask => {
+                    if self.assistant_busy {
+                        return Response::error(
+                            "The assistant is already answering. Cancel it first.",
+                        );
+                    }
+                    if self.chat_loading.is_some() {
+                        return Response::error("A chat is still loading. Try again.");
+                    }
+                    let Some(text) = text.as_deref().and_then(trim_opt) else {
+                        return Response::error("Ask the assistant with some text.");
+                    };
+                    self.show_assistant(cx);
+                    let input = self.assistant_input.clone();
+                    input.update(cx, |state, cx| state.set_value(&text, window, cx));
+                    self.send_assistant(cx);
+                    Response::ok(self.control_state(window, cx)).with_message("Prompt sent")
+                }
+                AssistantAction::Cancel => {
+                    self.cancel_assistant(cx);
+                    Response::ok(self.control_state(window, cx)).with_message("Assistant cancelled")
+                }
+            },
+            Command::Knowledge { intent } => match intent {
+                KnowledgeAction::Build => {
+                    if self.knowledge_building {
+                        return Response::error(
+                            "A knowledge build is already running. Cancel it first.",
+                        );
+                    }
+                    self.build_knowledge(cx);
+                    Response::ok(self.control_state(window, cx))
+                        .with_message("Knowledge build started")
+                }
+                KnowledgeAction::Cancel => {
+                    self.cancel_knowledge(cx);
+                    Response::ok(self.control_state(window, cx))
+                        .with_message("Knowledge build cancelled")
+                }
+            },
+            Command::Chats { intent } => {
+                match intent {
+                    ChatsAction::Open => {
+                        let open = self
+                            .chats_sheet
+                            .as_ref()
+                            .is_some_and(|sheet| sheet.closing_at.is_none());
+                        if !open {
+                            self.open_chats(window, cx);
+                        }
+                    }
+                    ChatsAction::New => {
+                        if !self.chat_switch_allowed() {
+                            return Response::error(
+                                "Finish or cancel the running answer before starting a new chat.",
+                            );
+                        }
+                        self.new_chat(window, cx);
+                    }
+                    ChatsAction::Close => {
+                        if self.chats_sheet.is_some() {
+                            self.close_chats(window, cx);
+                        }
+                    }
+                }
+                Response::ok(self.control_state(window, cx)).with_message("Chats updated")
+            }
+            Command::Window { .. } => {
+                Response::error("Window commands are handled by the app shell, not the view.")
+            }
+            Command::Quit => Response::error("Quit is handled by the app shell, not the view."),
+        }
+    }
+
+    /// Stable JSON snapshot of everything an agent needs to drive the UI.
+    ///
+    /// Long entry content is capped here; `entry <id>` returns the full text.
+    pub(crate) fn control_state(&self, window: &Window, _cx: &App) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                control_entry_value(
+                    entry,
+                    self.entry_labels.get(&entry.id).copied(),
+                    self.selected.contains(&entry.id),
+                    false,
+                )
+            })
+            .collect();
+        let messages: Vec<serde_json::Value> = self
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": match message.role {
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    },
+                    "text": message.text,
+                    "thinking": message.thinking,
+                    "streaming": message.streaming,
+                    "citations": message
+                        .citations
+                        .iter()
+                        .map(|citation| serde_json::json!({
+                            "n": citation.n,
+                            "label": citation.label.to_string(),
+                            "snippet": citation.snippet.to_string(),
+                            "host": citation.host.to_string(),
+                            "url": citation.url.to_string(),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let chats: Vec<serde_json::Value> = self
+            .chats
+            .iter()
+            .map(|chat| {
+                serde_json::json!({
+                    "id": chat.id,
+                    "title": chat.title.to_string(),
+                    "updated_at": chat.updated_at,
+                })
+            })
+            .collect();
+        let providers: Vec<serde_json::Value> = self
+            .providers
+            .iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "id": provider.id,
+                    "name": provider.name,
+                    "api_key_set": provider.api_key_set,
+                    "oauth_set": provider.oauth_set,
+                    "models_loading": provider.models_loading,
+                    "models_error": provider.models_error,
+                    "groups": provider.groups.iter().map(|group| serde_json::json!({
+                        "id": group.id,
+                        "name": group.name,
+                        "enabled": group.enabled,
+                    })).collect::<Vec<_>>(),
+                    "models": provider.models.iter().map(|model| serde_json::json!({
+                        "id": model.id,
+                        "name": model.name,
+                        "group": model.group,
+                        "api": model.api,
+                        "free": model.free,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let models_error = self
+            .providers
+            .iter()
+            .find_map(|provider| provider.models_error.clone());
+        let entry_modal = self.entry_modal.as_ref().map(|modal| {
+            serde_json::json!({
+                "id": modal.entry_id,
+                "title": modal.title.as_ref().map(|title| title.to_string()),
+                "content": control_clip_content(&modal.content),
+                "editing": self.entry_editing,
+            })
+        });
+        let bounds = window.bounds();
+
+        serde_json::json!({
+            "mode": match self.mode {
+                AppMode::Entries => "entries",
+                AppMode::Assistant => "assistant",
+                AppMode::Settings => "settings",
+            },
+            "settings_tab": self.settings_tab.map(|tab| tab.title().to_lowercase()),
+            "onboarding": {
+                "step": self.onboarding.as_ref().map(|state| match state.step {
+                    OnboardingStep::Welcome => "welcome",
+                    OnboardingStep::Accessibility => "accessibility",
+                    OnboardingStep::Provider => "provider",
+                }),
+                "trusted": self
+                    .onboarding
+                    .as_ref()
+                    .map(|state| state.accessibility_trusted)
+                    .unwrap_or_else(accessibility_trusted),
+            },
+            "entries": entries,
+            "visible_entry_ids": self.visible_entry_ids(),
+            "query": self.query,
+            "sort": {
+                "mode": match self.sort_mode {
+                    SortMode::Time => "time",
+                    SortMode::Alpha => "alpha",
+                    SortMode::Topic => "topic",
+                },
+                "ascending": self.sort_ascending,
+            },
+            "theme": match self.theme_mode {
+                AppThemeMode::Light => "light",
+                AppThemeMode::Dark => "dark",
+                AppThemeMode::System => "system",
+            },
+            "background_on_close": self.background_on_close,
+            "entry_modal": entry_modal,
+            "assistant": {
+                "busy": self.assistant_busy,
+                "chat_id": self.chat_id,
+                "messages": messages,
+                "chats": chats,
+            },
+            "providers": {
+                "active_provider": self.active_provider,
+                "active_model": self.active_model,
+                "loading": self.providers_loading,
+                "models_error": models_error,
+                "providers": providers,
+            },
+            "window": {
+                "bounds": {
+                    "x": f32::from(bounds.origin.x),
+                    "y": f32::from(bounds.origin.y),
+                    "width": f32::from(bounds.size.width),
+                    "height": f32::from(bounds.size.height),
+                },
+                "visible": window.is_visible(),
+            },
+        })
     }
 
     /// Clear/set an input's value via the window handle (inputs need a window).
@@ -3179,6 +3697,93 @@ impl Focusable for WorktableView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Control-surface helpers
+// ---------------------------------------------------------------------------
+
+/// Keep the state snapshot responsive even when one note is megabytes long.
+/// `entry <id>` returns the full body.
+const CONTROL_CONTENT_LIMIT: usize = 4000;
+
+fn control_clip_content(content: &str) -> String {
+    if content.chars().count() > CONTROL_CONTENT_LIMIT {
+        let mut clipped: String = content.chars().take(CONTROL_CONTENT_LIMIT).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        content.to_owned()
+    }
+}
+
+fn control_entry_copy_text(entry: &WorktableEntry) -> String {
+    entry
+        .title
+        .as_deref()
+        .map(|title| format!("{title}\n{}", entry.content))
+        .unwrap_or_else(|| entry.content.clone())
+}
+
+fn control_entry_value(
+    entry: &WorktableEntry,
+    label: Option<EntryLabelColor>,
+    selected: bool,
+    full: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": entry.id,
+        "title": entry.title,
+        "content": if full {
+            entry.content.clone()
+        } else {
+            control_clip_content(&entry.content)
+        },
+        "source": entry.source,
+        "created_at": entry.created_at,
+        "label": label.map(EntryLabelColor::key),
+        "selected": selected,
+    })
+}
+
+fn control_settings_tab(tab: ControlSettingsTab) -> SettingsTab {
+    match tab {
+        ControlSettingsTab::General => SettingsTab::General,
+        ControlSettingsTab::Appearance => SettingsTab::Appearance,
+        ControlSettingsTab::Data => SettingsTab::Data,
+        ControlSettingsTab::Providers => SettingsTab::Providers,
+    }
+}
+
+fn control_sort_mode(mode: ControlSortMode) -> SortMode {
+    match mode {
+        ControlSortMode::Time => SortMode::Time,
+        ControlSortMode::Alpha => SortMode::Alpha,
+        ControlSortMode::Topic => SortMode::Topic,
+    }
+}
+
+fn control_theme_mode(mode: ControlThemeMode) -> AppThemeMode {
+    match mode {
+        ControlThemeMode::Light => AppThemeMode::Light,
+        ControlThemeMode::Dark => AppThemeMode::Dark,
+        ControlThemeMode::System => AppThemeMode::System,
+    }
+}
+
+fn control_label_color(color: LabelColor) -> Option<EntryLabelColor> {
+    match color {
+        LabelColor::Red => Some(EntryLabelColor::Red),
+        LabelColor::Amber => Some(EntryLabelColor::Amber),
+        LabelColor::Green => Some(EntryLabelColor::Green),
+        LabelColor::Blue => Some(EntryLabelColor::Blue),
+        LabelColor::Purple => Some(EntryLabelColor::Purple),
+        LabelColor::None => None,
+    }
+}
+
+fn control_label_key(color: LabelColor) -> Option<&'static str> {
+    control_label_color(color).map(EntryLabelColor::key)
 }
 
 impl Render for WorktableView {

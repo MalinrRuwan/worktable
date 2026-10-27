@@ -7,6 +7,7 @@
 pub(crate) mod actions;
 pub(crate) mod assets;
 pub(crate) mod assistant;
+pub(crate) mod control;
 pub(crate) mod design;
 mod entry_actions;
 pub(crate) mod format;
@@ -23,6 +24,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -32,6 +34,7 @@ use gpui::{
 };
 use gpui_component::{Root, ThemeRegistry};
 use tokio::runtime::Runtime;
+use worktable_control::Command;
 use worktable_view::WorktableView;
 
 use crate::service::{AppCommand, WorktableService};
@@ -39,6 +42,11 @@ use crate::service::{AppCommand, WorktableService};
 /// Global handle to the main view so commands (status item) can reach it.
 struct MainView(gpui::Entity<WorktableView>);
 impl gpui::Global for MainView {}
+
+/// Global handle to the shell window so the control socket can run
+/// window-level commands (show/hide/focus) without reaching into the view.
+struct MainWindow(gpui::AnyWindowHandle);
+impl gpui::Global for MainWindow {}
 
 fn main() -> anyhow::Result<()> {
     let tokio = Arc::new(Runtime::new().context("failed to create Worktable Tokio runtime")?);
@@ -136,6 +144,9 @@ fn main() -> anyhow::Result<()> {
             }
         })
         .detach();
+
+        // Local control socket for `worktable-cli` and agent automation.
+        start_control(cx, service.clone(), visible.clone());
 
         cx.activate(true);
     });
@@ -251,6 +262,148 @@ fn app_menus() -> Vec<Menu> {
     ]
 }
 
+/// Start the local control socket when `WORKTABLE_CONTROL_SOCKET` is set and
+/// drive its requests on the GPUI main thread.
+fn start_control(cx: &mut App, service: Arc<WorktableService>, visible: Arc<AtomicBool>) {
+    let Some((mut requests, socket)) = control::start_from_env() else {
+        return;
+    };
+    cx.spawn(move |cx: &mut AsyncApp| {
+        let cx = cx.clone();
+        async move {
+            while let Some(request) = requests.recv().await {
+                let quit = matches!(request.command, Command::Quit);
+                let response =
+                    cx.update(|cx| execute_control(request.command, cx, &visible, &service));
+                let _ = request.reply.send(response);
+                if quit {
+                    control::remove_socket(&socket);
+                    // Let the socket thread flush the Quit reply before the
+                    // process, window, and service shut down.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    cx.update(|cx| cx.quit());
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// Execute one control command on the app thread.
+fn execute_control(
+    command: Command,
+    cx: &mut App,
+    visible: &Arc<AtomicBool>,
+    service: &Arc<WorktableService>,
+) -> worktable_control::Response {
+    use worktable_control::{Response, WindowAction};
+
+    match command {
+        Command::Ping => Response::ok(serde_json::json!({ "ready": true })).with_message("pong"),
+        Command::Window { intent } => match intent {
+            WindowAction::Show => {
+                // Reuses the status-item paths: restore the Dock tile, unhide,
+                // activate, then focus the window itself.
+                open_window(cx, visible, service);
+                if cx.windows().is_empty() {
+                    return Response::error("The Worktable window could not be opened.");
+                }
+                focus_main_window(cx);
+                control_window_response(cx, "Window shown", None)
+            }
+            WindowAction::Hide => {
+                visible.store(false, Ordering::SeqCst);
+                cx.hide();
+                control_window_response(cx, "Window hidden", Some(false))
+            }
+            WindowAction::Focus => {
+                visible.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "macos")]
+                status_item::restore_dock_and_unhide();
+                cx.activate(true);
+                focus_main_window(cx);
+                control_window_response(cx, "Window focused", None)
+            }
+        },
+        Command::Quit => Response::ok(serde_json::json!({})).with_message("Quitting"),
+        command => execute_view_control(command, cx),
+    }
+}
+
+/// Run one view-level command against the real `WorktableView`.
+fn execute_view_control(command: Command, cx: &mut App) -> worktable_control::Response {
+    use worktable_control::Response;
+
+    let Some(window) = cx.try_global::<MainWindow>().map(|main| main.0) else {
+        return Response::error("The Worktable window is not open. Run `window show` first.");
+    };
+    let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) else {
+        return Response::error("The Worktable view is not ready yet.");
+    };
+    match window.update(cx, |_, window, cx| {
+        view.update(cx, |this, cx| this.control(command, window, cx))
+    }) {
+        Ok(response) => response,
+        Err(error) => Response::error(format!("The Worktable window is not available: {error}")),
+    }
+}
+
+/// Window commands return the full view snapshot when the view exists, with
+/// the requested visibility forced for Hide (the platform flag can lag a
+/// frame); fall back to the shell's window-only object when it does not.
+fn control_window_response(
+    cx: &mut App,
+    message: &str,
+    force_visible: Option<bool>,
+) -> worktable_control::Response {
+    let mut state = execute_view_control(Command::State, cx).state;
+    if !state.is_object() {
+        state = control_window_state(cx);
+    }
+    if let Some(visible) = force_visible {
+        state["window"]["visible"] = serde_json::json!(visible);
+    }
+    worktable_control::Response::ok(state).with_message(message)
+}
+
+fn focus_main_window(cx: &mut App) {
+    let Some(window) = cx.try_global::<MainWindow>().map(|main| main.0) else {
+        return;
+    };
+    let _ = window.update(cx, |_, window, _| window.activate_window());
+}
+
+fn control_window_state(cx: &mut App) -> serde_json::Value {
+    let Some(window) = cx.try_global::<MainWindow>().map(|main| main.0) else {
+        return serde_json::json!({
+            "window": { "bounds": serde_json::Value::Null, "visible": false }
+        });
+    };
+    window
+        .update(cx, |_, window, _| {
+            let bounds = window.bounds();
+            serde_json::json!({
+                "window": {
+                    "bounds": {
+                        "x": f32::from(bounds.origin.x),
+                        "y": f32::from(bounds.origin.y),
+                        "width": f32::from(bounds.size.width),
+                        "height": f32::from(bounds.size.height),
+                    },
+                    "visible": window.is_visible(),
+                }
+            })
+        })
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "window": { "bounds": serde_json::Value::Null, "visible": false }
+            })
+        })
+}
+
 /// Handle a command from the macOS status item.
 fn handle_command(
     command: AppCommand,
@@ -321,7 +474,7 @@ fn open_main_window(
     visible: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     visible.store(true, Ordering::SeqCst);
-    cx.open_window(
+    let window = cx.open_window(
         WindowOptions {
             // A portrait 3:4 window: the reading column stays centered and
             // the minimum keeps the composer usable.
@@ -364,5 +517,6 @@ fn open_main_window(
             cx.new(|cx| Root::new(view, window, cx))
         },
     )?;
+    cx.set_global(MainWindow(window.into()));
     Ok(())
 }

@@ -78,6 +78,8 @@ crates/
 │   └── src/bin/worktable_visual_test.rs  # Real Metal off-screen capture runner
 ├── worktable-ui/      # Motion kit + agent UI components (orbs, thinking state, streaming text, citations)
 ├── worktable-ai/      # rig-backed agent runtime, provider catalog, opencode-go provider
+├── worktable-cli/     # Agent-friendly CLI: starts the real app and drives the control socket
+├── worktable-control/ # Typed local control protocol + Unix-socket client (no GPUI)
 ├── worktable-db/      # SQLite store (native) + in-memory store (wasm)
 ├── worktable-events/  # Cross-thread event types
 └── worktable-helix/   # Embedded JSON knowledge graph + topic extraction
@@ -562,6 +564,60 @@ The pinned GPUI Component revision leaks the menu entity through a refcount
 cycle in its dismiss subscription, so GPUI's leak detector fails the test even
 though app state is correct. Context-menu commands are covered through their
 keyboard equivalents; re-enable a direct test when the dependency is upgraded.
+
+## Agent CLI
+
+`worktable-cli` + `worktable-control` are the automation surface. They exist so
+an agent can exercise every user-facing page and action from a shell without
+duplicating app state.
+
+- **The app is the source of truth.** The CLI never opens SQLite, never writes
+  entries or chat snapshots, and never runs a second executor. It sends typed
+  commands; `WorktableView::control` executes them through the same methods as
+  buttons, menus, and keybindings. `start` seeds notes with `add-note` and
+  dismisses the tour with `onboarding skip`; it does not pre-write config.
+- **Local only and opt-in.** The app starts the control server only when
+  `WORKTABLE_CONTROL_SOCKET` is set, binds a Unix-domain socket, sets `0600`
+  permissions, removes a stale path only when nothing answers on it, and accepts
+  one JSON request per connection on a background thread. There is no TCP
+  listener and no network protocol. Work runs on the GPUI thread; window
+  show/hide/focus and quit stay in `main.rs` because the shell owns window
+  visibility and process exit.
+- **Typed protocol, stable state.** `Command` is internally tagged with
+  kebab-case `action`; nested action enums use `intent`. `Response` carries
+  `ok`, optional `error`/`message`, and a JSON `state`. `control_state` owns the
+  documented snapshot (`mode`, `settings_tab`, `onboarding`, `entries`, `query`,
+  `sort`, `theme`, `background_on_close`, `entry_modal`, `assistant`,
+  `providers`, `window`, plus `visible_entry_ids` for the filtered on-screen
+  order). Long content is capped at 4000 characters; `entry <id>` returns the
+  full body.
+- **Back is ordered.** Entry detail → chats → onboarding step → settings
+  category → settings list → Entries → Assistant → Entries.
+- **Adding a command** means updating the protocol enum and serde tests in
+  `worktable-control`, `WorktableView::control` (reusing the existing action
+  method), the CLI subcommand + parser test, the control-surface tests in
+  `worktable_view_tests.rs`, and `docs/cli.md`. Do not add GPUI to
+  `worktable-control`.
+- **Tests never call a provider.** Control tests drive the real view through
+  `VisualTestContext`; assistant and knowledge commands stop at the app's
+  existing not-configured / no-provider paths. The smoke test
+  (`scripts/cli-smoke.sh`) launches the real app on an isolated data directory
+  and asserts JSON with Python.
+- **Screenshots are real captures.** `screenshot` focuses the window, reads
+  `window.bounds`, and runs `screencapture -x -R...`. If macOS denies Screen
+  Recording or the display is asleep/locked, the command exits 1 with the exact
+  `screencapture` error; never substitute a placeholder image.
+
+```sh
+cargo build -p worktable-app -p worktable-cli
+./target/debug/worktable-cli start --seed '["A note"]'
+./target/debug/worktable-cli state
+./target/debug/worktable-cli stop
+sh scripts/cli-smoke.sh
+```
+
+Full command set, state schema, raw protocol, and agent recipes:
+[`docs/cli.md`](docs/cli.md).
 
 ## Debug builds
 

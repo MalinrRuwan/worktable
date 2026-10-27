@@ -1,0 +1,16 @@
+[package]
+name = "worktable-cli"
+version = "1.3.0"
+edition = "2024"
+license = "MIT"
+description = "Agent-friendly command line for driving the Worktable app"
+
+[[bin]]
+name = "worktable-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worktable-control = { path = "../worktable-control" }

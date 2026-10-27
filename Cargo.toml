@@ -2,6 +2,8 @@
 members = [
   "crates/worktable-ai",
   "crates/worktable-app",
+  "crates/worktable-cli",
+  "crates/worktable-control",
   "crates/worktable-db",
   "crates/worktable-events",
   "crates/worktable-helix",

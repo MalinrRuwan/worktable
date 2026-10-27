@@ -78,6 +78,25 @@ cargo run -p worktable-app
 Rustup selects the pinned toolchain automatically. The first build takes longer
 while it compiles the native UI dependencies.
 
+### Drive the app from a shell or agent
+
+`worktable-cli` starts the real app with an isolated data directory and drives
+the same controls a person uses through a local Unix socket:
+
+```sh
+cargo build -p worktable-app -p worktable-cli
+./target/debug/worktable-cli start --seed '["Remember the milk"]'
+./target/debug/worktable-cli state
+./target/debug/worktable-cli screenshot
+./target/debug/worktable-cli stop
+```
+
+The control socket exists only when `WORKTABLE_CONTROL_SOCKET` is set, uses
+owner-only permissions, and never listens on the network. Commands print JSON,
+so scripts and agents can inspect the app after every action. See
+[`docs/cli.md`](docs/cli.md) for the full command set, state shape, raw
+protocol, and screenshot permission notes.
+
 ### Make it yours
 
 1. **Take the welcome tour.** Every step is skippable, and you can replay it
@@ -156,6 +175,8 @@ One native app, with a small Rust workspace:
 | Crate | Responsibility |
 | --- | --- |
 | [`worktable-app`](crates/worktable-app/) | macOS shell, main view, settings, capture, and service orchestration |
+| [`worktable-cli`](crates/worktable-cli/) | Agent-friendly CLI that starts and drives the real app |
+| [`worktable-control`](crates/worktable-control/) | Typed local control protocol and Unix-socket client |
 | [`worktable-ui`](crates/worktable-ui/) | Shared motion, activity indicators, streaming text, and interactive citations |
 | [`worktable-ai`](crates/worktable-ai/) | Rig-backed assistant, providers, model discovery, and cancellation |
 | [`worktable-db`](crates/worktable-db/) | SQLite persistence for the native app |
@@ -210,6 +231,9 @@ Visual snapshots complement interaction tests; they do not replace them.
 | Variable | Purpose |
 | --- | --- |
 | `WORKTABLE_DB_PATH` | Use a different database file |
+| `WORKTABLE_MEDIA_DIR` | Use a different imported-image library |
+| `WORKTABLE_CONTROL_SOCKET` | Enable the local control socket at this path |
+| `WORKTABLE_APP_BIN` | App binary used by `worktable-cli start` |
 | `WORKTABLE_THEMES_DIR` | Watch a different directory for development theme overrides |
 | `RUST_LOG` | Configure logging, for example `worktable=debug` |
 

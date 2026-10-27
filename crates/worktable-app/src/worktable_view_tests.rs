@@ -22,6 +22,10 @@ use gpui::{
 };
 use gpui_component::Root;
 use worktable_ai::WorktableEntry;
+use worktable_control::{
+    Command, LabelColor, OnboardingAction, Page, Response, SettingsTab as ControlSettingsTab,
+    SortMode as ControlSortMode, ThemeMode as ControlThemeMode,
+};
 use worktable_db::EntryLabelColor;
 
 use super::{AppMode, SortMode, WorktableView};
@@ -1069,6 +1073,34 @@ fn wait_for_providers(cx: &mut VisualTestContext, view: &Entity<WorktableView>, 
     wait_for(cx, secs, |cx| {
         cx.read_entity(view, |v, _| !v.providers.is_empty())
     })
+}
+
+/// Execute one local control command against the real view.
+fn control(cx: &mut VisualTestContext, view: &Entity<WorktableView>, command: Command) -> Response {
+    cx.update(|window, cx| view.update(cx, |this, cx| this.control(command, window, cx)))
+}
+
+/// Execute a control command that must succeed.
+fn control_ok(
+    cx: &mut VisualTestContext,
+    view: &Entity<WorktableView>,
+    command: Command,
+) -> Response {
+    let response = control(cx, view, command);
+    assert!(response.ok, "control failed: {:?}", response.error);
+    response
+}
+
+/// Read the documented state snapshot.
+fn control_state(cx: &mut VisualTestContext, view: &Entity<WorktableView>) -> serde_json::Value {
+    cx.update(|window, cx| cx.read_entity(view, |this, cx| this.control_state(window, cx)))
+}
+
+fn state_entry<'a>(state: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
+    state["entries"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["id"] == id)
 }
 
 fn focus_view(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
@@ -5832,4 +5864,655 @@ fn onboarding_check_again_skip_each_step_and_persist(cx: &mut TestAppContext) {
         wait_for_config(&provider_db, "onboarding_completed", "1"),
         "skipping Provider persists completion"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Local control surface
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn control_state_reports_the_documented_shape(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Label {
+            id: Some("test-1000".into()),
+            color: LabelColor::Red,
+        },
+    );
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            control_state(cx, &view)["onboarding"]["step"].is_null()
+        }),
+        "a seeded database opens without the tour"
+    );
+
+    let state = control_state(&mut cx, &view);
+    assert_eq!(state["mode"], "entries");
+    assert!(state["settings_tab"].is_null());
+    assert!(state["onboarding"]["trusted"].is_boolean());
+    let entries = state["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 3);
+    let entry = state_entry(&state, "test-1000").expect("seeded entry");
+    assert_eq!(entry["title"], serde_json::Value::Null);
+    assert!(entry["content"].as_str().unwrap().contains("Negation"));
+    assert_eq!(entry["source"], "Worktable");
+    assert!(entry["created_at"].is_number());
+    assert_eq!(entry["label"], "red");
+    assert_eq!(entry["selected"], false);
+    assert_eq!(state["query"], "");
+    assert_eq!(state["sort"]["mode"], "time");
+    assert_eq!(state["sort"]["ascending"], false);
+    assert_eq!(state["theme"], "system");
+    assert_eq!(state["background_on_close"], true);
+    assert!(state["entry_modal"].is_null());
+    assert!(state["assistant"]["busy"].is_boolean());
+    assert!(state["assistant"]["chat_id"].is_null());
+    assert!(state["assistant"]["messages"].is_array());
+    assert!(state["assistant"]["chats"].is_array());
+    assert!(state["providers"]["providers"].is_array());
+    assert!(state["providers"]["loading"].is_boolean());
+    assert!(state["window"]["bounds"]["x"].is_number());
+    assert!(state["window"]["bounds"]["y"].is_number());
+    assert!(state["window"]["bounds"]["width"].is_number());
+    assert!(state["window"]["bounds"]["height"].is_number());
+    assert!(state["window"]["visible"].is_boolean());
+}
+
+#[gpui::test]
+fn control_navigates_pages_settings_and_back(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Page {
+            page: Page::Assistant,
+        },
+    );
+    assert_eq!(response.state["mode"], "assistant");
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Assistant);
+
+    let response = control_ok(&mut cx, &view, Command::Settings { tab: None });
+    assert_eq!(response.state["mode"], "settings");
+    assert!(response.state["settings_tab"].is_null());
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Settings {
+            tab: Some(ControlSettingsTab::Providers),
+        },
+    );
+    assert_eq!(response.state["settings_tab"], "providers");
+
+    // One Back leaves the category page, the next leaves Settings.
+    let response = control_ok(&mut cx, &view, Command::Back);
+    assert_eq!(response.state["mode"], "settings");
+    assert!(response.state["settings_tab"].is_null());
+    let response = control_ok(&mut cx, &view, Command::Back);
+    assert_eq!(response.state["mode"], "entries");
+
+    // Back from Assistant returns to Entries.
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Page {
+            page: Page::Assistant,
+        },
+    );
+    let response = control_ok(&mut cx, &view, Command::Back);
+    assert_eq!(response.state["mode"], "entries");
+    assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Entries);
+}
+
+#[gpui::test]
+fn control_adds_note_searches_and_clears(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::AddNote {
+            content: "Control needle for the agent".into(),
+            title: Some("Agent note".into()),
+        },
+    );
+    let id = response.state["result"]["id"]
+        .as_str()
+        .expect("add-note returns the queued id")
+        .to_owned();
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| v.entries.iter().any(|entry| entry.id == id))
+        }),
+        "the note lands in the real view"
+    );
+    let state = control_state(&mut cx, &view);
+    let entry = state_entry(&state, &id).expect("new note in state");
+    assert_eq!(entry["content"], "Control needle for the agent");
+    assert_eq!(entry["title"], "Agent note");
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Search {
+            query: "needle".into(),
+        },
+    );
+    assert_eq!(response.state["query"], "needle");
+    let visible = cx.read_entity(&view, |v, _| {
+        v.visible_entries()
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(visible, vec![id.clone()], "search filters the real list");
+    assert_eq!(
+        cx.update(|_, cx| { view.read(cx).search_input.read(cx).value().to_string() }),
+        "needle"
+    );
+
+    let response = control_ok(&mut cx, &view, Command::ClearSearch);
+    assert_eq!(response.state["query"], "");
+    assert!(
+        cx.read_entity(&view, |v, _| v.visible_entries().len()) >= 4,
+        "clearing search restores every entry"
+    );
+}
+
+#[gpui::test]
+fn control_selects_opens_and_closes_entries(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Select {
+            id: "test-900".into(),
+            extend: false,
+        },
+    );
+    let entry = state_entry(&response.state, "test-900").expect("selected entry");
+    assert_eq!(entry["selected"], true);
+    assert!(
+        cx.read_entity(&view, |v, _| v.selected.contains("test-900")),
+        "select updates the real selection"
+    );
+
+    // Open defaults to the selection and renders the real detail overlay.
+    let response = control_ok(&mut cx, &view, Command::Open { id: None });
+    assert_eq!(response.state["entry_modal"]["id"], "test-900");
+    assert_eq!(response.state["entry_modal"]["editing"], false);
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v
+            .entry_modal
+            .as_ref()
+            .map(|modal| modal.entry_id.clone())),
+        Some("test-900".to_owned())
+    );
+
+    control_ok(&mut cx, &view, Command::Close);
+    cx.background_executor
+        .advance_clock(worktable_ui::MORPH_CLOSE.total() + std::time::Duration::from_millis(30));
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |v, _| v.entry_modal.is_none()),
+        "close unmounts the detail view"
+    );
+    assert!(control_state(&mut cx, &view)["entry_modal"].is_null());
+}
+
+#[gpui::test]
+fn control_labels_copies_sorts_and_switches_theme(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Label {
+            id: Some("test-1000".into()),
+            color: LabelColor::Amber,
+        },
+    );
+    assert_eq!(
+        state_entry(&response.state, "test-1000").unwrap()["label"],
+        "amber"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        Some(EntryLabelColor::Amber)
+    );
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Label {
+            id: Some("test-1000".into()),
+            color: LabelColor::None,
+        },
+    );
+    assert!(state_entry(&response.state, "test-1000").unwrap()["label"].is_null());
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Select {
+            id: "test-1000".into(),
+            extend: false,
+        },
+    );
+    let response = control_ok(&mut cx, &view, Command::Copy { id: None });
+    let text = response.state["result"]["text"]
+        .as_str()
+        .expect("copy returns the text");
+    assert!(text.contains("Negation"));
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some(text.to_owned())
+    );
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Sort {
+            mode: ControlSortMode::Alpha,
+            ascending: Some(true),
+        },
+    );
+    let ids = cx.read_entity(&view, |v, _| {
+        v.visible_entries()
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids, vec!["test-800", "test-1000", "test-900"]);
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Sort {
+            mode: ControlSortMode::Alpha,
+            ascending: Some(false),
+        },
+    );
+    let ids = cx.read_entity(&view, |v, _| {
+        v.visible_entries()
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids, vec!["test-900", "test-1000", "test-800"]);
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Theme {
+            mode: ControlThemeMode::Dark,
+        },
+    );
+    assert_eq!(response.state["theme"], "dark");
+    let response = control_ok(&mut cx, &view, Command::ToggleTheme);
+    assert_eq!(response.state["theme"], "light");
+
+    let response = control_ok(&mut cx, &view, Command::Background { enabled: false });
+    assert_eq!(response.state["background_on_close"], false);
+    let response = control_ok(&mut cx, &view, Command::Background { enabled: true });
+    assert_eq!(response.state["background_on_close"], true);
+}
+
+#[gpui::test]
+fn control_edits_the_open_entry(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Open {
+            id: Some("test-900".into()),
+        },
+    );
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Edit {
+            content: "# Edited through control\n\nA new body.".into(),
+        },
+    );
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.entries.iter().any(|entry| {
+                    entry.id == "test-900"
+                        && entry.content == "# Edited through control\n\nA new body."
+                })
+            })
+        }),
+        "Edit persists the markdown through the same path as the Save button"
+    );
+    let state = control_state(&mut cx, &view);
+    assert_eq!(
+        state["entry_modal"]["content"],
+        "# Edited through control\n\nA new body."
+    );
+    assert_eq!(state["entry_modal"]["editing"], false);
+}
+
+#[gpui::test]
+fn control_deletes_entries(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Select {
+            id: "test-800".into(),
+            extend: false,
+        },
+    );
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Select {
+            id: "test-900".into(),
+            extend: true,
+        },
+    );
+    let response = control_ok(&mut cx, &view, Command::Delete { id: None });
+    assert_eq!(
+        response.state["result"]["ids"].as_array().unwrap().len(),
+        2,
+        "the whole multi-selection is deleted"
+    );
+    assert!(state_entry(&response.state, "test-800").is_none());
+    assert!(state_entry(&response.state, "test-900").is_none());
+    assert!(state_entry(&response.state, "test-1000").is_some());
+
+    // An explicit id deletes just that entry.
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Delete {
+            id: Some("test-1000".into()),
+        },
+    );
+    assert!(state_entry(&response.state, "test-1000").is_none());
+    assert!(
+        cx.read_entity(&view, |v, _| v.entries.is_empty()),
+        "all seeded entries are gone"
+    );
+}
+
+#[gpui::test]
+fn control_onboarding_can_be_stepped_and_skipped(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = seeded_db_with_config(sample_entries(), false);
+    let (view, window) = setup_view_with_db(cx, db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| v.onboarding.is_some())
+        }),
+        "a fresh database opens the tour"
+    );
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Start,
+        },
+    );
+    assert_eq!(response.state["onboarding"]["step"], "welcome");
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Next,
+        },
+    );
+    assert_eq!(response.state["onboarding"]["step"], "accessibility");
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Back,
+        },
+    );
+    assert_eq!(response.state["onboarding"]["step"], "welcome");
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Next,
+        },
+    );
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Next,
+        },
+    );
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Onboarding {
+            intent: OnboardingAction::Skip,
+        },
+    );
+    assert!(response.state["onboarding"]["step"].is_null());
+    assert!(
+        wait_for(&mut cx, 5, |_| {
+            config_value(&db, "onboarding_completed").as_deref() == Some("1")
+        }),
+        "skipping through control persists completion"
+    );
+}
+
+#[gpui::test]
+fn control_caps_long_state_but_entry_returns_everything(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let long = "lorem ipsum ".repeat(500);
+    let db = seeded_db(vec![WorktableEntry {
+        id: "long-control".into(),
+        content: long.clone(),
+        title: Some("Long note".into()),
+        source: "Worktable".into(),
+        created_at: 1_000,
+    }]);
+    let (view, window) = setup_view_with_db(cx, db, TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| v.entries.len() == 1)
+        }),
+        "the long note loads"
+    );
+
+    let state = control_state(&mut cx, &view);
+    let clipped = state_entry(&state, "long-control").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        clipped.chars().count(),
+        super::CONTROL_CONTENT_LIMIT + 1,
+        "state caps long content"
+    );
+    assert!(clipped.ends_with('…'));
+
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Entry {
+            id: "long-control".into(),
+        },
+    );
+    assert_eq!(response.state["result"]["entry"]["content"], long);
+    assert_eq!(response.state["result"]["entry"]["title"], "Long note");
+}
+
+#[gpui::test]
+fn control_imports_images_through_the_media_library(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let source = std::env::temp_dir().join(format!(
+        "worktable-control-image-{}.png",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&source, TEST_PNG).unwrap();
+    let db = seeded_db(Vec::new());
+    let media_dir = std::path::Path::new(&db)
+        .parent()
+        .expect("test database has a parent")
+        .join("media");
+    let (view, window) = setup_view_with_db(cx, db, TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    control_ok(
+        &mut cx,
+        &view,
+        Command::AddImage {
+            path: source.to_string_lossy().into_owned(),
+        },
+    );
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| {
+                v.entries.iter().any(|entry| {
+                    entry
+                        .content
+                        .starts_with(&media_dir.to_string_lossy().into_owned())
+                })
+            })
+        }),
+        "the imported image lands in the media library"
+    );
+    let state = control_state(&mut cx, &view);
+    let entry = state["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["content"].as_str().unwrap().ends_with(".png"))
+        .expect("image entry");
+    let path = entry["content"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "the media library path exists: {path}"
+    );
+    assert_eq!(entry["source"], "Selection");
+}
+
+#[gpui::test]
+fn control_assistant_and_chats_follow_the_view(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    // No provider is configured in the hermetic service: the prompt still
+    // lands in the transcript with the app's setup explanation, and the test
+    // never touches a network.
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Assistant {
+            intent: worktable_control::AssistantAction::Ask,
+            text: Some("What did I save?".into()),
+        },
+    );
+    assert_eq!(response.state["mode"], "assistant");
+    assert_eq!(response.state["assistant"]["busy"], false);
+    let messages = response.state["assistant"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["text"], "What did I save?");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(
+        messages[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("isn't configured")
+    );
+
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| {
+                !v.chat_save_pending && v.chat_save_error.is_none()
+            })
+        }),
+        "the draft transcript saves before switching chats"
+    );
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Chats {
+            intent: worktable_control::ChatsAction::Open,
+        },
+    );
+    assert!(cx.read_entity(&view, |v, _| v.chats_sheet.is_some()));
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Chats {
+            intent: worktable_control::ChatsAction::New,
+        },
+    );
+    assert!(
+        cx.read_entity(&view, |v, _| v.messages.is_empty()),
+        "New chat clears the draft transcript"
+    );
+    control_ok(
+        &mut cx,
+        &view,
+        Command::Chats {
+            intent: worktable_control::ChatsAction::Close,
+        },
+    );
+
+    // Cancelling when nothing is running is a harmless no-op.
+    let response = control_ok(
+        &mut cx,
+        &view,
+        Command::Assistant {
+            intent: worktable_control::AssistantAction::Cancel,
+            text: None,
+        },
+    );
+    assert_eq!(response.state["assistant"]["busy"], false);
 }

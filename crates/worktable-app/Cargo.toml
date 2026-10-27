@@ -25,6 +25,7 @@ gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
 worktable-ai = { path = "../worktable-ai" }
+worktable-control = { path = "../worktable-control" }
 worktable-db = { path = "../worktable-db" }
 worktable-events = { path = "../worktable-events" }
 worktable-ui = { path = "../worktable-ui" }
