@@ -5647,9 +5647,13 @@ fn cancelled_run_shows_the_aborted_message(cx: &mut TestAppContext) {
     assert!(!busy, "a cancelled run clears the busy state");
     let last = last.expect("the transcript ends with a message");
     assert!(
-        last.text.contains(worktable_ai::ABORTED_BY_USER),
-        "the cancelled run reports why it stopped, got: {}",
+        last.text.contains("The answer was stopped"),
+        "the cancelled run reports that it stopped, got: {}",
         last.text
+    );
+    assert!(
+        !last.text.contains(worktable_ai::ABORTED_BY_USER),
+        "the raw runtime string must not reach the transcript"
     );
 }
 
@@ -5695,6 +5699,51 @@ fn free_model_failure_shows_recovery_copy(cx: &mut TestAppContext) {
             .as_ref()
             .is_some_and(|message| message.text.contains("FreeUsageLimitError")),
         "the raw gateway error must not reach the transcript"
+    );
+}
+
+#[gpui::test]
+fn assistant_generic_failure_hides_the_raw_error(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.chat_id = Some("generic-failure".to_owned());
+        this.messages = vec![crate::assistant::ChatMessage::user("Ask")];
+        this.assistant_busy = true;
+        this.on_event(
+            &worktable_events::WorktableEvent::AiRunFailed {
+                request_id: "req".to_owned(),
+                session_id: "generic-failure".to_owned(),
+                run_id: "run".to_owned(),
+                error: "socket closed: internal detail 47".to_owned(),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let (status, last) = cx.read_entity(&view, |v, _| {
+        (v.settings_status.clone(), v.messages.last().cloned())
+    });
+    assert_eq!(
+        status.as_deref(),
+        Some("The assistant couldn't finish. Check the provider settings and try again.")
+    );
+    assert!(
+        last.as_ref()
+            .is_some_and(|message| message.text.contains("Check the provider settings")),
+        "the transcript should carry recovery copy"
+    );
+    assert!(
+        !last
+            .as_ref()
+            .is_some_and(|message| message.text.contains("internal detail 47")),
+        "the raw backend error must not reach the transcript"
     );
 }
 

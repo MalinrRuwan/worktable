@@ -990,7 +990,9 @@ impl WorktableView {
                     }
                     Err(error) => {
                         crate::logging::error(format!("failed to fetch GitHub stars: {error}"));
-                        this.github_error = Some(error);
+                        this.github_error = Some(
+                            "Couldn't fetch stars. Check the username and try again.".to_owned(),
+                        );
                     }
                 }
                 cx.notify();
@@ -2357,6 +2359,14 @@ impl WorktableView {
     fn apply_snapshot(&mut self, snapshot: &ProvidersSnapshot) {
         self.providers_loading = false;
         self.providers = snapshot.providers.clone();
+        for provider in &self.providers {
+            if let Some(error) = &provider.models_error {
+                crate::logging::error(format!(
+                    "model discovery failed for {}: {error}",
+                    provider.name
+                ));
+            }
+        }
         self.active_provider = snapshot.active_provider.clone();
         self.active_model = snapshot.active_model.clone();
         // Drop any api-key entry row that no longer exists.
@@ -5466,10 +5476,12 @@ fn render_settings(
         .providers
         .iter()
         .filter_map(|provider| {
-            provider
-                .models_error
-                .as_ref()
-                .map(|error| format!("{}: {error}", provider.name))
+            provider.models_error.as_ref().map(|_| {
+                format!(
+                    "{}: Couldn't load models. Check the key and retry.",
+                    provider.name
+                )
+            })
         })
         .collect();
     let mut providers_section = v_flex()
@@ -6547,13 +6559,21 @@ fn report_knowledge_status(
 /// OpenCode free-tier gate: its JSON error is noise to a Worktable user, so
 /// say which models Worktable can actually call.
 fn friendly_ai_error(error: &str) -> String {
-    if error.contains("FreeUsageLimitError")
-        || error.to_ascii_lowercase().contains("free usage limit")
-    {
+    let lower = error.to_ascii_lowercase();
+    if error == worktable_ai::ABORTED_BY_USER {
+        "The answer was stopped.".to_owned()
+    } else if error.contains("FreeUsageLimitError") || lower.contains("free usage limit") {
         "This free model only works in the OpenCode app. Choose a paid model or OpenCode Go."
             .to_owned()
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+    {
+        "The provider rejected the request. Check the key and model in Settings.".to_owned()
     } else {
-        error.to_owned()
+        "The assistant couldn't finish. Check the provider settings and try again.".to_owned()
     }
 }
 
