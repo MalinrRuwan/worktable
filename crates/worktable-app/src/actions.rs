@@ -17,6 +17,8 @@ actions!(
         ShowAssistant,
         /// Open the AI provider settings panel (⌘,)
         ShowSettings,
+        /// Check GitHub for a newer stable release
+        CheckForUpdates,
         /// Delete the selected entry (⌫)
         DeleteEntry,
         /// Open the selected entry (⏎ / ⌘O)

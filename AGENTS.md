@@ -118,10 +118,19 @@ button — the search field doubles as the prompt box: Enter sends the query to
 the agent (switching pages). The menu carries Settings, the sort modes (the
 checked item shows the active mode and direction; choosing it again flips
 direction), and Quit. A native macOS menu bar mirrors the keymap: the app menu
-(About, Settings ⌘,, Services, Hide/Hide Others/Show All, Quit), Edit
-(standard text actions), View (Entries, Assistant, Toggle Theme), and Window
-(Minimize, Zoom). There is no New Note command anywhere — the note bar is the
-only way to add a note, so no menu item or shortcut implies otherwise.
+(About, Settings ⌘,, **Check for Updates…**, Services, Hide/Hide Others/Show
+All, Quit), Edit (standard text actions), View (Entries, Assistant, Toggle
+Theme), and Window (Minimize, Zoom). There is no New Note command anywhere —
+the note bar is the only way to add a note, so no menu item or shortcut implies
+otherwise.
+
+**Check for Updates…** asks the public GitHub API for
+`MalinrRuwan/worktable`'s latest stable release (never a pre-release), compares
+semantic versions, and opens a dialog that can download the DMG, verify its
+published SHA-256 and signature, stage the app, and hand the replacement to a
+detached helper. Installed copies replace their own bundle, quit, and reopen;
+a build-folder copy only gets the release-page path. The download never strips
+quarantine or asks for an administrator.
 
 List keyboard commands are **mode-scoped**: `open_selected`, `delete_selected`,
 copy/link commands, and arrow navigation only act on the Library page with no
@@ -205,13 +214,14 @@ treatment. The card's accessible name names the color rather than relying on
 color alone. Labels are presentation metadata, never entry content: the card
 context menu shows a horizontal row of five theme-colored dots below the copy
 actions, choosing the active dot clears the label, and there is no separate
-Clear label item. The color row is a disabled menu item, so the menu's row
-hover never paints; each dot brightens on hover and dispatches Escape after a
-click so the menu still closes. The choice applies only to the right-clicked
-entry even when several are selected. With an entry selected, the library menu
-exposes the same five checked color items as the keyboard path. Copy as list is
-hidden for a single entry. Deleting an entry removes its label in the same
-transaction.
+Clear label item. The color row is centered in the menu, is a disabled menu
+item, and takes no row hover; each dot brightens on hover. The row is a small
+entity that observes the view, so the tick moves (or disappears) immediately
+while the menu stays open instead of only after reopening it. The choice
+applies only to the right-clicked entry even when several are selected. The
+library menu does **not** carry label commands. Copy as list is hidden for a
+single entry. Deleting an entry removes its label in the same transaction and
+drops its cached color-row entity.
 
 A new entry enters from the top with the list's push-down entrance: the
 existing rows start one card higher (their pre-insert places) and glide down
@@ -221,7 +231,11 @@ arms the window; render reads it through `list_insert_at`/`recent_entry_id`.
 
 The note bar under the list is always the input itself — no first click opens
 a composer. It is `[＋ note input ✓]`: the plus opens the system image picker
-(`App::prompt_for_paths`) and the tick (or Enter/⌘⏎) adds the note. Entry content has **no category attribute**: the legacy `kind`
+(`App::prompt_for_paths`) and the tick (or Enter/⌘⏎) adds the note. The field is
+a `TextareaState` with `submit_on_enter(true)`: Shift+Enter inserts a newline,
+Enter submits, and the box grows from one to four lines. Growth is animated over
+`RESIZE` in whole rows, so the list above glides with it instead of jumping or
+clipping the new line; past four lines the field scrolls. Entry content has **no category attribute**: the legacy `kind`
 column is dropped on migration, and images are recognized by content
 (`content_is_image`/`image_source_for`). Every added image is **hard-linked
 into the internal media library** (`WorktableService::import_image` →
@@ -252,8 +266,16 @@ while the menu bar item and capture shortcut keep running. The status menu's
 unhide → activate → `Regular`, in that order — AppKit defers the Dock tile
 when the policy changes while the app is hidden, so restoring before unhiding
 leaves the icon missing. Turning the toggle off makes the close button quit
-the app. General also carries *Diagnostic logs*, off by default; see
-[Diagnostics](#diagnostics).
+the app and hides the menu-bar item in the same click
+(`status_item::set_visible`); turning it back on restores the icon immediately.
+The saved preference also hides the item on the next launch. General also
+carries *Diagnostic logs*, off by default; see [Diagnostics](#diagnostics).
+
+Settings → Data opens the **GitHub stars** dialog. Fetch and Import use the
+dialog's `h_9` control height like Close, the repository list is a fixed
+viewport capped at nine rows (it scrolls past that instead of clipping at six),
+and the dialog reports only the repository count — not a total-star tally or a
+repeated account name.
 
 The first launch opens a **three-step tour** (`OnboardingState`): welcome with
 the keymap rendered as `gpui_component::kbd::Kbd` keycaps styled as our chips
@@ -267,6 +289,14 @@ completing it stores `onboarding_completed=1` in config, and Settings →
 Appearance has a *Replay* control. List key commands stay disabled while the
 tour is open.
 
+After an update, the view reads `last_run_version` and `accessibility_granted`.
+If the version changed, the grant was previously given (or this is the first
+build that records it), and `AXIsProcessTrusted` is now false, Worktable opens
+one recovery dialog with *Open System Settings*; it does not prompt when the
+stable requirement preserved the grant, when the tour is unfinished, or twice
+for the same version. The grant is recorded whenever the tour's check again
+button or Settings sees it active.
+
 While an OAuth sign-in is in progress, the Settings Providers panel shows the
 device code or prompt with a **Cancel sign-in** control; cancelling clears the
 pending login and reports `Sign-in cancelled.` in the panel's status.
@@ -277,9 +307,15 @@ radius, or padding; they keep an 85% measure for selectable rich text.
 
 The conversation icon beside the assistant input opens **Chats**, a bottom
 sheet that rises from the window's bottom edge using `MODAL_OPEN`/`MODAL_CLOSE`.
-Its virtualized rows show the first prompt and last activity; the active row
-says *Current chat*. Selecting a row loads its saved transcript and closes the
-sheet; *New chat* starts an empty draft without storing an empty chat.
+Its virtualized rows show the first prompt and last activity with a tight
+title/time gap and no hover tooltip; the active row says *Current chat*.
+Selecting a row loads its saved transcript and closes the sheet; *New chat*
+starts an empty draft without storing an empty chat. Right-clicking a row
+offers **Delete chat**, which removes the `wt_chats` snapshot, its
+`wt_ai_history` context, and the session/run bookkeeping in one transaction;
+deleting the active chat returns to the empty draft. On startup the most recent
+saved transcript is restored, so the welcome starter never replaces an existing
+conversation.
 Escape, Close, and the backdrop dismiss it, with focus restored; Tab stays
 inside the sheet. Switching waits for any answer or transcript save to finish,
 and failed saves expose Retry before switching is allowed. UI snapshots live
@@ -444,7 +480,9 @@ Provider rules:
 - **Free models are provider-gated.** OpenCode Zen free models only work
   inside the OpenCode app, so Worktable does not advertise them. OpenCode Go
   free models remain selectable. A `FreeUsageLimitError` maps to a recovery
-  message naming paid models or OpenCode Go.
+  message naming paid models or OpenCode Go. While a build runs, the composer
+  shows entry-unit progress (`Building knowledge · 24 of 130 entries`) instead
+  of hiding the state, updated after each AI batch.
 - **Adding a provider** means: a `ProviderSpec` in `providers.rs`, a client arm
   in `AgentRuntime::build_agent`, and a credential handled through
   `SqliteStore` (Worktable's database owns credentials; env vars are only a
@@ -682,7 +720,7 @@ to `stderr` as a fallback, so a release build without the setting stays quiet.
 `scripts/package-macos.sh` builds the release bundle and its installer:
 
 ```sh
-VERSION=1.5.0 sh scripts/package-macos.sh
+VERSION=1.5.1 sh scripts/package-macos.sh
 ```
 
 It runs `cargo build --release -p worktable-app`, assembles
@@ -699,6 +737,15 @@ effort: TCC may still ask for Accessibility once after an update. A Developer
 ID identity keeps the normal signature (the certificate/Team ID is already the
 stable requirement); a Developer ID + notarized build is the reliable TCC
 path.
+
+The app-menu **Check for Updates…** path is the packaged counterpart: it reads
+GitHub's latest stable release, verifies the DMG checksum and signature,
+stages the app, and launches a detached helper that waits for exit, swaps the
+bundle, and reopens it. `last_run_version` records the version that has run,
+and `accessibility_granted` records that the user has had Accessibility at
+least once, so the update can prompt once when macOS dropped it. Never fake a
+TCC check: `AXIsProcessTrusted` is the only source of truth, and a Developer ID
+build remains the only reliable way to keep the grant across replacements.
 
 ## Commit hygiene
 

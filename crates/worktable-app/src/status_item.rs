@@ -488,6 +488,23 @@ pub(crate) fn set_app_icon() {
     unsafe { app.setApplicationIconImage(Some(&image)) };
 }
 
+/// Show or hide the installed menu-bar item immediately. The item stays
+/// installed (and the global capture monitor keeps running) so turning the
+/// preference back on does not need a relaunch.
+pub(crate) fn set_visible(visible: bool) {
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_ITEM.with(|slot| {
+        let Ok(item) = slot.try_borrow() else {
+            return;
+        };
+        if let Some(item) = item.as_ref() {
+            item.setVisible(visible);
+        }
+    });
+}
+
 /// Swap the menu-bar image to the lit glyph (or back). Main thread only.
 fn set_status_image(lit: bool) {
     let Some(mtm) = MainThreadMarker::new() else {

@@ -17,6 +17,7 @@ pub(crate) mod model_picker;
 pub(crate) mod preferences;
 pub(crate) mod service;
 pub(crate) mod status_item;
+pub(crate) mod updates;
 pub(crate) mod worktable_view;
 
 use std::{
@@ -101,6 +102,17 @@ fn main() -> anyhow::Result<()> {
         cx.on_action(|_: &crate::actions::ShowAll, _: &mut App| {
             #[cfg(target_os = "macos")]
             status_item::show_all_applications();
+        });
+        cx.on_action(|_: &crate::actions::CheckForUpdates, cx: &mut App| {
+            let Some(view) = cx.try_global::<MainView>().map(|main| main.0.clone()) else {
+                return;
+            };
+            let Some(window) = cx.try_global::<MainWindow>().map(|main| main.0) else {
+                return;
+            };
+            let _ = window.update(cx, |_, window, cx| {
+                view.update(cx, |this, cx| this.check_for_updates(window, cx));
+            });
         });
         cx.on_action(|_: &crate::actions::MinimizeWindow, cx: &mut App| {
             if let Some(window) = cx.active_window() {
@@ -232,6 +244,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("About Worktable", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", ShowSettings),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),

@@ -20,7 +20,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, Size, TestAppContext, TouchPhase, VisualTestContext,
     WindowHandle, point, px,
 };
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use worktable_ai::WorktableEntry;
 use worktable_control::{
     Command, LabelColor, OnboardingAction, Page, Response, SettingsTab as ControlSettingsTab,
@@ -105,6 +105,12 @@ fn seeded_db_with_config(entries: Vec<WorktableEntry>, onboarding_done: bool) ->
     // tour.
     if onboarding_done {
         runtime.set_config("onboarding_completed", "1").unwrap();
+        // Startup tests must not depend on the host's TCC grant: mark this
+        // version as already seen so the post-update Accessibility notice
+        // stays out of every unrelated test.
+        runtime
+            .set_config("last_run_version", env!("CARGO_PKG_VERSION"))
+            .unwrap();
     }
     drop(runtime);
 
@@ -200,7 +206,8 @@ struct MockGithub {
 }
 
 impl MockGithub {
-    fn start(body: &'static str) -> Self {
+    fn start(body: impl Into<String>) -> Self {
+        let body = body.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -412,48 +419,6 @@ fn library_menu_dismisses_with_escape(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(cx.read_entity(&view, |v, _| v.mode), AppMode::Settings);
-}
-
-/// The library menu is the keyboard path to labels: choosing a color toggles
-/// it on the selected entry, and choosing the active color again clears it.
-#[gpui::test]
-fn library_menu_labels_selected_entry_through_the_keyboard(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
-    let (view, window) = setup_view(cx, sample_entries());
-    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
-    settle(&mut cx);
-    no_splash(&mut cx, &view);
-
-    view.update(&mut cx, |this, cx| {
-        this.select_at("test-1000".to_owned(), false);
-        cx.notify();
-    });
-    cx.run_until_parked();
-
-    // Settings, three sort rows, then the first label row.
-    click_selector(&mut cx, "library-menu");
-    for _ in 0..5 {
-        cx.simulate_keystrokes("down");
-    }
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert_eq!(
-        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
-        Some(EntryLabelColor::Red),
-        "the first label row colors the selected entry"
-    );
-
-    click_selector(&mut cx, "library-menu");
-    for _ in 0..5 {
-        cx.simulate_keystrokes("down");
-    }
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert_eq!(
-        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
-        None,
-        "choosing the active color again clears the label"
-    );
 }
 
 /// Labels persist through the real service and database: toggle, clear, and
@@ -1968,6 +1933,69 @@ fn nav_theme_toggle_flips_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn note_bar_shift_enter_grows_to_four_lines(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    bind_all(cx);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    let entry_count = cx.read_entity(&view, |v, _| v.entries.len());
+
+    focus_composer(&mut cx, &view);
+    let one_line = cx
+        .debug_bounds("composer-input")
+        .expect("the note field renders")
+        .size
+        .height;
+
+    cx.simulate_input("first line");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("second line");
+    assert_eq!(
+        cx.read_entity(&view, |v, cx| v.composer_body.read(cx).value().to_string()),
+        "first line\nsecond line",
+        "Shift+Enter inserts a newline instead of submitting"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entries.len()),
+        entry_count,
+        "Shift+Enter must not add an entry"
+    );
+
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("third line");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("fourth line");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("fifth line");
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.composer_rows),
+        4,
+        "the note field stops growing at four rows"
+    );
+
+    let grew = wait_for(&mut cx, 2, |cx| {
+        cx.debug_bounds("composer-input")
+            .is_some_and(|bounds| bounds.size.height > one_line + px(20.))
+    });
+    assert!(
+        grew,
+        "the note field grows taller as lines are added; one line was {one_line}"
+    );
+    force_frame(&mut cx);
+    let four_lines = cx
+        .debug_bounds("composer-input")
+        .expect("the note field still renders")
+        .size
+        .height;
+    assert!(
+        four_lines >= one_line + px(50.),
+        "three extra lines add real height, got {four_lines} from {one_line}"
+    );
+}
+
+#[gpui::test]
 fn nav_keyboard_shortcuts_cover_composer_and_search(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     bind_all(cx);
@@ -2115,16 +2143,18 @@ fn note_bar_enter_and_backspace_stay_in_the_field(cx: &mut TestAppContext) {
         cx.read_entity(&view, |v, _| v.entry_modal.is_none()),
         "Enter in the note bar must not open the detail view"
     );
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&view, |v, cx| v.composer_body.read(cx).value().is_empty()),
+        "the note field clears after Enter submits the note"
+    );
 
     // Backspace while the note input is focused edits the field, not the list.
-    cx.update(|window, cx| {
-        view.update(cx, |this, cx| {
-            let body = this.composer_body.clone();
-            body.update(cx, |state, cx| state.set_value("abc", window, cx));
-        });
-    });
-    cx.run_until_parked();
+    // Type through the editor so the caret sits at the end (a programmatic
+    // `set_value` places a multi-line caret at position 0, where Backspace is
+    // correctly a no-op).
     focus_composer(&mut cx, &view);
+    cx.simulate_input("abc");
     cx.simulate_keystrokes("backspace");
     assert_eq!(
         cx.read_entity(&view, |v, cx| v.composer_body.read(cx).value().to_string()),
@@ -5452,6 +5482,82 @@ fn github_fetch_and_import_drive_the_dialog(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn github_dialog_controls_match_and_the_star_list_scrolls(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let repos = (0..12)
+        .map(|index| {
+            format!(
+                r#"{{"starred_at":"2026-08-01T10:00:00Z","name":"repo-{index}","full_name":"someone/repo-{index}","stargazers_count":{index},"html_url":"https://github.com/someone/repo-{index}","repo":{{"name":"repo-{index}","full_name":"someone/repo-{index}","description":"Repository {index}","stargazers_count":{index},"html_url":"https://github.com/someone/repo-{index}"}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mock = MockGithub::start(format!("[{repos}]"));
+    let (view, window) = setup_view_with_github_base(cx, Vec::new(), &mock.base_url());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    cx.update_window(*window, |_, window, cx| {
+        view.update(cx, |this, cx| this.open_github_dialog(window, cx));
+    })
+    .ok();
+    force_frame(&mut cx);
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            let input = this.github_input.clone();
+            input.update(cx, |state, cx| state.set_value("octocat", window, cx));
+        });
+    });
+    click_selector(&mut cx, "github-fetch");
+    assert!(
+        wait_for(&mut cx, 10, |cx| {
+            cx.read_entity(&view, |v, _| {
+                !v.github_loading && v.github_repos.len() == 12
+            })
+        }),
+        "all twelve starred repositories land in the dialog"
+    );
+    force_frame(&mut cx);
+
+    let fetch = cx
+        .debug_bounds("github-fetch")
+        .expect("fetch control")
+        .size
+        .height;
+    let import = cx
+        .debug_bounds("github-import-stars")
+        .expect("import control")
+        .size
+        .height;
+    let close = cx
+        .debug_bounds("github-dialog-close")
+        .expect("dialog close control")
+        .size
+        .height;
+    assert_eq!(fetch, close, "Fetch stars uses the dialog's control height");
+    assert_eq!(
+        import, close,
+        "Import stars uses the dialog's control height"
+    );
+
+    let list = cx
+        .debug_bounds("github-repos")
+        .expect("the repository list renders")
+        .size
+        .height;
+    let max_list =
+        cx.update(|window, _| design::to_pixels(design::GITHUB_REPOS_MAX_HEIGHT, window));
+    assert!(
+        list >= max_list - px(2.),
+        "the repository list shows up to the capped height instead of stopping at six rows; got {list}"
+    );
+    assert!(
+        cx.debug_bounds("github-dialog-summary").is_some(),
+        "the dialog still names how many repositories it found"
+    );
+}
+
+#[gpui::test]
 fn settings_cancel_sign_in_clears_the_login(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, window) = setup_view(cx, Vec::new());
@@ -5703,6 +5809,139 @@ fn free_model_failure_shows_recovery_copy(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn assistant_restores_the_last_chat_instead_of_the_starter(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = seeded_db(sample_entries());
+    // A previous session left a long transcript behind.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt
+        .block_on(worktable_ai::WorktableRuntime::connect(&db))
+        .unwrap();
+    let messages = vec![
+        crate::assistant::ChatMessage::user("Summarize the knowledge graph work"),
+        crate::assistant::ChatMessage::assistant(
+            "The graph mirrors every entry, then names topics with the active model.",
+        ),
+    ];
+    let chat = worktable_db::StoredChat::new(
+        worktable_db::ChatSummary::new("last-chat", "Summarize the knowledge graph work", 10, 1),
+        serde_json::to_string(&messages).unwrap(),
+    );
+    runtime.save_chat(&chat).unwrap();
+    drop(runtime);
+
+    let (view, window) = setup_view_with_db(cx, db, TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(
+        wait_for(&mut cx, 5, |cx| {
+            cx.read_entity(&view, |v, _| v.messages.len() == 2)
+        }),
+        "startup should load the most recent transcript"
+    );
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.chat_id.clone()),
+        Some("last-chat".to_owned())
+    );
+    view.update(&mut cx, |this, cx| this.show_assistant(cx));
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("assistant-welcome").is_none(),
+        "an existing conversation must not show the welcome starter"
+    );
+    assert!(
+        cx.debug_bounds("assistant-restoring").is_none(),
+        "the restore placeholder clears once the transcript is loaded"
+    );
+    assert!(
+        cx.debug_bounds("assistant-messages").is_some(),
+        "the restored conversation renders"
+    );
+}
+
+#[gpui::test]
+fn deleting_a_chat_clears_the_active_draft_and_its_history(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = seeded_db(sample_entries());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt
+        .block_on(worktable_ai::WorktableRuntime::connect(&db))
+        .unwrap();
+    let transcript = serde_json::to_string(&vec![
+        crate::assistant::ChatMessage::user("Older question"),
+        crate::assistant::ChatMessage::assistant("Older answer"),
+    ])
+    .unwrap();
+    let newest = serde_json::to_string(&vec![
+        crate::assistant::ChatMessage::user("Current question"),
+        crate::assistant::ChatMessage::assistant("Current answer"),
+    ])
+    .unwrap();
+    runtime
+        .save_chat(&worktable_db::StoredChat::new(
+            worktable_db::ChatSummary::new("older", "Older question", 10, 1),
+            transcript,
+        ))
+        .unwrap();
+    runtime
+        .save_chat(&worktable_db::StoredChat::new(
+            worktable_db::ChatSummary::new("current", "Current question", 20, 1),
+            newest,
+        ))
+        .unwrap();
+    worktable_db::SqliteStore::connect(&db)
+        .unwrap()
+        .save_session_history("current", r#"[{"role":"user"}]"#)
+        .unwrap();
+    drop(runtime);
+
+    let (view, window) = setup_view_with_db(cx, db.clone(), TEST_WINDOW_SIZE);
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    assert!(wait_for(&mut cx, 5, |cx| {
+        cx.read_entity(&view, |v, _| v.chat_id.as_deref() == Some("current"))
+    }));
+
+    view.update(&mut cx, |this, cx| this.refresh_chats(cx));
+    assert!(wait_for(&mut cx, 5, |cx| {
+        cx.read_entity(&view, |v, _| v.chats.len() == 2)
+    }));
+
+    view.update(&mut cx, |this, cx| this.delete_chat("older".to_owned(), cx));
+    assert!(wait_for(&mut cx, 5, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.chats.iter().all(|chat| chat.id != "older")
+                && v.chat_id.as_deref() == Some("current")
+                && v.messages.len() == 2
+        })
+    }));
+
+    view.update(&mut cx, |this, cx| {
+        this.delete_chat("current".to_owned(), cx)
+    });
+    assert!(wait_for(&mut cx, 5, |cx| {
+        cx.read_entity(&view, |v, _| {
+            v.chats.is_empty() && v.chat_id.is_none() && v.messages.is_empty()
+        })
+    }));
+
+    let store = worktable_db::SqliteStore::connect(&db).unwrap();
+    assert!(store.load_chat("current").unwrap().is_none());
+    assert!(
+        store.load_session_history("current").unwrap().is_none(),
+        "deleting the chat also removes the model-facing history"
+    );
+}
+
+#[gpui::test]
 fn assistant_generic_failure_hides_the_raw_error(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, window) = setup_view(cx, Vec::new());
@@ -5790,6 +6029,209 @@ fn knowledge_status_line_shows_the_build_result(cx: &mut TestAppContext) {
         "the status line yields to the G2 orb while a build runs"
     );
     assert!(cx.debug_bounds("knowledge-building").is_some());
+}
+
+fn test_release(version: &str) -> crate::updates::ReleaseInfo {
+    crate::updates::ReleaseInfo {
+        version: crate::updates::Version::parse(version).unwrap(),
+        tag: format!("v{version}"),
+        name: format!("Worktable {version}"),
+        notes: "Fixes and polish.".to_owned(),
+        page_url: "https://github.com/MalinrRuwan/worktable/releases/tag/v1.5.1".to_owned(),
+        dmg: crate::updates::ReleaseAsset {
+            name: format!("Worktable-{version}.dmg"),
+            url: "https://example.test/Worktable.dmg".to_owned(),
+        },
+        checksum: crate::updates::ReleaseAsset {
+            name: format!("Worktable-{version}.dmg.sha256"),
+            url: "https://example.test/Worktable.dmg.sha256".to_owned(),
+        },
+    }
+}
+
+#[gpui::test]
+fn update_dialog_renders_each_check_state(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    let open = |cx: &mut VisualTestContext, view: &Entity<WorktableView>| {
+        cx.update_window(*window, |_, window, cx| {
+            view.update(cx, |this, cx| this.open_update_dialog(window, cx));
+        })
+        .ok();
+    };
+
+    // Up to date.
+    view.update(&mut cx, |this, _| {
+        this.update_state = Some(super::UpdateState::UpToDate {
+            current: "1.5.1".to_owned(),
+        });
+        this.update_self_install = false;
+    });
+    open(&mut cx, &view);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("update-uptodate").is_some());
+    assert!(cx.debug_bounds("update-checking").is_none());
+    cx.update_window(*window, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
+    // Available, running from a build folder: no automatic install button,
+    // but the release page remains reachable.
+    view.update(&mut cx, |this, _| {
+        this.update_state = Some(super::UpdateState::Available(test_release("1.5.1")));
+        this.update_self_install = false;
+    });
+    open(&mut cx, &view);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("update-available").is_some());
+    assert!(cx.debug_bounds("update-notes").is_some());
+    assert!(
+        cx.debug_bounds("update-install").is_none(),
+        "a build folder cannot replace an installed app"
+    );
+    assert!(cx.debug_bounds("update-release-page").is_some());
+    cx.update_window(*window, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
+    // Installing and failed states.
+    view.update(&mut cx, |this, _| {
+        this.update_state = Some(super::UpdateState::Installing(test_release("1.5.1")));
+    });
+    open(&mut cx, &view);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("update-installing").is_some());
+    assert!(cx.debug_bounds("update-installing-button").is_some());
+    cx.update_window(*window, |_, window, cx| window.close_dialog(cx))
+        .ok();
+    cx.run_until_parked();
+
+    view.update(&mut cx, |this, _| {
+        this.update_state = Some(super::UpdateState::Failed {
+            message: "Couldn't reach GitHub. Check the connection and try again.".to_owned(),
+            release: Some(test_release("1.5.1")),
+        });
+    });
+    open(&mut cx, &view);
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("update-error").is_some());
+    assert!(cx.debug_bounds("update-retry").is_some());
+    assert!(cx.debug_bounds("update-release-page").is_some());
+}
+
+#[gpui::test]
+fn accessibility_renewal_prompt_offers_the_recovery_path(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, Vec::new());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    cx.update_window(*window, |_, window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_accessibility_renewal_prompt(window, cx)
+        });
+    })
+    .ok();
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("accessibility-renewal-open").is_some(),
+        "the update prompt links to System Settings"
+    );
+    assert!(cx.debug_bounds("accessibility-renewal-later").is_some());
+    click_selector(&mut cx, "accessibility-renewal-later");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("accessibility-renewal-open").is_none(),
+        "Not now dismisses the prompt"
+    );
+}
+
+#[gpui::test]
+fn accessibility_renewal_prompt_is_gated_to_a_dropped_grant_after_an_update(
+    cx: &mut TestAppContext,
+) {
+    assert!(super::should_prompt_accessibility_renewal(
+        true,
+        Some("1.5.0"),
+        Some("1"),
+        "1.5.1",
+        false,
+    ));
+    assert!(super::should_prompt_accessibility_renewal(
+        true, None, None, "1.5.1", false,
+    ));
+    assert!(!super::should_prompt_accessibility_renewal(
+        false,
+        Some("1.5.0"),
+        Some("1"),
+        "1.5.1",
+        false,
+    ));
+    assert!(!super::should_prompt_accessibility_renewal(
+        true,
+        Some("1.5.0"),
+        Some("1"),
+        "1.5.1",
+        true,
+    ));
+    assert!(!super::should_prompt_accessibility_renewal(
+        true,
+        Some("1.5.1"),
+        Some("1"),
+        "1.5.1",
+        false,
+    ));
+    assert!(!super::should_prompt_accessibility_renewal(
+        true,
+        Some("1.5.0"),
+        None,
+        "1.5.1",
+        false,
+    ));
+    let _ = cx;
+}
+
+#[gpui::test]
+fn knowledge_build_shows_entry_progress(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+    view.update(&mut cx, |this, cx| {
+        this.show_assistant(cx);
+        this.knowledge_building = true;
+        this.knowledge_progress = Some((2, 5));
+        this.knowledge_status = Some("Naming topics with AI… 2 of 5 entries".to_owned());
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("knowledge-progress").is_some(),
+        "a running build reports entry progress beside the composer"
+    );
+    assert!(
+        cx.debug_bounds("knowledge-status").is_none(),
+        "the finished-build line yields to live progress while building"
+    );
+    assert_eq!(
+        super::knowledge_progress_label(2, 5),
+        "Building knowledge · 2 of 5 entries",
+        "progress is reported in entry units"
+    );
+
+    view.update(&mut cx, |this, cx| {
+        this.knowledge_building = false;
+        this.knowledge_progress = None;
+        this.knowledge_status = Some("Knowledge is up to date.".to_owned());
+        cx.notify();
+    });
+    force_frame(&mut cx);
+    assert!(cx.debug_bounds("knowledge-progress").is_none());
+    assert!(cx.debug_bounds("knowledge-status").is_some());
 }
 
 #[gpui::test]
@@ -6624,7 +7066,7 @@ fn control_assistant_and_chats_follow_the_view(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn context_menu_color_dot_click_toggles_and_dismisses(cx: &mut TestAppContext) {
+fn context_menu_color_dot_updates_the_tick_without_closing(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, window) = setup_view(cx, sample_entries());
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
@@ -6645,19 +7087,60 @@ fn context_menu_color_dot_click_toggles_and_dismisses(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     force_frame(&mut cx);
+    assert!(
+        cx.debug_bounds("entry-label-check:red").is_some(),
+        "the menu opens with the entry's current color ticked"
+    );
     let blue = cx
         .debug_bounds("entry-label-dot:blue")
         .expect("the blue label dot renders")
         .center();
     cx.simulate_click(blue, Modifiers::default());
     cx.run_until_parked();
+    force_frame(&mut cx);
     assert_eq!(
         cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
         Some(EntryLabelColor::Blue),
         "clicking a dot applies its color"
     );
     assert!(
+        cx.debug_bounds("entry-label-colors").is_some(),
+        "the menu stays open so the new tick is visible"
+    );
+    assert!(
+        cx.debug_bounds("entry-label-check:blue").is_some(),
+        "the new color shows its tick immediately"
+    );
+    assert!(
+        cx.debug_bounds("entry-label-check:red").is_none(),
+        "the previous color loses its tick immediately"
+    );
+
+    let blue = cx
+        .debug_bounds("entry-label-dot:blue")
+        .expect("the blue dot is still on screen")
+        .center();
+    cx.simulate_click(blue, Modifiers::default());
+    cx.run_until_parked();
+    force_frame(&mut cx);
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.entry_labels.get("test-1000").copied()),
+        None,
+        "clicking the active color clears the label"
+    );
+    assert!(
+        cx.debug_bounds("entry-label-check:blue").is_none(),
+        "clearing the label removes the tick immediately"
+    );
+    assert!(
+        cx.debug_bounds("entry-label-colors").is_some(),
+        "clearing the label also keeps the menu open"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
         cx.debug_bounds("entry-label-colors").is_none(),
-        "clicking a dot dismisses the context menu"
+        "Escape still dismisses the menu"
     );
 }

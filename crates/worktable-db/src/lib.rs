@@ -306,17 +306,6 @@ impl EntryLabelColor {
         }
     }
 
-    /// The menu item label for this color.
-    pub fn menu_label(self) -> &'static str {
-        match self {
-            Self::Red => "Red label",
-            Self::Amber => "Amber label",
-            Self::Green => "Green label",
-            Self::Blue => "Blue label",
-            Self::Purple => "Purple label",
-        }
-    }
-
     /// Read a stored key, ignoring values this build does not know.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
@@ -430,6 +419,33 @@ impl SqliteStore {
                 chat.messages_json
             ],
         )?;
+        Ok(())
+    }
+
+    /// Remove a saved chat and everything keyed to its AI session in one
+    /// transaction. The chat id is also the AI session id, so the transcript,
+    /// provider history, and session/run bookkeeping all go together.
+    pub fn delete_chat(&self, id: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().expect("sqlite lock poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM wt_chats WHERE id = ?", [id])?;
+        transaction.execute("DELETE FROM wt_ai_history WHERE session_id = ?", [id])?;
+        transaction.execute(
+            "DELETE FROM wt_ai_events WHERE run_id IN
+                (SELECT id FROM wt_ai_runs WHERE session_id = ?)",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM wt_ai_runs WHERE session_id = ?", [id])?;
+        transaction.execute("DELETE FROM wt_ai_session_items WHERE session_id = ?", [id])?;
+        transaction.execute(
+            "DELETE FROM wt_ai_session_leases WHERE session_id = ?",
+            [id],
+        )?;
+        transaction.execute(
+            "DELETE FROM wt_ai_sessions WHERE id = ? OR pi_session_id = ?",
+            params![id, id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1058,6 +1074,18 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Remove a saved chat and its model-facing session state.
+    pub fn delete_chat(&self, id: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().expect("wasm lock poisoned");
+        inner.chats.remove(id);
+        inner.history.remove(id);
+        inner.sessions.remove(id);
+        inner.leases.remove(id);
+        drop(inner);
+        self.save_to_storage();
+        Ok(())
+    }
+
     pub fn load_session_history(&self, session_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self
             .inner
@@ -1533,17 +1561,16 @@ mod tests {
     #[test]
     fn entry_label_keys_are_stable_lowercase_names() {
         let expected = [
-            (EntryLabelColor::Red, "red", "Red", "Red label"),
-            (EntryLabelColor::Amber, "amber", "Amber", "Amber label"),
-            (EntryLabelColor::Green, "green", "Green", "Green label"),
-            (EntryLabelColor::Blue, "blue", "Blue", "Blue label"),
-            (EntryLabelColor::Purple, "purple", "Purple", "Purple label"),
+            (EntryLabelColor::Red, "red", "Red"),
+            (EntryLabelColor::Amber, "amber", "Amber"),
+            (EntryLabelColor::Green, "green", "Green"),
+            (EntryLabelColor::Blue, "blue", "Blue"),
+            (EntryLabelColor::Purple, "purple", "Purple"),
         ];
         assert_eq!(EntryLabelColor::ALL.len(), expected.len());
-        for (color, key, name, menu_label) in expected {
+        for (color, key, name) in expected {
             assert_eq!(color.key(), key);
             assert_eq!(color.name(), name);
-            assert_eq!(color.menu_label(), menu_label);
             assert_eq!(EntryLabelColor::from_key(key), Some(color));
         }
         assert_eq!(EntryLabelColor::from_key("crimson"), None);
@@ -1758,6 +1785,59 @@ mod tests {
         invalid.messages_json = "broken JSON".into();
         assert!(store.save_chat(&invalid).is_err());
         assert!(store.load_chat("c").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_chat_removes_the_saved_chat_and_its_session_history() {
+        let store = store();
+        store.save_chat(&chat("keep", 10, 1)).unwrap();
+        store.save_chat(&chat("drop", 20, 1)).unwrap();
+        store
+            .save_session_history("drop", r#"[{"role":"user"}]"#)
+            .unwrap();
+        store
+            .save_session_history("keep", r#"[{"role":"user"}]"#)
+            .unwrap();
+        store.ensure_session("drop", Some("Drop"), 20).unwrap();
+        assert!(
+            store
+                .begin_run("drop-run", "drop", "drop-request", 20)
+                .unwrap()
+        );
+
+        store.delete_chat("drop").unwrap();
+
+        assert!(store.load_chat("drop").unwrap().is_none());
+        assert!(
+            store.load_session_history("drop").unwrap().is_none(),
+            "the provider history for the deleted chat goes with it"
+        );
+        assert_eq!(
+            store
+                .list_chats()
+                .unwrap()
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keep"]
+        );
+        assert!(store.load_session_history("keep").unwrap().is_some());
+        let connection = store.connection.lock().unwrap();
+        for (table, key) in [
+            ("wt_ai_sessions", "id"),
+            ("wt_ai_runs", "session_id"),
+            ("wt_ai_session_items", "session_id"),
+            ("wt_ai_session_leases", "session_id"),
+        ] {
+            let rows: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {key} = 'drop'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table} rows for the deleted chat must go");
+        }
     }
 
     /// A database whose migration counter is already ahead of [`MIGRATIONS`]

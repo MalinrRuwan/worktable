@@ -1,6 +1,6 @@
 [package]
 name = "worktable-app"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 # `cargo run -p worktable-app` is the documented developer loop; the package
 # also ships the feature-gated visual-test runner.
@@ -33,6 +33,8 @@ uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Verifies the release DMG against the published SHA-256 before staging it.
+sha2 = "0.10"
 # Saving captured RgbaImages as PNG baselines (visual-test binary).
 image = "0.25"
 

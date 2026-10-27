@@ -89,6 +89,13 @@ pub const PROVIDER_DIALOG_WIDTH: Rems = rems(26.25);
 /// fetch/import controls on one row.
 pub const GITHUB_DIALOG_WIDTH: Rems = rems(30.0);
 
+/// Maximum height of the starred-repository list. Tall enough for nine rows,
+/// so the list scrolls instead of showing a fixed six-row window.
+pub const GITHUB_REPOS_MAX_HEIGHT: Rems = rems(18.0);
+
+/// Approximate height of one repository row (text + vertical padding + border).
+pub const GITHUB_REPO_ROW_HEIGHT: Rems = rems(1.75);
+
 /// Width of the first-run onboarding card: room for the shortcut rows without
 /// stretching to dialog width.
 pub const ONBOARDING_CARD_WIDTH: Rems = rems(34.0);
@@ -102,6 +109,13 @@ pub const CHATS_SHEET_HEIGHT: Rems = rems(26.0);
 
 /// Two lines per saved-chat row: title and last activity.
 pub const CHAT_ROW_HEIGHT: Rems = rems(4.0);
+
+/// The note bar grows from one line to four. `COMPOSER_FIELD_PADDING` is the
+/// vertical padding above and below the text inside the field, so the animated
+/// height includes the same box the textarea lays out.
+pub const COMPOSER_MIN_ROWS: usize = 1;
+pub const COMPOSER_MAX_ROWS: usize = 4;
+pub const COMPOSER_FIELD_PADDING: Rems = rems(0.5);
 
 /// Entries ⇄ Agent page offset — transitions.dev's `--page-slide-distance`
 /// (8px). The outgoing page exits toward it, the incoming page enters from it.

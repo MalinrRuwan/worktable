@@ -464,6 +464,45 @@ impl WorktableService {
         }
     }
 
+    /// Delete a saved chat and its provider history. The active run is owned
+    /// by the chat; the view only offers this while no run is in flight.
+    pub async fn delete_chat(&self, id: &str) -> EmptyResult {
+        if self.runtime.is_some() {
+            let id = id.to_owned();
+            self.run_on_tokio(move |runtime| async move { runtime.delete_chat(&id) })
+                .await
+        } else {
+            self.memory_chats.lock().await.remove(id);
+            Ok(())
+        }
+    }
+
+    /// Check the public GitHub releases for a newer stable Worktable.
+    /// Network work stays on the Tokio runtime; the caller gets short
+    /// recovery copy, never a raw HTTP detail.
+    pub async fn check_for_update(&self) -> Result<crate::updates::UpdateCheck, String> {
+        match self.tokio.spawn(crate::updates::check()).await {
+            Ok(result) => result,
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Download the release DMG, verify its published checksum, and stage the
+    /// contained app outside the running bundle.
+    pub async fn download_and_stage_update(
+        &self,
+        release: crate::updates::ReleaseInfo,
+    ) -> Result<crate::updates::PreparedUpdate, String> {
+        match self
+            .tokio
+            .spawn(crate::updates::download_and_stage(release))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Submit a prompt to the AI worker and return the run info.
     pub async fn submit_prompt(
         &self,

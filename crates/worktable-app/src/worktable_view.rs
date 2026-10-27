@@ -62,6 +62,31 @@ struct ChatRow {
     updated_at: i64,
 }
 
+/// The software-update dialog's live state. The dialog entity reads this from
+/// the main view, so an async check or download repaints the open dialog.
+#[derive(Clone)]
+pub(crate) enum UpdateState {
+    Checking,
+    UpToDate {
+        current: String,
+    },
+    Available(crate::updates::ReleaseInfo),
+    Installing(crate::updates::ReleaseInfo),
+    Failed {
+        message: String,
+        release: Option<crate::updates::ReleaseInfo>,
+    },
+}
+
+/// An in-flight height transition for the note field as it grows from one to
+/// four lines. Row counts (not pixels) are stored so the morph follows the
+/// interface zoom when the window's rem size changes mid-transition.
+struct ComposerResize {
+    from_rows: f32,
+    to_rows: f32,
+    started: Instant,
+}
+
 enum ChatListState {
     Loading,
     Ready,
@@ -321,6 +346,11 @@ pub struct WorktableView {
     /// Presentation metadata: the color stroke painted on an entry's card.
     /// Labels are never part of the entry's content.
     pub(crate) entry_labels: HashMap<String, EntryLabelColor>,
+    /// One long-lived row entity per entry for the context menu's label dots.
+    /// Rebuilding it inside the popup's render would reset the element ids on
+    /// every hover repaint, and a click's down/up pair would then land on two
+    /// different elements (so no click fires).
+    label_rows: HashMap<String, Entity<EntryLabelColorRow>>,
     entry_label_status: Option<String>,
     pub(crate) selected: HashSet<String>,
     selected_anchor: Option<String>,
@@ -349,7 +379,12 @@ pub struct WorktableView {
     page_anim_at: Option<Instant>,
 
     // Composer
-    composer_body: Entity<InputState>,
+    composer_body: Entity<TextareaState>,
+    /// Rows the note field is currently laid out at (1–4), separate from the
+    /// animated height so a rapid second newline continues from the row count
+    /// already on screen.
+    composer_rows: usize,
+    composer_resize: Option<ComposerResize>,
     assistant_input: Entity<InputState>,
 
     // Assistant
@@ -363,11 +398,18 @@ pub struct WorktableView {
     chats: Vec<ChatRow>,
     chats_state: ChatListState,
     chat_loading: Option<String>,
+    /// Startup restores the most recent saved transcript. While that read is
+    /// in flight the empty transcript must not flash the welcome panel.
+    chat_restoring: bool,
     chats_sheet: Option<ChatSheet>,
     chats_focus: FocusHandle,
     chats_scroll: VirtualListScrollHandle,
-    /// Reject list/transcript loads after dismissal or a newer selection.
+    /// Reject transcript loads after dismissal or a newer selection.
     chats_generation: u64,
+    /// Reject stale chat-list reads without cancelling a transcript load.
+    /// Opening the picker while a chat is opening used to bump the transcript
+    /// generation and leave `chat_loading` set forever.
+    chats_list_generation: u64,
     /// Scroll position of the assistant transcript (explicit scrollbar).
     assistant_scroll: ScrollHandle,
     /// Name of the tool currently executing, rendered as an orb status row.
@@ -404,7 +446,6 @@ pub struct WorktableView {
     // GitHub Stars
     github_input: Entity<InputState>,
     github_username: Option<String>,
-    github_total_stars: Option<u64>,
     github_repos: Vec<crate::github::GithubRepo>,
     github_loading: bool,
     github_error: Option<String>,
@@ -412,6 +453,9 @@ pub struct WorktableView {
     // Helix embedded graph
     pub(crate) knowledge_building: bool,
     pub(crate) knowledge_status: Option<String>,
+    /// Live `(named, total)` entry progress while a build runs. `None` until
+    /// the first build starts; the status line renders it in entry units.
+    pub(crate) knowledge_progress: Option<(usize, usize)>,
     /// Set to stop a running knowledge build (button clicked again).
     knowledge_cancel: Arc<std::sync::atomic::AtomicBool>,
 
@@ -444,6 +488,12 @@ pub struct WorktableView {
     splash_start: Option<Instant>,
     /// First-run tour; `None` once completed or skipped.
     pub(crate) onboarding: Option<OnboardingState>,
+    /// Software-update dialog state; `None` before the first check.
+    update_state: Option<UpdateState>,
+    /// Whether this copy can replace its own bundle (set when the dialog
+    /// opens; probing the Applications directory on every frame would be
+    /// wasteful).
+    pub(crate) update_self_install: bool,
 
     pub(crate) _subscriptions: Vec<Subscription>,
 }
@@ -460,7 +510,11 @@ impl WorktableView {
                 .placeholder("Search entries")
                 .clean_on_escape()
         });
-        let composer_body = cx.new(|cx| InputState::new(window, cx).placeholder("Add a note"));
+        let composer_body = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Add a note")
+                .submit_on_enter(true)
+        });
         let assistant_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Ask your notes…")
@@ -499,6 +553,7 @@ impl WorktableView {
             mode: AppMode::Entries,
             entries: Vec::new(),
             entry_labels: HashMap::new(),
+            label_rows: HashMap::new(),
             entry_label_status: None,
             selected: HashSet::new(),
             selected_anchor: None,
@@ -513,6 +568,8 @@ impl WorktableView {
             pointer_position: point(Pixels::ZERO, Pixels::ZERO),
             page_anim_at: None,
             composer_body,
+            composer_rows: 1,
+            composer_resize: None,
             assistant_input,
             messages: Vec::new(),
             assistant_busy: false,
@@ -523,10 +580,12 @@ impl WorktableView {
             chats: Vec::new(),
             chats_state: ChatListState::Ready,
             chat_loading: None,
+            chat_restoring: false,
             chats_sheet: None,
             chats_focus: cx.focus_handle(),
             chats_scroll: VirtualListScrollHandle::new(),
             chats_generation: 0,
+            chats_list_generation: 0,
             assistant_scroll: ScrollHandle::new(),
             active_tool: None,
             pending_citations: Vec::new(),
@@ -550,12 +609,12 @@ impl WorktableView {
             provider_dialog_status: None,
             github_input,
             github_username: None,
-            github_total_stars: None,
             github_repos: Vec::new(),
             github_loading: false,
             github_error: None,
             knowledge_building: false,
             knowledge_status: None,
+            knowledge_progress: None,
             knowledge_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stale_provider_cleared: false,
             topic_cache: HashMap::new(),
@@ -571,6 +630,8 @@ impl WorktableView {
             github_import_status: None,
             splash_start: Some(Instant::now()),
             onboarding: None,
+            update_state: None,
+            update_self_install: false,
 
             _subscriptions: Vec::new(),
         };
@@ -586,6 +647,9 @@ impl WorktableView {
         view.load_github_username(cx);
         view.load_preferences(window, cx);
         view.load_knowledge_topics(cx);
+        // Pick up the last conversation instead of showing the welcome panel
+        // over a transcript the user already has.
+        view.restore_last_chat(window, cx);
         view
     }
 
@@ -629,10 +693,17 @@ impl WorktableView {
         });
         self._subscriptions.push(subscription);
 
-        // Pressing Enter in the composer submits it.
+        // Pressing Enter in the composer submits it; Shift+Enter inserts a
+        // newline (the textarea owns that behavior). Every text change starts
+        // the height morph, so the list glides instead of jumping.
         let composer_body = self.composer_body.clone();
         {
             let field = composer_body;
+            // The subscription callback has no `Window`, and the active-window
+            // lookup is empty while a textarea action is dispatching. Keep the
+            // handle from construction so clearing the field after Enter is
+            // deterministic.
+            let composer_window = window.window_handle();
             let subscription = cx.subscribe(&field, move |this, _emitter, event, cx| {
                 if matches!(
                     event,
@@ -643,8 +714,11 @@ impl WorktableView {
                 ) {
                     let input = this.composer_body.clone();
                     if this.queue_composer_entry(cx) {
-                        this.set_input(&input, "", cx);
+                        this.set_composer_value_in(&input, "", composer_window, cx);
                     }
+                }
+                if matches!(event, InputEvent::Change) {
+                    this.begin_composer_resize(cx);
                 }
             });
             self._subscriptions.push(subscription);
@@ -742,7 +816,15 @@ impl WorktableView {
             let result = service.list_entries().await;
             let _ = view.update(cx, |this, cx| {
                 match result {
-                    Ok(entries) => this.entries = entries,
+                    Ok(entries) => {
+                        this.entries = entries;
+                        // Drop cached menu rows for entries that no longer
+                        // exist; their entities only live while the library
+                        // does.
+                        let live: HashSet<String> =
+                            this.entries.iter().map(|entry| entry.id.clone()).collect();
+                        this.label_rows.retain(|id, _| live.contains(id));
+                    }
                     Err(error) => {
                         crate::logging::error(format!("failed to load entries: {error}"));
                     }
@@ -982,8 +1064,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 this.github_loading = false;
                 match result {
-                    Ok((total, repos)) => {
-                        this.github_total_stars = Some(total);
+                    Ok((_total, repos)) => {
                         this.github_repos = repos;
                         this.github_username = Some(username.clone());
                         this.github_error = None;
@@ -1022,7 +1103,9 @@ impl WorktableView {
         self.knowledge_building = true;
         self.knowledge_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = Arc::clone(&self.knowledge_cancel);
-        self.knowledge_status = Some("Building knowledge…".to_owned());
+        let total_entries = self.entries.len();
+        self.knowledge_progress = None;
+        self.knowledge_status = Some("Mirroring entries into knowledge…".to_owned());
         cx.notify();
 
         let db_path = self.service.database_path().to_owned();
@@ -1065,6 +1148,15 @@ impl WorktableView {
             };
 
             // Phase 2 — AI topics, when a provider is configured.
+            let _ = view.update(cx, |this, cx| {
+                this.knowledge_progress = can_enrich.then_some((0, total_entries));
+                this.knowledge_status = Some(if can_enrich {
+                    format!("Naming topics with AI… 0 of {total_entries} entries")
+                } else {
+                    "Linking entries…".to_owned()
+                });
+                cx.notify();
+            });
             let mut enriched = 0usize;
             let mut enrichment_note: Option<String> = None;
             let mut stopped = false;
@@ -1136,8 +1228,10 @@ impl WorktableView {
                     .await;
                     enriched += batch_len;
                     let _ = view.update(cx, |this, cx| {
-                        this.knowledge_status =
-                            Some(format!("Naming topics with AI… {enriched} entries so far"));
+                        this.knowledge_progress = Some((enriched, total_entries));
+                        this.knowledge_status = Some(format!(
+                            "Naming topics with AI… {enriched} of {total_entries} entries"
+                        ));
                         cx.notify();
                     });
                 }
@@ -1156,6 +1250,7 @@ impl WorktableView {
             let _ = view.update(cx, |this, cx| {
                 this.apply_knowledge_topics(topics);
                 this.knowledge_building = false;
+                this.knowledge_progress = None;
                 let summary = if stopped {
                     format!("Knowledge build stopped after {enriched} AI-named entries.")
                 } else if enriched > 0 {
@@ -1457,18 +1552,23 @@ impl WorktableView {
         let Some(state) = self.onboarding.as_mut() else {
             return;
         };
+        let mut record_grant = false;
         match state.step {
             OnboardingStep::Welcome => {
                 state.step = OnboardingStep::Accessibility;
                 state.accessibility_trusted = accessibility_trusted();
             }
             OnboardingStep::Accessibility => {
+                record_grant = state.accessibility_trusted;
                 state.step = OnboardingStep::Provider;
             }
             OnboardingStep::Provider => {
                 self.complete_onboarding(cx);
                 return;
             }
+        }
+        if record_grant {
+            self.record_accessibility_grant(cx);
         }
         cx.notify();
     }
@@ -1495,10 +1595,25 @@ impl WorktableView {
     /// Re-read the Accessibility permission (the user grants it in System
     /// Settings, outside the app).
     pub fn refresh_accessibility(&mut self, cx: &mut Context<Self>) {
+        let trusted = accessibility_trusted();
         if let Some(state) = self.onboarding.as_mut() {
-            state.accessibility_trusted = accessibility_trusted();
+            state.accessibility_trusted = trusted;
+        }
+        if trusted {
+            self.record_accessibility_grant(cx);
         }
         cx.notify();
+    }
+
+    /// Remember that Accessibility has been granted at least once. The next
+    /// app update can then tell a dropped grant apart from a user who never
+    /// enabled capture.
+    fn record_accessibility_grant(&self, cx: &mut Context<Self>) {
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |_view, _cx| {
+            let _ = service.set_config("accessibility_granted", "1").await;
+        })
+        .detach();
     }
 
     /// Jump straight into the provider settings from the tour.
@@ -1523,6 +1638,7 @@ impl WorktableView {
         self.apply_theme(window, cx);
         let service = Arc::clone(&self.service);
         let appearance = window.appearance();
+        let window_handle = window.window_handle();
         cx.spawn(async move |view, cx| {
             let show_thinking = service.get_config("show_thinking").await;
             let theme_mode = service.get_config("theme_mode").await;
@@ -1531,6 +1647,33 @@ impl WorktableView {
                 .get_config(crate::preferences::BACKGROUND_ON_CLOSE_KEY)
                 .await;
             let logs_enabled = service.get_config(crate::logging::LOGS_ENABLED_KEY).await;
+            let last_run_version = service.get_config("last_run_version").await.ok().flatten();
+            let accessibility_granted = service
+                .get_config("accessibility_granted")
+                .await
+                .ok()
+                .flatten();
+            let current_version = env!("CARGO_PKG_VERSION").to_owned();
+            let trusted_now = accessibility_trusted();
+            let onboarding_done = matches!(onboarding_done, Ok(Some(ref value)) if value == "1");
+            // A version change is the moment macOS may have invalidated the
+            // grant. The first build that records this (upgrading from an
+            // older one with no `last_run_version`) prompts when the grant is
+            // missing, because it cannot know whether the user had granted
+            // before; later builds require the recorded grant.
+            let renewal_prompt = should_prompt_accessibility_renewal(
+                onboarding_done,
+                last_run_version.as_deref(),
+                accessibility_granted.as_deref(),
+                &current_version,
+                trusted_now,
+            );
+            let _ = service
+                .set_config("last_run_version", &current_version)
+                .await;
+            if trusted_now {
+                let _ = service.set_config("accessibility_granted", "1").await;
+            }
             let _ = view.update(cx, |this, cx| {
                 if let Ok(Some(value)) = show_thinking {
                     this.show_thinking = value == "1";
@@ -1538,6 +1681,8 @@ impl WorktableView {
                 if let Ok(Some(value)) = background_on_close {
                     this.background_on_close = value != "0";
                     crate::preferences::set_background_on_close(this.background_on_close);
+                    #[cfg(target_os = "macos")]
+                    crate::status_item::set_visible(this.background_on_close);
                 }
                 if let Ok(Some(value)) = logs_enabled {
                     this.logs_enabled = value == "1";
@@ -1545,7 +1690,7 @@ impl WorktableView {
                 crate::logging::set_enabled(this.logs_enabled);
                 // First launch: show the tour. Tests and the visual runner
                 // seed this as "1" so they open straight into the app.
-                if !matches!(onboarding_done, Ok(Some(ref value)) if value == "1") {
+                if !onboarding_done {
                     this.onboarding = Some(OnboardingState::new());
                 }
                 if let Ok(Some(value)) = theme_mode
@@ -1582,8 +1727,66 @@ impl WorktableView {
                 }
                 cx.notify();
             });
+            if renewal_prompt {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.open_accessibility_renewal_prompt(window, cx);
+                        cx.notify();
+                    });
+                });
+            }
         })
         .detach();
+    }
+
+    /// One-time post-update notice: macOS dropped a grant the user had
+    /// already given, so point at the exact recovery path instead of leaving
+    /// triple-Shift silently dead.
+    fn open_accessibility_renewal_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let width = dialog_width(window, design::PROVIDER_DIALOG_WIDTH);
+        let muted = cx.theme().muted_foreground;
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Turn Accessibility back on")
+                .width(width)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(
+                            "macOS turned off Accessibility for Worktable after this update. \
+                             Triple-Shift capture needs it again.",
+                        )
+                        .child(div().text_xs().text_color(muted).child(
+                            "Open System Settings → Privacy & Security → Accessibility \
+                                     and switch Worktable on. If it is listed but off, remove \
+                                     it and add it again.",
+                        )),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("accessibility-renewal-later")
+                                .label("Not now")
+                                .ghost()
+                                .h_9()
+                                .debug_selector(|| "accessibility-renewal-later".into())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("accessibility-renewal-open")
+                                .label("Open System Settings")
+                                .primary()
+                                .h_9()
+                                .debug_selector(|| "accessibility-renewal-open".into())
+                                .on_click(|_, window, cx| {
+                                    open_accessibility_settings();
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+        cx.notify();
     }
 
     /// Resolve and apply the current theme mode. `System` follows the
@@ -1629,6 +1832,10 @@ impl WorktableView {
     pub fn toggle_background_on_close(&mut self, cx: &mut Context<Self>) {
         self.background_on_close = !self.background_on_close;
         crate::preferences::set_background_on_close(self.background_on_close);
+        // The menu-bar icon is a live reflection of this setting, not a
+        // restart-time choice: hide it in the same click.
+        #[cfg(target_os = "macos")]
+        crate::status_item::set_visible(self.background_on_close);
         let value = if self.background_on_close { "1" } else { "0" }.to_owned();
         let service = Arc::clone(&self.service);
         cx.spawn(async move |_view, _cx| {
@@ -1681,6 +1888,109 @@ impl WorktableView {
             _ => gpui_component::ThemeMode::Light,
         };
         gpui_component::Theme::change(mode, None, cx);
+        cx.notify();
+    }
+
+    /// App menu → Check for Updates…: open the dialog and start a check.
+    pub fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_self_install = crate::updates::can_self_install();
+        self.update_state = Some(UpdateState::Checking);
+        if !window.has_active_dialog(cx) {
+            self.open_update_dialog(window, cx);
+        }
+        self.start_update_check(cx);
+    }
+
+    fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let main = cx.entity();
+        let dialog_view = cx.new(|_| UpdateDialogView {
+            main: main.downgrade(),
+        });
+        let width = dialog_width(window, design::PROVIDER_DIALOG_WIDTH);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Software update")
+                .width(width)
+                .child(dialog_view.clone())
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("update-dialog-close")
+                            .label("Close")
+                            .ghost()
+                            .h_9()
+                            .debug_selector(|| "update-dialog-close".into())
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+        cx.notify();
+    }
+
+    fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        self.update_state = Some(UpdateState::Checking);
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.check_for_update().await;
+            let _ = view.update(cx, |this, cx| {
+                this.update_state = Some(match result {
+                    Ok(crate::updates::UpdateCheck::UpToDate { current }) => {
+                        UpdateState::UpToDate {
+                            current: current.to_string(),
+                        }
+                    }
+                    Ok(crate::updates::UpdateCheck::Available(release)) => {
+                        UpdateState::Available(release)
+                    }
+                    Err(message) => UpdateState::Failed {
+                        message,
+                        release: None,
+                    },
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn retry_update_check(&mut self, cx: &mut Context<Self>) {
+        self.start_update_check(cx);
+    }
+
+    /// Download, verify, stage, and hand off to the detached installer. The
+    /// app quits so the helper can replace the bundle and reopen it.
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(UpdateState::Available(release)) = self.update_state.clone() else {
+            return;
+        };
+        self.update_state = Some(UpdateState::Installing(release.clone()));
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = match service.download_and_stage_update(release.clone()).await {
+                Ok(prepared) => crate::updates::launch_installer(&prepared).map(|_| prepared),
+                Err(message) => Err(message),
+            };
+            match result {
+                Ok(_prepared) => {
+                    // Give the dialog one beat to paint the installing state,
+                    // then exit; the helper waits for this process to go.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(350))
+                        .await;
+                    cx.update(|cx| cx.quit());
+                }
+                Err(message) => {
+                    let _ = view.update(cx, |this, cx| {
+                        this.update_state = Some(UpdateState::Failed {
+                            message,
+                            release: Some(release),
+                        });
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1762,6 +2072,7 @@ impl WorktableView {
         self.entries.retain(|entry| !ids.contains(&entry.id));
         for id in &ids {
             self.entry_labels.remove(id);
+            self.label_rows.remove(id);
         }
         self.rebuild_topic_cache();
         self.selected.clear();
@@ -1775,6 +2086,23 @@ impl WorktableView {
             }
         })
         .detach();
+    }
+
+    /// The persistent label row for an entry's context menu. It is created on
+    /// right-click (before the menu renders) so its element ids stay stable
+    /// across the popup's own repaints.
+    fn ensure_label_row(
+        &mut self,
+        entry_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<EntryLabelColorRow> {
+        if let Some(row) = self.label_rows.get(entry_id) {
+            return row.clone();
+        }
+        let main = cx.entity();
+        let row = cx.new(|cx| EntryLabelColorRow::new(main, entry_id.to_owned(), cx));
+        self.label_rows.insert(entry_id.to_owned(), row.clone());
+        row
     }
 
     /// Choosing the active color again clears the label; any other color
@@ -2213,11 +2541,8 @@ impl WorktableView {
                 let follow = self.transcript_follows_tail();
                 self.assistant_busy = false;
                 self.active_tool = None;
-                for message in self.messages.iter_mut().rev() {
-                    if message.streaming {
-                        message.streaming = false;
-                        break;
-                    }
+                for message in &mut self.messages {
+                    message.streaming = false;
                 }
                 if follow {
                     // The answer is in: fold the reasoning away by default.
@@ -2254,11 +2579,8 @@ impl WorktableView {
                 self.assistant_busy = false;
                 self.active_tool = None;
                 self.pending_citations.clear();
-                for message in self.messages.iter_mut().rev() {
-                    if message.streaming {
-                        message.streaming = false;
-                        break;
-                    }
+                for message in &mut self.messages {
+                    message.streaming = false;
                 }
                 if follow {
                     for message in self.messages.iter_mut() {
@@ -2495,15 +2817,51 @@ impl WorktableView {
         cx.notify();
     }
 
+    /// Restore the most recent transcript on startup. This is not a chat
+    /// switch: it never focuses the composer and yields to anything the user
+    /// has already started while the read was in flight.
+    fn restore_last_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_id.is_some() || !self.messages.is_empty() {
+            return;
+        }
+        self.chat_restoring = true;
+        let service = Arc::clone(&self.service);
+        cx.spawn_in(window, async move |view, cx| {
+            let result = service.list_chats().await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.chat_restoring = false;
+                match result {
+                    Ok(chats)
+                        if this.chat_id.is_none()
+                            && this.messages.is_empty()
+                            && !this.assistant_busy =>
+                    {
+                        if let Some(chat) = chats.first() {
+                            let id = chat.id.clone();
+                            this.load_chat_with_focus(id, false, window, cx);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        crate::logging::error(format!("failed to restore the last chat: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn refresh_chats(&mut self, cx: &mut Context<Self>) {
-        self.chats_generation += 1;
-        let generation = self.chats_generation;
+        self.chats_list_generation += 1;
+        let generation = self.chats_list_generation;
         self.chats_state = ChatListState::Loading;
         let service = Arc::clone(&self.service);
         cx.spawn(async move |view, cx| {
             let result = service.list_chats().await;
             let _ = view.update(cx, |this, cx| {
-                if this.chats_generation != generation {
+                if this.chats_list_generation != generation {
                     return;
                 }
                 match result {
@@ -2608,8 +2966,10 @@ impl WorktableView {
         self.chat_id = None;
         self.chat_revision = 0;
         self.messages.clear();
+        self.assistant_busy = false;
         self.active_tool = None;
         self.pending_citations.clear();
+        self.chat_restoring = false;
         let input = self.assistant_input.clone();
         input.update(cx, |state, cx| state.set_value("", window, cx));
         input.read(cx).focus_handle(cx).focus(window, cx);
@@ -2618,9 +2978,20 @@ impl WorktableView {
     }
 
     fn load_chat(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_chat_with_focus(id, true, window, cx);
+    }
+
+    fn load_chat_with_focus(
+        &mut self,
+        id: String,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.chat_switch_allowed() {
             return;
         }
+        self.chat_restoring = false;
         self.chats_generation += 1;
         let generation = self.chats_generation;
         self.chat_loading = Some(id.clone());
@@ -2650,20 +3021,62 @@ impl WorktableView {
                     Ok((summary, mut messages)) => {
                         for message in &mut messages {
                             message.thinking_collapsed = true;
+                            message.streaming = false;
                         }
                         this.chat_id = Some(summary.id);
                         this.chat_revision = summary.revision;
                         this.messages = messages;
+                        this.assistant_busy = false;
                         this.active_tool = None;
                         this.pending_citations.clear();
                         this.assistant_scroll = ScrollHandle::new();
                         this.assistant_scroll.scroll_to_bottom();
                         this.close_chats(window, cx);
-                        let input = this.assistant_input.clone();
-                        input.update(cx, |state, cx| state.set_value("", window, cx));
-                        input.read(cx).focus_handle(cx).focus(window, cx);
+                        if focus {
+                            let input = this.assistant_input.clone();
+                            input.update(cx, |state, cx| state.set_value("", window, cx));
+                            input.read(cx).focus_handle(cx).focus(window, cx);
+                        }
                     }
                     Err(error) => this.chats_state = ChatListState::Failed(error.into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Delete a saved chat from the picker. Deleting the active chat clears
+    /// the draft and returns to the welcome state.
+    fn delete_chat(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.chat_switch_allowed() {
+            return;
+        }
+        let service = Arc::clone(&self.service);
+        cx.spawn(async move |view, cx| {
+            let result = service.delete_chat(&id).await;
+            let _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.chats.retain(|chat| chat.id != id);
+                        if this.chat_id.as_deref() == Some(&id) {
+                            this.chat_id = None;
+                            this.chat_revision = 0;
+                            this.messages.clear();
+                            this.assistant_busy = false;
+                            this.active_tool = None;
+                            this.pending_citations.clear();
+                            this.chat_save_error = None;
+                            this.assistant_scroll = ScrollHandle::new();
+                        }
+                        this.chats_state = ChatListState::Ready;
+                    }
+                    Err(error) => {
+                        crate::logging::error(format!("failed to delete the chat: {error}"));
+                        this.chats_state =
+                            ChatListState::Failed("Couldn't delete this chat. Try again.".into());
+                    }
                 }
                 cx.notify();
             });
@@ -2989,6 +3402,79 @@ impl WorktableView {
         }
         let input = self.composer_body.clone();
         input.update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// The note field's row count: one row per explicit line, capped at the
+    /// design maximum. Shift+Enter adds a line, so this is the growth the
+    /// user asked for; a single wrapped line stays one row and scrolls.
+    fn composer_row_count(&self, cx: &App) -> usize {
+        let value = self.composer_body.read(cx).value();
+        value
+            .split('\n')
+            .count()
+            .clamp(design::COMPOSER_MIN_ROWS, design::COMPOSER_MAX_ROWS)
+    }
+
+    /// Start the 1–4 line height morph. The current row count is the from
+    /// value, so two quick newlines continue from what is on screen instead of
+    /// snapping back.
+    fn begin_composer_resize(&mut self, cx: &mut Context<Self>) {
+        let rows = self.composer_row_count(cx);
+        if rows == self.composer_rows {
+            return;
+        }
+        let from_rows = self.composer_rows as f32;
+        self.composer_rows = rows;
+        self.composer_resize = Some(ComposerResize {
+            from_rows,
+            to_rows: rows as f32,
+            started: Instant::now(),
+        });
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(8))
+                    .await;
+                let keep_going = view
+                    .update(cx, |this, cx| {
+                        if this.composer_resize.as_ref().is_none_or(|resize| {
+                            resize.started.elapsed() >= worktable_ui::RESIZE.total()
+                        }) {
+                            // Park at the target row count; the field's own
+                            // text layout owns the settled height.
+                            this.composer_resize = None;
+                            cx.notify();
+                            false
+                        } else {
+                            cx.notify();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn set_composer_value_in(
+        &mut self,
+        input: &Entity<TextareaState>,
+        value: &str,
+        window: gpui::AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let input = input.clone();
+        let value = value.to_owned();
+        let Some(window) = window.downcast::<gpui_component::Root>() else {
+            return;
+        };
+        let _ = window.update(cx, |_root, window, cx| {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        });
     }
 
     /// Queue the note in the bar for insertion. Returns false when it is empty.
@@ -5027,14 +5513,6 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
         this.sort_mode == SortMode::Topic,
     );
     let ascending = this.sort_ascending;
-    // The keyboard path for labels: the selected entry and its active color.
-    // No selection means no label commands; the menu then keeps its usual
-    // Settings/sort/Quit shape.
-    let label_target = (this.mode == AppMode::Entries && this.entry_modal.is_none())
-        .then(|| this.selected_entry())
-        .flatten()
-        .map(|entry| (entry.id.clone(), this.entry_labels.get(&entry.id).copied()));
-
     Button::new("library-menu")
         .icon(app_icon(IconName::Menu))
         .secondary()
@@ -5088,23 +5566,6 @@ fn library_menu_button(this: &WorktableView, cx: &mut Context<WorktableView>) ->
                         view.update(cx, |this, cx| this.set_sort_mode(mode, cx));
                     },
                 ));
-            }
-            if let Some((entry_id, active)) = label_target.clone() {
-                menu = menu.separator();
-                for color in EntryLabelColor::ALL {
-                    let view = view.clone();
-                    let entry_id = entry_id.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(color.menu_label())
-                            .checked(active == Some(color))
-                            .on_click(move |_, _, cx| {
-                                let entry_id = entry_id.clone();
-                                view.update(cx, |this, cx| {
-                                    this.toggle_entry_label(&entry_id, color, cx);
-                                });
-                            }),
-                    );
-                }
             }
             menu.separator().item(
                 PopupMenuItem::new("Quit Worktable")
@@ -5939,8 +6400,32 @@ fn render_active_login(
     )
 }
 
-fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> impl IntoElement {
+fn composer_bar(
+    this: &mut WorktableView,
+    window: &mut Window,
+    cx: &mut Context<WorktableView>,
+) -> impl IntoElement {
     let theme = cx.theme().clone();
+    // The textarea keeps its natural line layout; we animate the box height in
+    // whole rows so the list above it glides instead of jumping when a new
+    // Shift+Enter line appears.
+    let rows = match this.composer_resize.as_ref() {
+        Some(resize) if resize.started.elapsed() < worktable_ui::RESIZE.total() => {
+            let _ = worktable_ui::activity_now(cx.entity_id(), cx);
+            let raw =
+                resize.started.elapsed().as_secs_f32() / worktable_ui::RESIZE.total().as_secs_f32();
+            let progress = if worktable_ui::reduced_motion(cx) {
+                1.0
+            } else {
+                worktable_ui::RESIZE.progress(raw)
+            };
+            resize.from_rows + (resize.to_rows - resize.from_rows) * progress
+        }
+        _ => this.composer_rows as f32,
+    };
+    let field_height = window.line_height() * rows
+        + design::to_pixels(design::COMPOSER_FIELD_PADDING, window) * 2.0
+        + px(2.);
     h_flex()
         .id("composer-bar")
         .debug_selector(|| "composer-bar".into())
@@ -5965,8 +6450,10 @@ fn composer_bar(this: &mut WorktableView, cx: &mut Context<WorktableView>) -> im
                 .min_w_0()
                 .debug_selector(|| "composer-input".into())
                 .child(
-                    Input::new(&this.composer_body)
+                    Textarea::new(&this.composer_body)
                         .w_full()
+                        .h(field_height)
+                        .overflow_hidden()
                         .appearance(true)
                         .border_color(theme.muted)
                         .bg(theme.muted)
@@ -6283,7 +6770,7 @@ fn render_entries_pane(
         .size_full()
         .child(body)
         .when_some(label_status, |pane, status| pane.child(status))
-        .child(composer_bar(this, cx).into_any_element())
+        .child(composer_bar(this, window, cx).into_any_element())
         .into_any_element()
 }
 
@@ -6532,6 +7019,34 @@ async fn run_blocking<T: Send + 'static>(
     rx.await.map_err(|error| error.to_string())
 }
 
+/// Whether a post-update Accessibility notice is warranted.
+///
+/// Prompt only after the tour is done, only on a version change, only when
+/// the platform says the grant is missing, and only when the user had it
+/// before (or this is the first build that records the grant, where the
+/// previous value is unknowable). The version key write keeps this one-shot.
+fn should_prompt_accessibility_renewal(
+    onboarding_done: bool,
+    last_run_version: Option<&str>,
+    accessibility_granted: Option<&str>,
+    current_version: &str,
+    trusted: bool,
+) -> bool {
+    if !onboarding_done || trusted {
+        return false;
+    }
+    let version_changed = last_run_version != Some(current_version);
+    if !version_changed {
+        return false;
+    }
+    accessibility_granted == Some("1") || last_run_version.is_none()
+}
+
+/// Entry-unit progress copy for a running knowledge build.
+fn knowledge_progress_label(done: usize, total: usize) -> String {
+    format!("Building knowledge · {done} of {total} entries")
+}
+
 /// Report a knowledge-build failure. Progress lives on the button's orb, so
 /// the only text a failed pass owes the user is the failure itself — it lands
 /// in the transcript with the rest of the run feedback.
@@ -6542,6 +7057,7 @@ fn report_knowledge_status(
 ) {
     let _ = view.update(cx, |this, cx| {
         this.knowledge_building = false;
+        this.knowledge_progress = None;
         this.knowledge_status = Some(status.clone());
         if !this
             .messages
@@ -6704,6 +7220,95 @@ struct EntryCardOptions {
     label: Option<EntryLabelColor>,
     height: Pixels,
     max_body_lines: usize,
+}
+
+/// Live label row for an entry's context menu.
+///
+/// The popup menu is built once and does not repaint when the entry's label
+/// changes, so a static row kept showing the old check mark until the menu was
+/// reopened. This entity observes the main view and repaints its own ticks in
+/// place, which is what makes selecting a color (and clearing it) visible
+/// immediately while the menu stays open.
+struct EntryLabelColorRow {
+    view: WeakEntity<WorktableView>,
+    entry_id: String,
+    _subscription: Subscription,
+}
+
+impl EntryLabelColorRow {
+    fn new(view: Entity<WorktableView>, entry_id: String, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&view, |_, _, cx| cx.notify());
+        Self {
+            view: view.downgrade(),
+            entry_id,
+            _subscription: subscription,
+        }
+    }
+}
+
+impl Render for EntryLabelColorRow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let active = self
+            .view
+            .upgrade()
+            .and_then(|view| view.read(cx).entry_labels.get(&self.entry_id).copied());
+        let row_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window);
+        let mut row = h_flex()
+            .id("entry-label-colors")
+            .debug_selector(|| "entry-label-colors".into())
+            .w(row_width)
+            .ml(design::ENTRY_LABEL_MENU_ICON_OFFSET)
+            .items_center()
+            .justify_center()
+            .gap_2();
+        for color in EntryLabelColor::ALL {
+            let swatch = design::entry_label_color(&theme, color);
+            let hover_swatch = design::entry_label_hover_color(&theme, color);
+            let is_active = active == Some(color);
+            let view = self.view.clone();
+            let entry_id = self.entry_id.clone();
+            let selector = format!("entry-label-dot:{}", color.key());
+            let debug = selector.clone();
+            let check_selector = format!("entry-label-check:{}", color.key());
+            row = row.child(
+                div()
+                    .id(selector)
+                    .debug_selector(move || debug.clone())
+                    .role(Role::Button)
+                    .aria_label(format!("{} label", color.name()))
+                    .size_5()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(swatch)
+                    .hover(move |style| style.bg(hover_swatch))
+                    .border_1()
+                    .border_color(theme.border)
+                    .when(is_active, |el| {
+                        el.child(
+                            div().debug_selector(move || check_selector.clone()).child(
+                                Icon::new(IconName::Check)
+                                    .size_3()
+                                    .text_color(design::entry_label_foreground(&theme, color)),
+                            ),
+                        )
+                    })
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let Some(view) = view.upgrade() else {
+                            return;
+                        };
+                        let entry_id = entry_id.clone();
+                        view.update(cx, |this, cx| {
+                            this.toggle_entry_label(&entry_id, color, cx);
+                        });
+                    }),
+            );
+        }
+        row
+    }
 }
 
 /// One entry card: top-aligned, height derived from its content within the
@@ -7035,8 +7640,9 @@ fn render_entry_card(
             view.update(cx, |this, cx| {
                 if !this.selected.contains(&id_for_right) {
                     this.select_at(id_for_right.clone(), false);
-                    cx.notify();
                 }
+                this.ensure_label_row(&id_for_right, cx);
+                cx.notify();
             });
         }
     });
@@ -7046,9 +7652,8 @@ fn render_entry_card(
     let id_view = entry.id.clone();
     let id_label = entry.id.clone();
     // Labels are per-entry even when a multi-selection was right-clicked; only
-    // the menu's copy/delete actions carry the selection count.
-    let active_label = label;
-    // A right click on a selected card keeps the selection, so the menu's
+    // the menu's copy/delete actions carry the selection count. A right click
+    // on a selected card keeps the selection, so the menu's
     // actions apply to every selected entry.
     let menu_multi = selected.contains(&entry.id) && selected.len() > 1;
     let menu_count = selected.len();
@@ -7126,59 +7731,14 @@ fn render_entry_card(
             })
             .separator()
             .item(
-                PopupMenuItem::element(move |window, cx| {
-                    let theme = cx.theme();
-                    let row_width = design::to_pixels(design::ENTRY_LABEL_MENU_ROW_WIDTH, window);
-                    let mut row = h_flex()
-                        .id("entry-label-colors")
-                        .debug_selector(|| "entry-label-colors".into())
-                        .w(row_width)
-                        .ml(design::ENTRY_LABEL_MENU_ICON_OFFSET)
-                        .items_center()
-                        .justify_center()
-                        .gap_2();
-                    for color in EntryLabelColor::ALL {
-                        let swatch = design::entry_label_color(theme, color);
-                        let hover_swatch = design::entry_label_hover_color(theme, color);
-                        let active = active_label == Some(color);
-                        let view = row_view.clone();
-                        let id = row_id.clone();
-                        let selector = format!("entry-label-dot:{}", color.key());
-                        let debug = selector.clone();
-                        row =
-                            row.child(
-                                div()
-                                    .id(selector)
-                                    .debug_selector(move || debug.clone())
-                                    .role(Role::Button)
-                                    .aria_label(format!("{} label", color.name()))
-                                    .size_5()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .bg(swatch)
-                                    .hover(move |style| style.bg(hover_swatch))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .when(active, |el| {
-                                        el.child(Icon::new(IconName::Check).size_3().text_color(
-                                            design::entry_label_foreground(theme, color),
-                                        ))
-                                    })
-                                    .cursor_pointer()
-                                    .on_click(move |_, window, cx| {
-                                        let id = id.clone();
-                                        view.update(cx, |this, cx| {
-                                            this.toggle_entry_label(&id, color, cx);
-                                        });
-                                        if let Ok(escape) = Keystroke::parse("escape") {
-                                            window.dispatch_keystroke(escape, cx);
-                                        }
-                                    }),
-                            );
-                    }
-                    row
+                PopupMenuItem::element(move |_window, cx| {
+                    row_view
+                        .read(cx)
+                        .label_rows
+                        .get(&row_id)
+                        .cloned()
+                        .map(IntoElement::into_any_element)
+                        .unwrap_or_else(|| div().into_any_element())
                 })
                 .disabled(true),
             )
@@ -7404,6 +7964,7 @@ fn render_chats_sheet(
     } else {
         let row_h = design::to_pixels(design::CHAT_ROW_HEIGHT, window);
         let row_sizes = Rc::new(vec![size(Pixels::ZERO, row_h); this.chats.len()]);
+        let list_view = cx.entity().downgrade();
         let list = v_virtual_list(
             cx.entity(),
             "chats-list",
@@ -7417,6 +7978,8 @@ fn render_chats_sheet(
                         let selector = format!("chat-row:{id}");
                         let content_selector = format!("chat-row-content:{id}");
                         let active = this.chat_id.as_ref() == Some(&id);
+                        let delete_view = list_view.clone();
+                        let delete_id = id.clone();
                         div()
                             .id(SharedString::from(format!("chat-item:{id}")))
                             .h_full()
@@ -7425,6 +7988,19 @@ fn render_chats_sheet(
                             .role(Role::ListItem)
                             .aria_label(chat.title.clone())
                             .aria_selected(active)
+                            .context_menu(move |menu, _, _| {
+                                let view = delete_view.clone();
+                                let id = delete_id.clone();
+                                menu.item(
+                                    PopupMenuItem::new("Delete chat")
+                                        .icon(Icon::new(IconName::Delete))
+                                        .on_click(move |_, _, cx| {
+                                            let id = id.clone();
+                                            let _ = view
+                                                .update(cx, |this, cx| this.delete_chat(id, cx));
+                                        }),
+                                )
+                            })
                             .child(
                                 Button::new(SharedString::from(format!("chat:{id}")))
                                     .ghost()
@@ -7438,7 +8014,6 @@ fn render_chats_sheet(
                                     .py_2()
                                     .justify_start()
                                     .overflow_hidden()
-                                    .tooltip(chat.title.clone())
                                     .debug_selector(move || selector.clone())
                                     .child(
                                         h_flex()
@@ -7457,7 +8032,7 @@ fn render_chats_sheet(
                                                 v_flex()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .gap_1()
+                                                    .gap_0p5()
                                                     .child(
                                                         div()
                                                             .text_sm()
@@ -7569,6 +8144,12 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
     let knowledge_status = (!this.knowledge_building)
         .then(|| this.knowledge_status.clone())
         .flatten();
+    let knowledge_progress = if this.knowledge_building {
+        this.knowledge_progress
+            .map(|(done, total)| knowledge_progress_label(done, total))
+    } else {
+        None
+    };
 
     let mut messages = v_flex()
         .id("assistant-messages")
@@ -7614,7 +8195,27 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
         )
     };
 
-    if this.messages.is_empty() {
+    if this.messages.is_empty() && this.chat_restoring {
+        // Restoring the last saved transcript: show the read instead of the
+        // welcome panel, so an existing conversation never flashes the
+        // starter over it.
+        messages = messages.child(
+            h_flex()
+                .id("assistant-restoring")
+                .debug_selector(|| "assistant-restoring".into())
+                .role(Role::Status)
+                .aria_label("Loading your last chat")
+                .p_3()
+                .child(
+                    Button::new("assistant-restoring-button")
+                        .label("Loading your last chat")
+                        .ghost()
+                        .h_9()
+                        .loading(true)
+                        .disabled(true),
+                ),
+        );
+    } else if this.messages.is_empty() {
         messages = messages.child(fade_in(
             "assistant-welcome",
             div()
@@ -7790,6 +8391,18 @@ fn render_assistant(this: &mut WorktableView, cx: &mut Context<WorktableView>) -
                 .py_3()
                 .border_t_1()
                 .border_color(theme.border)
+                .when_some(knowledge_progress, |el, progress| {
+                    el.child(
+                        div()
+                            .id("knowledge-progress")
+                            .debug_selector(|| "knowledge-progress".into())
+                            .role(Role::Status)
+                            .aria_label(progress.clone())
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(progress),
+                    )
+                })
                 .when_some(knowledge_status, |el, status| {
                     el.child(
                         div()
@@ -8121,7 +8734,199 @@ impl Render for ProviderDialogView {
     }
 }
 
-/// The GitHub stars dialog body: account, fetch, the starred-repository
+/// Body of the software-update dialog. It reads the main view's `UpdateState`
+/// every frame, so an async check or download repaints in place.
+struct UpdateDialogView {
+    main: WeakEntity<WorktableView>,
+}
+
+impl Render for UpdateDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let theme = cx.theme().clone();
+        let Some(main) = self.main.upgrade() else {
+            return div().into_any_element();
+        };
+        let state = main.read(cx).update_state.clone();
+        let self_install = main.read(cx).update_self_install;
+        let current = crate::updates::current_version().to_string();
+
+        let mut column = v_flex()
+            .debug_selector(|| "update-dialog".into())
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "Worktable checks the public releases on GitHub. You're on {current}."
+                    )),
+            );
+
+        match state {
+            None | Some(UpdateState::Checking) => {
+                column = column.child(
+                    Button::new("update-checking")
+                        .label("Checking for updates…")
+                        .ghost()
+                        .h_9()
+                        .loading(true)
+                        .disabled(true)
+                        .debug_selector(|| "update-checking".into()),
+                );
+            }
+            Some(UpdateState::UpToDate { current }) => {
+                column = column.child(
+                    div()
+                        .id("update-uptodate")
+                        .debug_selector(|| "update-uptodate".into())
+                        .role(Role::Status)
+                        .text_sm()
+                        .child(format!("Worktable {current} is up to date.")),
+                );
+                let main_for_retry = main.clone();
+                column = column.child(
+                    Button::new("update-retry")
+                        .label("Check again")
+                        .ghost()
+                        .h_9()
+                        .debug_selector(|| "update-retry".into())
+                        .on_click(move |_, _, cx| {
+                            main_for_retry.update(cx, |this, cx| this.retry_update_check(cx));
+                        }),
+                );
+            }
+            Some(UpdateState::Available(release)) => {
+                column = column.child(
+                    div()
+                        .id("update-available")
+                        .debug_selector(|| "update-available".into())
+                        .role(Role::Status)
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(format!(
+                            "{} is available. You're on {current}.",
+                            release.name
+                        )),
+                );
+                if !release.notes.trim().is_empty() {
+                    column = column.child(
+                        div()
+                            .id("update-notes")
+                            .debug_selector(|| "update-notes".into())
+                            .max_h(rems(8.0))
+                            .overflow_y_scrollbar()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(release.notes.clone()),
+                    );
+                }
+                let mut actions = h_flex().gap_2().items_center();
+                if self_install {
+                    let main_for_install = main.clone();
+                    actions = actions.child(
+                        Button::new("update-install")
+                            .label("Download and install")
+                            .primary()
+                            .h_9()
+                            .debug_selector(|| "update-install".into())
+                            .on_click(move |_, _, cx| {
+                                main_for_install.update(cx, |this, cx| this.install_update(cx));
+                            }),
+                    );
+                }
+                let page = release.page_url.clone();
+                actions = actions.child(
+                    Button::new("update-release-page")
+                        .label(if self_install {
+                            "Release notes"
+                        } else {
+                            "Open release page"
+                        })
+                        .ghost()
+                        .h_9()
+                        .debug_selector(|| "update-release-page".into())
+                        .on_click(move |_, _, cx| cx.open_url(&page)),
+                );
+                column = column.child(actions).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if self_install {
+                            "The app quits, replaces its copy in Applications, and reopens."
+                        } else {
+                            "This copy of Worktable can't replace itself. Download the release from GitHub to update an installed copy."
+                        }),
+                );
+            }
+            Some(UpdateState::Installing(release)) => {
+                column = column.child(
+                    div()
+                        .id("update-installing")
+                        .debug_selector(|| "update-installing".into())
+                        .role(Role::Status)
+                        .text_sm()
+                        .child(format!(
+                            "Downloading {} and preparing it to install.",
+                            release.name
+                        )),
+                );
+                column = column.child(
+                    Button::new("update-installing-button")
+                        .label("Downloading and installing…")
+                        .ghost()
+                        .h_9()
+                        .loading(true)
+                        .disabled(true)
+                        .debug_selector(|| "update-installing-button".into()),
+                );
+                column = column.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Worktable will quit and reopen when the update is ready."),
+                );
+            }
+            Some(UpdateState::Failed { message, release }) => {
+                column = column.child(
+                    div()
+                        .id("update-error")
+                        .debug_selector(|| "update-error".into())
+                        .role(Role::Alert)
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(message),
+                );
+                let main_for_retry = main.clone();
+                let mut actions = h_flex().gap_2().items_center().child(
+                    Button::new("update-retry")
+                        .label("Try again")
+                        .primary()
+                        .h_9()
+                        .debug_selector(|| "update-retry".into())
+                        .on_click(move |_, _, cx| {
+                            main_for_retry.update(cx, |this, cx| this.retry_update_check(cx));
+                        }),
+                );
+                if let Some(release) = release {
+                    let page = release.page_url.clone();
+                    actions = actions.child(
+                        Button::new("update-release-page")
+                            .label("Open release page")
+                            .ghost()
+                            .h_9()
+                            .debug_selector(|| "update-release-page".into())
+                            .on_click(move |_, _, cx| cx.open_url(&page)),
+                    );
+                }
+                column = column.child(actions);
+            }
+        }
+
+        column.into_any_element()
+    }
+}
+
+/// The GitHub stars dialog body: the username, fetch, the starred-repository
 /// list, and the import action.
 ///
 /// Own entity like the provider dialog, so the dialog layer can render it
@@ -8131,12 +8936,12 @@ struct GithubStarsDialog {
 }
 
 impl Render for GithubStarsDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let theme = cx.theme().clone();
         let Some(main) = self.main.upgrade() else {
             return div().into_any_element();
         };
-        let (input, username, error, repos, loading, importing, import_status, total) = {
+        let (input, username, error, repos, loading, importing, import_status) = {
             let this = main.read(cx);
             (
                 this.github_input.clone(),
@@ -8146,14 +8951,13 @@ impl Render for GithubStarsDialog {
                 this.github_loading,
                 this.github_importing,
                 this.github_import_status.clone(),
-                this.github_total_stars,
             )
         };
 
         let main_for_fetch = main.clone();
         let fetch = Button::new("github-fetch")
             .label("Fetch stars")
-            .small()
+            .h_9()
             .loading(loading)
             .debug_selector(|| "github-fetch".into())
             .on_click(move |_, _, cx| {
@@ -8172,7 +8976,7 @@ impl Render for GithubStarsDialog {
         let import = Button::new("github-import-stars")
             .label("Import stars to entries")
             .primary()
-            .small()
+            .h_9()
             .loading(importing)
             .disabled(!import_enabled)
             .debug_selector(|| "github-import-stars".into())
@@ -8183,10 +8987,16 @@ impl Render for GithubStarsDialog {
         let repo_list: gpui::AnyElement = if repos.is_empty() {
             div().into_any_element()
         } else {
+            // A fixed viewport, not just a max height: a max-height box can be
+            // measured by the dialog and clipped instead of becoming a scroll
+            // owner. Nine rows fit before scrolling.
+            let row_height = design::to_pixels(design::GITHUB_REPO_ROW_HEIGHT, window);
+            let list_height = design::to_pixels(design::GITHUB_REPOS_MAX_HEIGHT, window)
+                .min(row_height * repos.len() as f32);
             div()
                 .id("github-repos")
                 .debug_selector(|| "github-repos".into())
-                .max_h(rems(12.0))
+                .h(list_height)
                 .overflow_y_scrollbar()
                 .rounded(theme.radius_tokens().md)
                 .border_1()
@@ -8254,14 +9064,6 @@ impl Render for GithubStarsDialog {
                             .child(fetch),
                     ),
             );
-        if let Some(username) = username.filter(|user| !user.is_empty()) {
-            column = column.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Account: {username}")),
-            );
-        }
         if let Some(error) = error {
             column = column.child(
                 div()
@@ -8272,17 +9074,15 @@ impl Render for GithubStarsDialog {
                     .child(error),
             );
         }
-        if let Some(total) = total.filter(|_| !repos.is_empty()) {
+        if !repos.is_empty() {
             column = column.child(
                 div()
                     .id("github-dialog-summary")
+                    .debug_selector(|| "github-dialog-summary".into())
                     .role(Role::Status)
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "{} starred repositories · {total} stars total",
-                        repos.len()
-                    )),
+                    .child(format!("{} starred repositories", repos.len())),
             );
         }
         column = column.child(repo_list).child(import);

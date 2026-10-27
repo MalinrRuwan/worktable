@@ -59,6 +59,9 @@ mod service;
 #[path = "../status_item.rs"]
 #[allow(dead_code)]
 mod status_item;
+#[path = "../updates.rs"]
+#[allow(dead_code)]
+mod updates;
 #[path = "../worktable_view.rs"]
 #[allow(dead_code)]
 mod worktable_view;
@@ -157,6 +160,9 @@ fn seeded_db(entries: Vec<WorktableEntry>) -> String {
     }
     // Captures drive the main UI; the tour has its own dedicated steps.
     runtime.set_config("onboarding_completed", "1").unwrap();
+    runtime
+        .set_config("last_run_version", env!("CARGO_PKG_VERSION"))
+        .unwrap();
     drop(runtime);
 
     path_str
@@ -707,6 +713,21 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(200));
     capture(&mut cx, handle, "worktable_composer_focused")?;
+
+    println!("— step 9a: note bar grows to four lines —");
+    cx.simulate_input(handle, "First line of the note");
+    cx.simulate_keystrokes(handle, "shift-enter");
+    cx.simulate_input(handle, "Second line");
+    cx.simulate_keystrokes(handle, "shift-enter");
+    cx.simulate_input(handle, "Third line");
+    cx.simulate_keystrokes(handle, "shift-enter");
+    cx.simulate_input(handle, "Fourth line");
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    capture(&mut cx, handle, "worktable_composer_multiline")?;
+    cx.simulate_keystrokes(handle, "cmd-a");
+    cx.simulate_keystrokes(handle, "backspace");
+    cx.run_until_parked();
 
     println!("— step 10: multi-select (cmd + shift) —");
     // Select first, cmd-add second, shift-range to third if available

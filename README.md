@@ -50,9 +50,9 @@ knowledge, and ask questions when you need the context back.
 | **A library for more than text** | Keep notes, links, and images together; open full entries and view images fullscreen |
 | **Search and organize** | Filter entries and sort by time, alphabetically, or by topic; use keyboard navigation and multi-selection |
 | **Connected knowledge** | Build local topics and relationships, with optional AI topic enrichment from your chosen provider |
-| **An assistant with context** | Read streaming answers, follow source citations, stop a running answer, and reopen saved chats |
+| **An assistant with context** | Read streaming answers, follow source citations, stop a running answer, and reopen or delete saved chats |
 | **GitHub stars** | Import repositories you have starred, including their descriptions and links |
-| **At home on macOS** | Stay in the menu bar, use native menus and shortcuts, and switch between Ayu Light and Ayu Dark |
+| **At home on macOS** | Stay in the menu bar, check for updates, use native menus and shortcuts, and switch between Ayu Light and Ayu Dark |
 
 Built with **Rust, GPUI, and GPUI Component**. The AI runtime lives in the native
 app through Rig; there is no JavaScript worker or separate sidecar to install.
@@ -105,13 +105,21 @@ protocol, and screenshot permission notes.
    settings. Triple-Shift uses the foreground app's Copy action and clipboard,
    so that app must support copying the selected text or image.
 3. **Add your first note.** The note bar is always ready: type and press Return.
-   Use its plus button to choose an image.
+   Shift+Return adds a line; the field grows to four lines. Use its plus button
+   to choose an image.
 4. **Set up the assistant, optionally.** Open Settings → Providers, configure a
    provider, and choose a model. Build knowledge before asking about your library.
 
 Notes and the local knowledge-building pass work without an AI provider.
 Closing the window keeps Worktable in the menu bar by default; change **Keep
 running in the menu bar** in Settings → General if you prefer closing to quit.
+The menu-bar icon hides as soon as that toggle is turned off.
+
+Worktable → **Check for Updates…** checks the latest stable GitHub release. An
+installed copy downloads the DMG, verifies its published SHA-256 and signature,
+replaces itself, and reopens. If macOS dropped the Accessibility grant during
+that replacement, Worktable asks once to turn it back on; a preserved grant
+does not prompt.
 
 ### Choose your AI provider
 
@@ -142,6 +150,7 @@ Provider access, limits, and any charges depend on the service you choose.
 | ⌘C / ⌘⇧C | Copy selected entries / copy the selected entry's link |
 | ⌘⇧P | Clear search |
 | ⌘Return | Submit the note bar |
+| Shift+Return | Add a line to the note bar (up to four lines) |
 | Escape (⎋) | Dismiss the current overlay or image viewer |
 | ⌘Q | Quit Worktable |
 
@@ -248,7 +257,7 @@ Visual snapshots complement interaction tests; they do not replace them.
 Set the version you want to package:
 
 ```sh
-VERSION=1.5.0 sh scripts/package-macos.sh
+VERSION=1.5.1 sh scripts/package-macos.sh
 ```
 
 The script builds the release binary, bundles themes and the app icon, signs
@@ -257,8 +266,8 @@ the app, and creates:
 ```text
 dist/
 ├── Worktable.app
-├── Worktable-1.5.0.dmg
-└── Worktable-1.5.0.dmg.sha256
+├── Worktable-1.5.1.dmg
+└── Worktable-1.5.1.dmg.sha256
 ```
 
 Packaging uses the host architecture and ad-hoc signing by default; it does
@@ -270,7 +279,9 @@ Ad-hoc builds carry a stable bundle identifier and designated requirement
 effort: macOS may still require enabling Accessibility once after an update,
 and if capture stays blocked, remove Worktable from System Settings → Privacy &
 Security → Accessibility and add it again. A Developer ID-signed and notarized
-build is the reliable TCC path.
+build is the reliable TCC path. Worktable also records `last_run_version` and
+`accessibility_granted`, so an update can offer the recovery step once when a
+grant that used to work is gone.
 
 ### Contributing
 

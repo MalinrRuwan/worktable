@@ -88,6 +88,10 @@ impl WorktableRuntime {
         self.store.save_chat(chat)
     }
 
+    pub fn delete_chat(&self, id: &str) -> anyhow::Result<()> {
+        self.store.delete_chat(id)
+    }
+
     pub async fn list_entries(&self, limit: usize) -> anyhow::Result<Vec<worktable_db::Entry>> {
         self.store.list_entries(limit)
     }
