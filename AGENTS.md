@@ -26,7 +26,9 @@ Brand assets live in `crates/worktable-app/assets`: `worktable.svg` is the
 source glyph, `menu_icon.png` is the menu-bar template (alpha only, tinted by
 macOS), and `menu_icon_lit.png` is the same lamp rendered lit — warm amber
 strokes, a soft halo, and a brighter bulb at the lamp head — used for the
-double blink after a capture,
+double blink after a capture, `menu_icon_warning.png` is the same lamp with a
+red dot (non-template, so the dot keeps its color on both menu-bar tones) while
+macOS has not granted Accessibility,
 `app_icon.png` is the light badge (cream squircle, dark glyph) laid out on
 Apple's icon grid — the 824×824 artwork centered in a 1024×1024 canvas with
 the standard corner radius — for the Dock, About panel, and the `.icns` the

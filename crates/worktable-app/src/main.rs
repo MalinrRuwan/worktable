@@ -139,6 +139,25 @@ fn main() -> anyhow::Result<()> {
             if !status_item::install(sender) {
                 logging::error("failed to install the macOS menu-bar item");
             }
+            // Accessibility is granted in System Settings while the app runs.
+            // Poll the system flag on the GPUI main thread and repaint the
+            // menu-bar glyph only when it changes, so the red dot clears (or
+            // appears) without a relaunch and without per-frame work.
+            let mut last_trusted = status_item::accessibility_trusted();
+            cx.spawn(move |cx: &mut AsyncApp| {
+                let cx = cx.clone();
+                async move {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        let trusted = status_item::accessibility_trusted();
+                        if trusted != last_trusted {
+                            status_item::set_accessibility_warning(trusted);
+                            last_trusted = trusted;
+                        }
+                    }
+                }
+            })
+            .detach();
         }
         // Route status-item commands into the app.
         let mut command_rx = service

@@ -34,6 +34,9 @@ use objc2_foundation::{NSData, NSSize, NSString};
 const MENU_ICON: &[u8] = include_bytes!("../assets/menu_icon.png");
 /// The "lit" glyph shown briefly after a triple-Shift capture.
 const MENU_ICON_LIT: &[u8] = include_bytes!("../assets/menu_icon_lit.png");
+/// The glyph plus a red dot, shown while macOS has not granted Accessibility.
+/// It is not a template image: the dot must stay red on both menu-bar tones.
+const MENU_ICON_WARNING: &[u8] = include_bytes!("../assets/menu_icon_warning.png");
 /// The app icon shown in the Dock and the About panel.
 const APP_ICON: &[u8] = include_bytes!("../assets/app_icon.png");
 
@@ -43,9 +46,26 @@ const MENU_ICON_SIZE: NSSize = NSSize {
     height: 14.5,
 };
 
+/// Menu-bar presentation state shared by trust updates and capture feedback.
+///
+/// `lit` belongs to the two-blink capture animation; `accessibility_warning`
+/// belongs to the permission state. Keeping both here means a blink that ends
+/// while Accessibility is off returns to the warning glyph instead of the
+/// plain template.
+struct StatusState {
+    accessibility_warning: bool,
+    lit: bool,
+}
+
 thread_local! {
     /// The live status item, so capture feedback can swap its image.
     static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
+    static STATUS_STATE: RefCell<StatusState> = const {
+        RefCell::new(StatusState {
+            accessibility_warning: false,
+            lit: false,
+        })
+    };
 }
 
 /// Whether the process is trusted for Accessibility (global capture and
@@ -143,8 +163,22 @@ pub fn install(sender: CommandSender) -> bool {
     // 22 is the standard menu bar icon slot size.
     let item = status_bar.statusItemWithLength(22.0);
 
+    // Read the grant before the first frame so an untrusted app opens with the
+    // red dot already visible instead of correcting itself on the next poll.
+    let accessibility_warning = !accessibility_trusted();
+    STATUS_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.accessibility_warning = accessibility_warning;
+        state.lit = false;
+    });
+
     if let Some(button) = item.button(mtm) {
-        if let Some(image) = make_template_image() {
+        let image = if accessibility_warning {
+            make_warning_image()
+        } else {
+            make_template_image()
+        };
+        if let Some(image) = image {
             button.setImage(Some(&image));
             button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
         } else {
@@ -436,6 +470,12 @@ fn make_lit_image() -> Option<Retained<NSImage>> {
     embedded_image(MENU_ICON_LIT, false)
 }
 
+/// The glyph with a red dot, shown while Accessibility is missing. A
+/// non-template image keeps the dot red on light and dark menu bars.
+fn make_warning_image() -> Option<Retained<NSImage>> {
+    embedded_image(MENU_ICON_WARNING, false)
+}
+
 /// Show or hide the app's Dock presence. Closing the window in background
 /// mode switches to `Accessory` (menu bar only); opening the window restores
 /// `Regular`.
@@ -505,8 +545,30 @@ pub(crate) fn set_visible(visible: bool) {
     });
 }
 
+/// Show or hide the Accessibility warning without waiting for the next
+/// capture blink. Main thread only; a no-op before `install` creates the item.
+pub(crate) fn set_accessibility_warning(trusted: bool) {
+    let (warning, lit) = STATUS_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.accessibility_warning = !trusted;
+        (state.accessibility_warning, state.lit)
+    });
+    apply_status_image(warning, lit);
+}
+
 /// Swap the menu-bar image to the lit glyph (or back). Main thread only.
 fn set_status_image(lit: bool) {
+    let warning = STATUS_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.lit = lit;
+        state.accessibility_warning
+    });
+    apply_status_image(warning, lit);
+}
+
+/// Paint the current state: an in-progress blink wins, then the Accessibility
+/// warning, then the ordinary template glyph.
+fn apply_status_image(warning: bool, lit: bool) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -522,6 +584,8 @@ fn set_status_image(lit: bool) {
         };
         let image = if lit {
             make_lit_image()
+        } else if warning {
+            make_warning_image()
         } else {
             make_template_image()
         };
@@ -533,7 +597,8 @@ fn set_status_image(lit: bool) {
 
 /// Feedback for a captured selection: blink the menu-bar glyph twice so the
 /// user sees the lap light up. Runs on the GPUI main thread; the timers keep
-/// frames/events flowing without touching AppKit from another thread.
+/// frames/events flowing without touching AppKit from another thread. Each
+/// off beat returns to the warning glyph while Accessibility is missing.
 pub(crate) fn flash_capture_feedback(cx: &mut gpui::App) {
     const ON: Duration = Duration::from_millis(130);
     const OFF: Duration = Duration::from_millis(130);
@@ -546,4 +611,40 @@ pub(crate) fn flash_capture_feedback(cx: &mut gpui::App) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The warning glyph is a real 2x asset with a red dot and neutral lamp
+    /// pixels; a template image would tint the dot away, so the decode also
+    /// proves the dot survives as color.
+    #[test]
+    fn warning_menu_icon_keeps_a_red_dot() {
+        let image = image::load_from_memory(MENU_ICON_WARNING).expect("warning icon decodes");
+        let rgba = image.to_rgba8();
+        assert_eq!(
+            rgba.dimensions(),
+            (72, 58),
+            "the warning glyph stays at the menu bar's 2x size"
+        );
+
+        let mut red = 0;
+        let mut neutral = 0;
+        for pixel in rgba.pixels() {
+            let [r, g, b, a] = pixel.0;
+            if a > 180 && r > 150 && r > g.saturating_add(50) && r > b.saturating_add(50) {
+                red += 1;
+            }
+            if a > 100 && r.abs_diff(g) < 12 && r.abs_diff(b) < 12 {
+                neutral += 1;
+            }
+        }
+        assert!(red > 40, "the red dot is visible ({red} red pixels)");
+        assert!(
+            neutral > 200,
+            "the lamp glyph keeps neutral strokes ({neutral} neutral pixels)"
+        );
+    }
 }
