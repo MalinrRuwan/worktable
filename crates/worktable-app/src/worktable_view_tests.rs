@@ -4480,6 +4480,33 @@ fn db_with_chats() -> String {
     db
 }
 
+/// Wait for the 1.5.1 startup transcript restore to finish before a chat test
+/// establishes its own draft. The read is asynchronous and can otherwise land
+/// in the middle of a test that seeded a saved chat.
+fn settle_startup_chat(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
+    assert!(
+        wait_for(cx, 5, |cx| {
+            cx.read_entity(view, |v, _| !v.chat_restoring && v.chat_loading.is_none())
+        }),
+        "the startup chat restore settles"
+    );
+}
+
+/// Start a deterministic draft after the startup restore, so a saved chat
+/// cannot overwrite the message under test.
+fn start_chat_draft(cx: &mut VisualTestContext, view: &Entity<WorktableView>, text: &str) {
+    settle_startup_chat(cx, view);
+    view.update(cx, |this, cx| {
+        this.chat_id = None;
+        this.chat_revision = 0;
+        this.messages = vec![crate::assistant::ChatMessage::user(text)];
+        this.assistant_busy = false;
+        this.active_tool = None;
+        this.pending_citations.clear();
+        cx.notify();
+    });
+}
+
 fn open_chat_picker(cx: &mut VisualTestContext, view: &Entity<WorktableView>) {
     view.update(cx, |this, cx| this.show_assistant(cx));
     settle_strip(cx);
@@ -4563,6 +4590,9 @@ fn chats_select_a_saved_transcript_and_new_chat_keeps_the_previous_one(cx: &mut 
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
     settle(&mut cx);
     no_splash(&mut cx, &view);
+    // Start from a draft so selecting the recent row is the load under test,
+    // not a reload of a transcript the startup restore already opened.
+    start_chat_draft(&mut cx, &view, "draft");
     open_chat_picker(&mut cx, &view);
     assert_eq!(
         cx.read_entity(&view, |v, _| v
@@ -4580,12 +4610,17 @@ fn chats_select_a_saved_transcript_and_new_chat_keeps_the_previous_one(cx: &mut 
     assert!(content.top() >= row.top() + rem * 0.5);
     assert!(content.bottom() <= row.bottom() - rem * 0.5);
     click_selector(&mut cx, "chat-row:recent");
-    assert!(wait_for(&mut cx, 5, |cx| cx
-        .read_entity(&view, |v, _| v.chat_id.as_deref()
-            == Some("recent"))));
-    settle_strip(&mut cx);
+    assert!(wait_for(&mut cx, 5, |cx| cx.read_entity(&view, |v, _| {
+        v.chat_id.as_deref() == Some("recent") && v.chat_loading.is_none()
+    })));
+    cx.background_executor
+        .advance_clock(worktable_ui::MODAL_CLOSE.total());
+    cx.run_until_parked();
     force_frame(&mut cx);
-    assert!(cx.debug_bounds("chats-sheet").is_none());
+    assert!(
+        cx.debug_bounds("chats-sheet").is_none(),
+        "loading a transcript closes the sheet after the close transition"
+    );
     assert!(
         cx.debug_bounds("assistant-citations").is_some(),
         "loaded sources remain interactive"
@@ -4619,6 +4654,7 @@ fn chats_rows_load_from_the_keyboard(cx: &mut TestAppContext) {
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
     settle(&mut cx);
     no_splash(&mut cx, &view);
+    settle_startup_chat(&mut cx, &view);
     open_chat_picker(&mut cx, &view);
     // Visual order: New chat, Close, then the newest conversation.
     for _ in 0..3 {
@@ -4666,9 +4702,8 @@ fn chats_switching_is_disabled_during_an_answer(cx: &mut TestAppContext) {
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
     settle(&mut cx);
     no_splash(&mut cx, &view);
+    start_chat_draft(&mut cx, &view, "Answer in progress");
     view.update(&mut cx, |this, cx| {
-        this.messages
-            .push(crate::assistant::ChatMessage::user("Answer in progress"));
         this.assistant_busy = true;
         cx.notify();
     });
@@ -4757,11 +4792,7 @@ fn chats_corrupt_transcript_shows_retry_without_replacing_current_messages(
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
     settle(&mut cx);
     no_splash(&mut cx, &view);
-    view.update(&mut cx, |this, cx| {
-        this.messages
-            .push(crate::assistant::ChatMessage::user("Keep this visible"));
-        cx.notify();
-    });
+    start_chat_draft(&mut cx, &view, "Keep this visible");
     open_chat_picker(&mut cx, &view);
     click_selector(&mut cx, "chat-row:recent");
     assert!(wait_for(&mut cx, 5, |cx| cx.read_entity(&view, |v, _| {
@@ -4787,11 +4818,8 @@ fn chats_reduced_motion_and_dismissal_reject_a_pending_selection(cx: &mut TestAp
     let mut cx = VisualTestContext::from_window(*window.deref(), cx);
     settle(&mut cx);
     no_splash(&mut cx, &view);
-    view.update(&mut cx, |this, cx| {
-        this.show_assistant(cx);
-        this.messages
-            .push(crate::assistant::ChatMessage::user("Keep this draft"));
-    });
+    start_chat_draft(&mut cx, &view, "Keep this draft");
+    view.update(&mut cx, |this, cx| this.show_assistant(cx));
     force_frame(&mut cx);
     click_selector(&mut cx, "assistant-chats");
     force_frame(&mut cx);
