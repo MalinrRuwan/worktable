@@ -28,7 +28,7 @@ use gpui_component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarAxis};
 use gpui_component::switch::Switch;
 use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Selectable, Side, Sizable,
+    ActiveTheme, Disableable, FocusTrapElement as _, Icon, IconName, Selectable, Sizable,
     VirtualListScrollHandle, WindowExt as _, h_flex, v_flex, v_virtual_list,
 };
 
@@ -6343,8 +6343,7 @@ fn render_entry_card(
         let copy_label = copy_label.clone();
         let delete_label = delete_label.clone();
         let menu_multi = menu_multi;
-        // Checks sit on the right so the left slot keeps the color circle.
-        let mut menu = menu.check_side(Side::Right).item(
+        let mut menu = menu.item(
             PopupMenuItem::new("View entry")
                 .icon(Icon::new(IconName::Eye))
                 .on_click(move |_event, _window, cx| {
@@ -6361,14 +6360,21 @@ fn render_entry_card(
             let id_label_menu = id_label_menu.clone();
             let color = *color;
             let checked = active_label == Some(color);
+            // Keep the color circle visible on the active row. A checked menu
+            // item spends the leading icon slot on a check mark, which would
+            // hide the very color the row is choosing; name the state instead.
+            let label = if checked {
+                format!("{} (current)", color.menu_label())
+            } else {
+                color.menu_label().to_owned()
+            };
             menu = menu.item(
-                PopupMenuItem::new(color.menu_label())
+                PopupMenuItem::new(label)
                     .icon(
                         Icon::default()
                             .path(crate::assets::LABEL_CIRCLE_PATH)
                             .text_color(*swatch),
                     )
-                    .checked(checked)
                     .on_click(move |_event, _window, cx| {
                         let id = id_label_menu.clone();
                         view_label.update(cx, |this, cx| {

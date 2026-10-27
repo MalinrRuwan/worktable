@@ -64,7 +64,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{AppContext as _, Modifiers, VisualTestAppContext, point, px};
+use gpui::{
+    AppContext as _, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, VisualTestAppContext,
+    point, px,
+};
 use gpui_component::{Root, WindowExt as _};
 use worktable_ai::WorktableEntry;
 
@@ -255,6 +258,39 @@ fn run_visual_tests() -> anyhow::Result<()> {
     cx.run_until_parked();
     std::thread::sleep(std::time::Duration::from_millis(150));
     capture(&mut cx, handle, "worktable_entry_labels")?;
+
+    // The context menu is normally pointer-only. Capture it on the Red card
+    // so the five swatches and the current color name are part of the visual
+    // proof. This runner is a standalone binary, not an in-process test, so
+    // the pinned context-menu subscription leak cannot fail the run.
+    println!("— step 1-menu: entry context menu —");
+    let card = cx.read_entity(&view, |v, _| v.entry_origin("visual-1000"));
+    let card_center = card.center();
+    cx.simulate_mouse_move(handle, card_center, None, Modifiers::default());
+    cx.simulate_event(
+        handle,
+        MouseDownEvent {
+            position: card_center,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Right,
+            click_count: 1,
+            first_mouse: false,
+        },
+    );
+    cx.run_until_parked();
+    capture(&mut cx, handle, "worktable_entry_menu")?;
+    cx.simulate_event(
+        handle,
+        MouseUpEvent {
+            position: card_center,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Right,
+            click_count: 1,
+        },
+    );
+    cx.simulate_keystrokes(handle, "escape");
+    cx.run_until_parked();
+
     cx.update(|cx| {
         view.update(cx, |this, cx| {
             let origin = this.entry_origin("visual-1000");
