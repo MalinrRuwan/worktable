@@ -92,10 +92,20 @@ strip -S -x "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 KEYCHAIN_SEARCH_LIST=$(mktemp)
 # `security` prints quoted paths, usually one per line but not always. Split
 # on the quotes so a multi-entry line cannot collapse into one path.
-security list-keychains -d user \
-  | tr '"' '\n' \
+if ! security list-keychains -d user > "$KEYCHAIN_SEARCH_LIST.raw"; then
+  rm -f "$KEYCHAIN_SEARCH_LIST" "$KEYCHAIN_SEARCH_LIST.raw"
+  echo "Couldn't read the user keychain search list; refusing to sign." >&2
+  exit 1
+fi
+tr '"' '\n' < "$KEYCHAIN_SEARCH_LIST.raw" \
   | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
   | sed '/^$/d' > "$KEYCHAIN_SEARCH_LIST"
+rm -f "$KEYCHAIN_SEARCH_LIST.raw"
+if [ ! -s "$KEYCHAIN_SEARCH_LIST" ]; then
+  rm -f "$KEYCHAIN_SEARCH_LIST"
+  echo "The user keychain search list is empty; refusing to replace it." >&2
+  exit 1
+fi
 
 restore_keychain_search_list() {
   if [ -f "$KEYCHAIN_SEARCH_LIST" ]; then

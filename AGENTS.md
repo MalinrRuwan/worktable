@@ -747,9 +747,10 @@ asset), signs it, and writes a drag-to-Applications
 The default `CODESIGN_IDENTITY` is **Worktable Self-Signed Code Signing**.
 `scripts/ensure-self-signed-identity.sh` creates — or idempotently reuses — that
 identity in its own keychain at
-`~/.worktable/codesign/worktable-codesign.keychain-db`, with the password,
-certificate PEM, and trust settings under the same directory; nothing is
-created in or trusted from the login keychain. The script generates a
+`~/.worktable/codesign/worktable-codesign.keychain-db`, with the password and
+certificate PEM under the same directory. Trust is a user-domain code-signing
+setting, not a file beside the keychain; nothing is created in or trusted from
+the login keychain. The script generates a
 2048-bit RSA self-signed certificate (10 years, critical code-signing EKU),
 imports it with legacy PKCS#12 (macOS `security` rejects modern encryption),
 allows `/usr/bin/codesign`, and trusts it only as a code-signing root in the
@@ -764,8 +765,11 @@ anchored to the certificate leaf
 (`designated => identifier "com.worktable.app" and certificate leaf = H"…"`)
 instead of an ad-hoc cdhash, so replacing `/Applications/Worktable.app` keeps
 the same requirement. Losing or recreating the keychain changes that leaf and
-may cost one Accessibility re-grant. This is best effort: TCC may still ask
-once after an update, and remove/re-add is the recovery step.
+may cost one Accessibility re-grant. The first self-signed build also replaces
+the old ad-hoc requirement, so an existing ad-hoc install needs one grant
+again; the red-dot lamp and Accessibility dialog make that recovery visible.
+This is best effort: TCC may still ask once after an update, and remove/re-add
+is the recovery step.
 
 Set `CODESIGN_IDENTITY` to a Developer ID Application identity to keep the
 normal signature (the certificate/Team ID is already the stable requirement).

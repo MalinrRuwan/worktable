@@ -451,6 +451,10 @@ fn library_menu_accessibility_warning_opens_the_dialog(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert!(
+        cx.debug_bounds("accessibility-dialog-off").is_some(),
+        "the warning row opens the untrusted dialog state"
+    );
+    assert!(
         cx.debug_bounds("accessibility-dialog-status").is_some(),
         "the warning row opens the Accessibility dialog"
     );
@@ -461,6 +465,64 @@ fn library_menu_accessibility_warning_opens_the_dialog(cx: &mut TestAppContext) 
     );
     click_selector(&mut cx, "accessibility-dialog-close");
     assert!(cx.debug_bounds("accessibility-dialog-status").is_none());
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus_handle.is_focused(window)),
+        "closing the dialog returns keyboard focus to the view"
+    );
+}
+
+#[gpui::test]
+fn library_menu_hides_the_accessibility_warning_when_trusted(cx: &mut TestAppContext) {
+    let _trust = AccessibilityTrustGuard::set(true);
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    select_library_menu_item(&mut cx, 0);
+    assert_eq!(
+        cx.read_entity(&view, |v, _| v.mode),
+        AppMode::Settings,
+        "a trusted menu has Settings as its first item"
+    );
+    assert!(
+        cx.debug_bounds("accessibility-dialog-status").is_none(),
+        "no warning row or dialog appears when Accessibility is on"
+    );
+}
+
+/// Check again must re-read the grant, flip the open dialog to the on state,
+/// and leave keyboard focus on the view after dismissal.
+#[gpui::test]
+fn accessibility_dialog_check_again_reads_the_live_grant(cx: &mut TestAppContext) {
+    let _trust = AccessibilityTrustGuard::set(false);
+    cx.update(gpui_component::init);
+    let (view, window) = setup_view(cx, sample_entries());
+    let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+    settle(&mut cx);
+    no_splash(&mut cx, &view);
+
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| this.open_accessibility_dialog(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("accessibility-dialog-off").is_some());
+
+    super::set_accessibility_trust_override(Some(true));
+    click_selector(&mut cx, "accessibility-dialog-check");
+    assert!(
+        cx.debug_bounds("accessibility-dialog-on").is_some(),
+        "Check again re-reads the live grant and flips the dialog"
+    );
+    assert!(cx.debug_bounds("accessibility-dialog-off").is_none());
+
+    click_selector(&mut cx, "accessibility-dialog-close");
+    assert!(cx.debug_bounds("accessibility-dialog-status").is_none());
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus_handle.is_focused(window)),
+        "the main view owns the keyboard after the dialog closes"
+    );
 }
 
 /// Both dialog states are exercised through the forced grant: the off state

@@ -566,6 +566,26 @@ fn set_status_image(lit: bool) {
     apply_status_image(warning, lit);
 }
 
+/// Which glyph the menu bar should show for the current state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusImage {
+    Lit,
+    Warning,
+    Template,
+}
+
+/// An in-progress blink wins, then the Accessibility warning, then the
+/// ordinary template glyph.
+fn status_image_kind(warning: bool, lit: bool) -> StatusImage {
+    if lit {
+        StatusImage::Lit
+    } else if warning {
+        StatusImage::Warning
+    } else {
+        StatusImage::Template
+    }
+}
+
 /// Paint the current state: an in-progress blink wins, then the Accessibility
 /// warning, then the ordinary template glyph.
 fn apply_status_image(warning: bool, lit: bool) {
@@ -582,12 +602,10 @@ fn apply_status_image(warning: bool, lit: bool) {
         let Some(button) = item.button(mtm) else {
             return;
         };
-        let image = if lit {
-            make_lit_image()
-        } else if warning {
-            make_warning_image()
-        } else {
-            make_template_image()
+        let image = match status_image_kind(warning, lit) {
+            StatusImage::Lit => make_lit_image(),
+            StatusImage::Warning => make_warning_image(),
+            StatusImage::Template => make_template_image(),
         };
         if let Some(image) = image {
             button.setImage(Some(&image));
@@ -620,6 +638,14 @@ mod tests {
     /// The warning glyph is a real 2x asset with a red dot and neutral lamp
     /// pixels; a template image would tint the dot away, so the decode also
     /// proves the dot survives as color.
+    #[test]
+    fn status_image_prefers_blink_then_warning_then_template() {
+        assert_eq!(status_image_kind(true, true), StatusImage::Lit);
+        assert_eq!(status_image_kind(false, true), StatusImage::Lit);
+        assert_eq!(status_image_kind(true, false), StatusImage::Warning);
+        assert_eq!(status_image_kind(false, false), StatusImage::Template);
+    }
+
     #[test]
     fn warning_menu_icon_keeps_a_red_dot() {
         let image = image::load_from_memory(MENU_ICON_WARNING).expect("warning icon decodes");

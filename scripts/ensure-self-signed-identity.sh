@@ -22,17 +22,29 @@ log() {
   printf '%s\n' "$*" >&2
 }
 
-if ! command -v openssl >/dev/null 2>&1; then
-  log "openssl is required to create the Worktable code-signing identity."
-  log "Install OpenSSL 3 (for example: brew install openssl@3) and try again."
-  exit 1
-fi
+# macOS `security` rejects modern PKCS#12 encryption, so this script needs an
+# OpenSSL with the legacy provider. Stock macOS ships LibreSSL; Homebrew's
+# openssl@3 is keg-only, so look there before giving up.
+supports_legacy_pkcs12() {
+  "$1" pkcs12 -help 2>&1 | grep -q -- '-legacy'
+}
 
-# macOS `security` rejects modern PKCS#12 encryption, so this script must
-# export with OpenSSL's legacy provider.
-if ! openssl pkcs12 -help 2>&1 | grep -q -- '-legacy'; then
-  log "This openssl does not support 'pkcs12 -legacy', which macOS security needs."
-  log "Install OpenSSL 3 and try again."
+OPENSSL_BIN=${WORKTABLE_OPENSSL:-}
+if [ -z "$OPENSSL_BIN" ]; then
+  OPENSSL_BIN=$(command -v openssl 2>/dev/null || true)
+fi
+if [ -z "$OPENSSL_BIN" ] || ! supports_legacy_pkcs12 "$OPENSSL_BIN"; then
+  for candidate in     /opt/homebrew/opt/openssl@3/bin/openssl     /usr/local/opt/openssl@3/bin/openssl
+  do
+    if [ -x "$candidate" ] && supports_legacy_pkcs12 "$candidate"; then
+      OPENSSL_BIN=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "$OPENSSL_BIN" ] || ! supports_legacy_pkcs12 "$OPENSSL_BIN"; then
+  log "OpenSSL 3 with 'pkcs12 -legacy' is required to create the identity."
+  log "Install it (brew install openssl@3) or set WORKTABLE_OPENSSL to its path."
   exit 1
 fi
 
@@ -50,7 +62,7 @@ fi
 if [ -f "$PASSWORD_FILE" ]; then
   PASSWORD=$(cat "$PASSWORD_FILE")
 else
-  PASSWORD=$(openssl rand -hex 32)
+  PASSWORD=$("$OPENSSL_BIN" rand -hex 32)
   printf '%s' "$PASSWORD" > "$PASSWORD_FILE"
   chmod 600 "$PASSWORD_FILE"
 fi
@@ -64,11 +76,19 @@ if [ -f "$KEYCHAIN" ]; then
     log "Check the password in $PASSWORD_FILE, or remove the keychain to recreate the identity."
     exit 1
   fi
-  if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -F "$IDENTITY" >/dev/null; then
+  if ! IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN" 2>&1); then
+    log "Couldn't read the Worktable codesigning identity: $KEYCHAIN"
+    log "$IDENTITIES"
+    exit 1
+  fi
+  if printf '%s\n' "$IDENTITIES" | grep -F "$IDENTITY" >/dev/null; then
     printf '%s\n' "$KEYCHAIN"
     exit 0
   fi
-  log "The Worktable codesigning keychain exists without '$IDENTITY'; creating the identity."
+  log "The codesigning keychain exists without a valid '$IDENTITY' identity."
+  log "Remove $KEYCHAIN to recreate it. That changes the designated requirement"
+  log "and may cost one Accessibility re-grant."
+  exit 1
 else
   log "Creating the Worktable codesigning keychain: $KEYCHAIN"
   security create-keychain -p "$PASSWORD" "$KEYCHAIN" >&2
@@ -98,11 +118,11 @@ extendedKeyUsage = critical,codeSigning
 EOF
 
 log "Generating a 2048-bit RSA self-signed certificate for '$IDENTITY'."
-openssl req -x509 -newkey rsa:2048 -nodes -days "$CERT_DAYS" \
+"$OPENSSL_BIN" req -x509 -newkey rsa:2048 -nodes -days "$CERT_DAYS" \
   -keyout "$KEY_PEM" -out "$CERT_TMP" -config "$OPENSSL_CONFIG" >&2
 
 # `security import` refuses OpenSSL's default PKCS#12 algorithms on macOS.
-openssl pkcs12 -export -legacy \
+"$OPENSSL_BIN" pkcs12 -export -legacy \
   -inkey "$KEY_PEM" -in "$CERT_TMP" \
   -name "$IDENTITY" -out "$P12" \
   -passout "pass:$PASSWORD" >&2
@@ -129,7 +149,12 @@ chmod 600 "$CERT_PEM"
 # dedicated keychain. The login keychain is never touched.
 security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$CERT_PEM" >&2
 
-if ! security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -F "$IDENTITY" >/dev/null; then
+if ! IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN" 2>&1); then
+  log "Couldn't read the Worktable codesigning identity: $KEYCHAIN"
+  log "$IDENTITIES"
+  exit 1
+fi
+if ! printf '%s\n' "$IDENTITIES" | grep -F "$IDENTITY" >/dev/null; then
   log "Failed to create a valid code-signing identity in $KEYCHAIN."
   exit 1
 fi

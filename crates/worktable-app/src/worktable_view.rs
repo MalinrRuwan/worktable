@@ -1718,8 +1718,9 @@ impl WorktableView {
             }
             let _ = view.update(cx, |this, cx| {
                 // The status item may have installed while these config reads
-                // were in flight; apply the grant the view just checked.
-                sync_status_accessibility_warning(trusted_now);
+                // were in flight; re-read the grant at paint time so a grant
+                // or revocation during the awaits cannot leave a stale glyph.
+                sync_status_accessibility_warning(accessibility_trusted());
                 if let Ok(Some(value)) = show_thinking {
                     this.show_thinking = value == "1";
                 }
@@ -1865,6 +1866,10 @@ impl WorktableView {
         cx: &mut Context<Self>,
         forced_trust: Option<bool>,
     ) {
+        // The library-menu item is focused when it opens the dialog. Focus the
+        // main view first so the dialog snapshots a live handle and returns
+        // keyboard control there when it closes, not to the dismissed popup.
+        self.focus_handle.focus(window, cx);
         let main = cx.entity();
         let dialog_view = cx.new(|cx| AccessibilityDialogView::new(main, forced_trust, cx));
         let width = dialog_width(window, design::PROVIDER_DIALOG_WIDTH);

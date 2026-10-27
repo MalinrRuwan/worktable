@@ -283,13 +283,18 @@ by Git.
 The default identity is **Worktable Self-Signed Code Signing**. The first
 package run creates it in its own keychain at
 `~/.worktable/codesign/worktable-codesign.keychain-db` and stores the
-certificate and keychain password beside it. Signing uses the certificate leaf
+certificate and keychain password beside it. The certificate is trusted only
+as a user-domain code-signing root, not in the login keychain. Creating the
+identity needs OpenSSL 3 with `pkcs12 -legacy` (`brew install openssl@3`); the
+script also finds Homebrew's keg-only install. Signing uses the certificate leaf
 as the designated requirement
 (`designated => identifier "com.worktable.app" and certificate leaf = H"…"`)
 rather than an ad-hoc cdhash, so replacing the app in `/Applications` keeps the
 same requirement. Losing or recreating that keychain creates a new certificate,
-changes the requirement, and may cost one Accessibility re-grant. To use a
-Developer ID instead, set `CODESIGN_IDENTITY` to the identity name:
+changes the requirement, and may cost one Accessibility re-grant. Replacing an
+older ad-hoc build with this self-signed one also changes the requirement once;
+the app's red-dot lamp and Accessibility dialog walk through the re-grant. To
+use a Developer ID instead, set `CODESIGN_IDENTITY` to the identity name:
 
 ```sh
 CODESIGN_IDENTITY="Developer ID Application: Name (TEAMID)" \

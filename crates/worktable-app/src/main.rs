@@ -136,6 +136,10 @@ fn main() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         {
             let sender = service.command_sender();
+            // Read the baseline before install paints the first glyph. If the
+            // grant changes between this read and install, the first poll sees
+            // a mismatch and corrects the icon instead of missing it.
+            let mut last_trusted = status_item::accessibility_trusted();
             if !status_item::install(sender) {
                 logging::error("failed to install the macOS menu-bar item");
             }
@@ -143,7 +147,6 @@ fn main() -> anyhow::Result<()> {
             // Poll the system flag on the GPUI main thread and repaint the
             // menu-bar glyph only when it changes, so the red dot clears (or
             // appears) without a relaunch and without per-frame work.
-            let mut last_trusted = status_item::accessibility_trusted();
             cx.spawn(move |cx: &mut AsyncApp| {
                 let cx = cx.clone();
                 async move {
