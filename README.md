@@ -42,7 +42,12 @@ knowledge, and ask questions when you need the context back.
 3. **Find the connection.** Build knowledge, then ask the assistant about what
    you have saved. Citation chips take you back to the original entries.
 
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FMalinrRuwan%2Fworktable.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FMalinrRuwan%2Fworktable?ref=badge_large)
+
 ## Features
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FMalinrRuwan%2Fworktable.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FMalinrRuwan%2Fworktable?ref=badge_shield)
+
 
 | | What you can do |
 | --- | --- |
